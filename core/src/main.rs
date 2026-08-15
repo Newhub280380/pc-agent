@@ -170,17 +170,61 @@ fn main() -> Result<()> {
         providers,
     };
 
-    let opts = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 680.0])
-            .with_min_inner_size([820.0, 520.0]),
-        ..Default::default()
-    };
-    eframe::run_native("PC Agent", opts, Box::new(|_cc| Ok(Box::new(app))))
-        .map_err(|e| anyhow::anyhow!("GUI: {e}"))?;
+    run_gui(app)?;
 
     platform::shutdown();
     Ok(())
+}
+
+/// Окно агента с откатом рендерера. Зачем: glow требует OpenGL 2.0+, а на
+/// машинах без GPU (VM, RDP-сессия, Windows Server, CI-раннер) его нет —
+/// приложение молча умирало с «egui_glow requires opengl 2.0+» в логе. wgpu
+/// умеет DX12, в том числе программный WARP, и там окно всё равно откроется.
+/// Альтернативы: тащить ANGLE/Mesa рядом с .exe (ломает «один файл») или
+/// сразу жить на wgpu (дороже по старту на обычном ПК).
+fn run_gui(app: gui::AppState) -> Result<()> {
+    let pending = Arc::new(Mutex::new(Some(app)));
+    let mut last: Option<String> = None;
+    for renderer in [eframe::Renderer::Glow, eframe::Renderer::Wgpu] {
+        let opts = eframe::NativeOptions {
+            viewport: eframe::egui::ViewportBuilder::default()
+                .with_inner_size([1100.0, 680.0])
+                .with_min_inner_size([820.0, 520.0]),
+            renderer,
+            ..Default::default()
+        };
+        let slot = pending.clone();
+        let res = eframe::run_native(
+            "PC Agent",
+            opts,
+            Box::new(move |_cc| {
+                let app = slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .ok_or("окно агента уже было создано")?;
+                Ok(Box::new(app) as Box<dyn eframe::App>)
+            }),
+        );
+        match res {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                log::error!("GUI на {renderer:?} не поднялась: {e}");
+                last = Some(e.to_string());
+                // Состояние уже забрали в умершее окно — повторять нечем.
+                if pending.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    let why = last.unwrap_or_else(|| "неизвестная ошибка".into());
+    // Окна нет, консоли в релизе тоже нет: без этого сообщения двойной клик
+    // по ярлыку выглядит как «ничего не произошло».
+    gui::error_dialog(&format!(
+        "Не удалось открыть окно агента.\n\n{why}\n\nСкорее всего нет драйвера видеокарты или сессия без рабочего стола. Подробности в логе %APPDATA%\\PCAgent\\logs."
+    ));
+    anyhow::bail!("GUI: {why}")
 }
 
 /// Приём команд из GUI. Живёт всё время работы приложения: после задачи
