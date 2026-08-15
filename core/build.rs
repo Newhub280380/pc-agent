@@ -8,11 +8,24 @@ fn main() {
     println!("cargo:rerun-if-changed=../native/src");
     println!("cargo:rerun-if-changed=../native/include/agent_native.h");
 
-    if !cfg!(target_os = "windows") {
+    // Смотрим на ЦЕЛЬ, а не на хост: сам build.rs всегда собирается под хост,
+    // поэтому cfg!(target_os) здесь врёт при кросс-компиляции и раньше давал
+    // 30 «undefined reference to an_*» вместо понятной ошибки.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os != "windows" {
         // На не-Windows собирается только ядро (для проверки логики и CI).
         // Реальные «руки и глаза» существуют только под Windows.
         println!("cargo:warning=native-слой пропущен: цель не Windows (stub-режим)");
         return;
+    }
+    if target_env != "msvc" {
+        // C++/WinRT (OCR, UI Automation) есть только в MSVC-заголовках: под
+        // mingw эти интерфейсы отсутствуют, и линковка всё равно упадёт.
+        panic!(
+            "цель {target_os}-{target_env} не поддерживается: C++/WinRT-слой собирается только MSVC.\n\
+             Собирай релиз так: cargo build --release --target x86_64-pc-windows-msvc (или просто cargo build --release на Windows)."
+        );
     }
 
     let mut b = cc::Build::new();

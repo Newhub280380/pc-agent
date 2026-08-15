@@ -57,6 +57,22 @@ go build -ldflags "-s -w" -o pcagent-router.exe .
 cd ..\core; cargo build --release
 ```
 
+Цель сборки — только `x86_64-pc-windows-msvc`. Вариант
+`--target x86_64-pc-windows-gnu` (mingw) не поддерживается и падает осознанной
+ошибкой из `build.rs`: C++/WinRT-интерфейсы OCR и UI Automation есть только в
+MSVC-заголовках, под mingw их нет.
+
+### Проверка сборки без GUI
+
+```powershell
+dist\pcagent.exe --selfcheck --report selfcheck.txt   # пути, .env, роутер, экран, память
+dist\pcagent.exe --shot screen.png                    # снимок экрана глазами агента
+```
+
+`--selfcheck` возвращает ненулевой код, если хоть одна проверка провалилась —
+этим же пользуется windows-джоб CI и складывает отчёт со скриншотом в артефакт
+`pcagent-windows-smoke`.
+
 ### Сборка ядра на Linux/macOS
 
 `cargo check` / `cargo test` работают везде: платформенный слой подменяется
