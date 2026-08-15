@@ -414,9 +414,14 @@ fn init_logging(dir: &std::path::Path) {
         .append(true)
         .open(path)
     {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .target(env_logger::Target::Pipe(Box::new(file)))
-            .init();
+        // wgpu/naga на info вываливают в лог весь сгенерированный HLSL —
+        // это десятки КБ на каждый запуск и лог агента становится нечитаемым.
+        env_logger::Builder::from_env(
+            env_logger::Env::default()
+                .default_filter_or("info,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn"),
+        )
+        .target(env_logger::Target::Pipe(Box::new(file)))
+        .init();
     } else {
         env_logger::init();
     }

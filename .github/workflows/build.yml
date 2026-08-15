@@ -57,6 +57,16 @@ jobs:
           $gui = Start-Process $exe -PassThru
           Start-Sleep -Seconds 20
           Start-Process $exe -ArgumentList "--shot","$dir\gui.png" -Wait
+          # Второй кадр — окно с введённой задачей: печатаем текст в поле
+          # через SendKeys, чтобы в артефакте было видно не только пустое окно.
+          Add-Type -AssemblyName System.Windows.Forms, Microsoft.VisualBasic
+          try {
+            [Microsoft.VisualBasic.Interaction]::AppActivate($gui.Id)
+            Start-Sleep -Milliseconds 500
+            [System.Windows.Forms.SendKeys]::SendWait("{TAB}Open notepad and type hello")
+            Start-Sleep -Seconds 2
+            Start-Process $exe -ArgumentList "--shot","$dir\gui-task.png" -Wait
+          } catch { Write-Host "ввод задачи не удался: $_" }
           Stop-Process -Id $gui.Id -Force -ErrorAction SilentlyContinue
           Copy-Item "$env:APPDATA\PCAgent\logs\*.log" $dir -ErrorAction SilentlyContinue
           exit $sc.ExitCode
