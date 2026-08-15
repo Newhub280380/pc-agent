@@ -155,7 +155,7 @@ pub fn ui_tree(hwnd: u64) -> Result<Vec<UiElement>> {
     Ok(serde_json::from_str(&json).unwrap_or_default())
 }
 
-pub fn find_template(png: &[u8], min_score: f32) -> Result<Vec<(i32, i32, i32, i32, f32)>> {
+pub fn find_template(png: &[u8], min_score: f32) -> Result<Vec<super::TemplateHit>> {
     let f = grab()?;
     let mut rects = [AnRect::default(); 16];
     let mut found = 0i32;

@@ -3,6 +3,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+// WIN32_LEAN_AND_MEAN выкидывает OLE/COM из windows.h, а CoTaskMemAlloc/Free
+// нужны в каждом месте, где строка уходит в Rust.
+#include <objbase.h>
 #include <string>
 #include <vector>
 

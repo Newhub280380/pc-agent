@@ -13,6 +13,8 @@
 mod agent;
 mod android;
 mod config;
+#[cfg(test)]
+mod fuzz;
 mod gui;
 mod llm;
 mod memory;
@@ -172,11 +174,8 @@ fn main() -> Result<()> {
 /// Приём команд из GUI. Живёт всё время работы приложения: после задачи
 /// агент возвращается сюда и ждёт следующую.
 fn worker_loop(agent: &mut Agent, ev_tx: &Sender<AgentEvent>) {
-    loop {
-        let cmd = match agent.next_command() {
-            Some(c) => c,
-            None => break, // GUI закрылся — канал оборван
-        };
+    // Канал обрывается, когда GUI закрылся — это и есть выход из цикла.
+    while let Some(cmd) = agent.next_command() {
         match cmd {
             AgentCommand::Start(task) => {
                 agent.reset_stop();

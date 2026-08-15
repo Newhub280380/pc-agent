@@ -130,6 +130,13 @@ impl Agent {
         }
     }
 
+    /// Доступ к памяти. Отравленный мьютекс (паника в другом потоке) не должен
+    /// добивать агента: данные SQLite от этого не портятся, поэтому берём
+    /// содержимое и работаем дальше.
+    fn mem_lock(&self) -> std::sync::MutexGuard<'_, Memory> {
+        self.mem.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Блокирующее ожидание команды от GUI. None = GUI закрылся.
     pub fn next_command(&self) -> Option<AgentCommand> {
         self.rx.recv().ok()
@@ -157,7 +164,7 @@ impl Agent {
 
         // 1. Поднимаем прошлый опыт ДО планирования.
         let hints = {
-            let m = self.mem.lock().unwrap();
+            let m = self.mem_lock();
             m.recall_global(task, 8)?
                 .into_iter()
                 .map(|i| format!("- [{}] {}: {}", i.shelf, i.title, i.summary))
@@ -243,7 +250,7 @@ impl Agent {
 
             // --- ПАМЯТЬ: только нужная полка ---
             let (shelf_notes, lessons, digest) = {
-                let m = self.mem.lock().unwrap();
+                let m = self.mem_lock();
                 let notes = m
                     .recall(&shelf, &sub.goal, 6)?
                     .into_iter()
@@ -378,27 +385,22 @@ impl Agent {
                 importance,
             } = &decision.next
             {
-                let m = self.mem.lock().unwrap();
+                let m = self.mem_lock();
                 m.remember(&shelf, "fact", title, body, body, *importance)?;
             }
 
             match result {
                 Ok(Outcome::Ok(msg)) => {
                     if let Some(sig) = pending_lesson.take() {
-                        let _ = self.mem.lock().unwrap().mark_lesson_worked(&sig);
+                        let _ = self.mem_lock().mark_lesson_worked(&sig);
                     }
                     history.push(format!(
                         "{step}. {} → {}",
                         human_readable(&decision.next),
                         msg
                     ));
-                    self.mem.lock().unwrap().log_step(
-                        &task_id,
-                        step as i64,
-                        &act_str,
-                        &msg,
-                        true,
-                    )?;
+                    self.mem_lock()
+                        .log_step(&task_id, step as i64, &act_str, &msg, true)?;
                     failures.clear();
                 }
                 Ok(Outcome::SubtaskDone(res)) => {
@@ -410,7 +412,7 @@ impl Agent {
                 }
                 Ok(Outcome::Finished(report)) => {
                     self.log("Задача выполнена");
-                    let m = self.mem.lock().unwrap();
+                    let m = self.mem_lock();
                     m.remember(
                         &shelf,
                         "outcome",
@@ -454,19 +456,14 @@ impl Agent {
                     let err = e.to_string();
                     self.log(format!("Ошибка: {err}"));
                     failures.push(err.clone());
-                    self.mem.lock().unwrap().log_step(
-                        &task_id,
-                        step as i64,
-                        &act_str,
-                        &err,
-                        false,
-                    )?;
+                    self.mem_lock()
+                        .log_step(&task_id, step as i64, &act_str, &err, false)?;
 
                     // --- РЕФЛЕКСИЯ ---
                     let screen = view.prompt.clone();
                     match reflection::analyze(
                         &self.llm,
-                        &self.mem.lock().unwrap(),
+                        &self.mem_lock(),
                         &ctx,
                         &sub.goal,
                         &act_str,

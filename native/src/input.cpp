@@ -123,6 +123,15 @@ WORD vk_from_name(const std::string& n) {
 extern "C" int32_t an_mouse_move_human(int32_t x, int32_t y, int32_t duration_ms) {
   POINT p{};
   ::GetCursorPos(&p);
+  // Координаты приходят от модели и бывают любыми. Ограничиваем виртуальным
+  // экраном: иначе hypot на INT_MAX даёт огромный duration и агент встаёт.
+  const int vx = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int vy = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+  const int vw = std::max(1, ::GetSystemMetrics(SM_CXVIRTUALSCREEN));
+  const int vh = std::max(1, ::GetSystemMetrics(SM_CYVIRTUALSCREEN));
+  x = std::clamp(x, vx, vx + vw - 1);
+  y = std::clamp(y, vy, vy + vh - 1);
+  duration_ms = std::clamp(duration_ms, 0, 10000);
   human_move(p.x, p.y, x, y, duration_ms);
   return 0;
 }
@@ -158,6 +167,10 @@ extern "C" int32_t an_mouse_drag(int32_t x1, int32_t y1, int32_t x2, int32_t y2,
 extern "C" int32_t an_scroll(int32_t clicks, int32_t horizontal) {
   // Скроллим порциями по одному «щелчку» с паузой: колесо мыши физически
   // не может отдать 10 щелчков за 1мс, а такие пакеты — маркер бота.
+  // Лимит дублируется в Rust, но C ABI должен быть безопасен сам по себе:
+  // clicks = 100000 — это час зависания потока.
+  clicks = std::clamp(clicks, -50, 50);
+  if (clicks == 0) return 0;
   const int step = clicks > 0 ? 1 : -1;
   for (int i = 0; i != clicks; i += step) {
     INPUT in{}; in.type = INPUT_MOUSE;
@@ -170,7 +183,11 @@ extern "C" int32_t an_scroll(int32_t clicks, int32_t horizontal) {
 }
 
 extern "C" int32_t an_type_text_human(const char* utf8, int32_t wpm) {
+  if (!utf8) { an_set_error("type_text: null"); return -1; }
   std::wstring w = utf8_to_wide(utf8);
+  // Потолок на длину: при человеческой скорости 100k символов — это часы
+  // забитой клавиатуры, и остановить это можно только убив процесс.
+  if (w.size() > 20000) { an_set_error("type_text: слишком длинный текст"); return -1; }
   if (wpm <= 0) wpm = 240;  // ~240 зн/мин: быстрый, но реальный человек
   const int base = std::max(15, 60000 / std::max(60, wpm * 5));
   for (size_t i = 0; i < w.size(); ++i) {

@@ -39,14 +39,24 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+// Максимальный размер запроса от ядра. Реальный промпт со скриншотом в base64
+// — единицы мегабайт; 32 МиБ с запасом. Без лимита любой локальный процесс
+// (или вкладка браузера через fetch) кладёт роутер одним POST-ом.
+const maxBodyBytes = 32 << 20
+
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.AuthToken != "" {
-			got := r.Header.Get("X-Agent-Token")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.AuthToken)) != 1 {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
+		// Fail-closed: пустой токен в конфиге — не «режим без пароля», а
+		// сломанная установка. Иначе любой локальный процесс получает доступ
+		// к чужим API-ключам.
+		if s.cfg.AuthToken == "" {
+			http.Error(w, "router misconfigured: ROUTER_TOKEN is empty", http.StatusForbidden)
+			return
+		}
+		got := r.Header.Get("X-Agent-Token")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.AuthToken)) != 1 {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
 		}
 		next(w, r)
 	}
@@ -78,6 +88,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var req llm.Request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, llm.Response{Error: "bad request: " + err.Error()})

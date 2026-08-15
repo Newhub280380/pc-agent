@@ -13,6 +13,7 @@
 #include "../include/agent_native.h"
 #include <uiautomation.h>
 #include <atlbase.h>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,10 @@
 namespace {
 
 IUIAutomation* g_uia = nullptr;
+// GUI-поток и поток агента ходят в UIA одновременно (лог и шаг цикла),
+// а g_uia — глобальный указатель: без мьютекса это гонка на инициализации
+// и use-after-free при shutdown.
+std::mutex g_uia_mu;
 
 std::string control_type_name(CONTROLTYPEID id) {
   switch (id) {
@@ -44,7 +49,7 @@ std::string control_type_name(CONTROLTYPEID id) {
 
 void walk(IUIAutomationElement* el, IUIAutomationTreeWalker* walker, int depth, int maxDepth,
           std::string& json, bool& first, int& budget) {
-  if (!el || depth > maxDepth || budget <= 0) return;
+  if (!el || !walker || depth > maxDepth || budget <= 0) return;
 
   CComBSTR name, autoId;
   CONTROLTYPEID ct = 0;
@@ -85,8 +90,8 @@ void walk(IUIAutomationElement* el, IUIAutomationTreeWalker* walker, int depth, 
 
 }  // namespace
 
-// Вызывается из an_init.
-int32_t uia_init() {
+// Вызывается из an_init или лениво; вызывающий держит g_uia_mu.
+int32_t uia_init_locked() {
   if (g_uia) return 0;
   HRESULT hr = ::CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_IUIAutomation, (void**)&g_uia);
@@ -94,12 +99,20 @@ int32_t uia_init() {
   return 0;
 }
 
+int32_t uia_init() {
+  std::lock_guard<std::mutex> lk(g_uia_mu);
+  return uia_init_locked();
+}
+
 void uia_shutdown() {
+  std::lock_guard<std::mutex> lk(g_uia_mu);
   if (g_uia) { g_uia->Release(); g_uia = nullptr; }
 }
 
 extern "C" int32_t an_ui_tree(uint64_t hwnd, int32_t max_depth, char** out_json) {
-  if (!g_uia && uia_init() != 0) return -1;
+  if (!out_json) { an_set_error("ui_tree: out == null"); return -1; }
+  std::lock_guard<std::mutex> lk(g_uia_mu);
+  if (uia_init_locked() != 0) return -1;
   CComPtr<IUIAutomationElement> root;
   HWND h = hwnd ? reinterpret_cast<HWND>(hwnd) : ::GetForegroundWindow();
   if (FAILED(g_uia->ElementFromHandle(h, &root)) || !root) {
@@ -108,24 +121,33 @@ extern "C" int32_t an_ui_tree(uint64_t hwnd, int32_t max_depth, char** out_json)
   CComPtr<IUIAutomationTreeWalker> walker;
   // ControlViewWalker вместо RawView: raw содержит служебные узлы, которые
   // человеку (и модели) ни о чём не говорят.
-  g_uia->get_ControlViewWalker(&walker);
+  if (FAILED(g_uia->get_ControlViewWalker(&walker)) || !walker) {
+    an_set_error("UIA walker недоступен"); return -2;
+  }
 
   std::string json = "[";
   bool first = true;
   int budget = 400;  // жёсткий лимит узлов: контекст LLM не резиновый
-  walk(root, walker, 0, max_depth > 0 ? max_depth : 12, json, first, budget);
+  // max_depth сверху ограничен: walk — рекурсия, а дерево Electron бывает
+  // патологически глубоким — иначе переполнение стека.
+  const int depth = (max_depth > 0 && max_depth <= 64) ? max_depth : 12;
+  walk(root, walker, 0, depth, json, first, budget);
   json += "]";
-  *out_json = an_dup_cstr(json);
+  char* dup = an_dup_cstr(json);
+  if (!dup) { an_set_error("OOM"); return -3; }
+  *out_json = dup;
   return 0;
 }
 
 extern "C" int32_t an_ui_find(const char* name_substr, const char* control_type, an_rect* out) {
-  if (!g_uia && uia_init() != 0) return -1;
+  if (!out) { an_set_error("ui_find: out == null"); return -1; }
+  std::lock_guard<std::mutex> lk(g_uia_mu);
+  if (uia_init_locked() != 0) return -1;
   CComPtr<IUIAutomationElement> root;
   if (FAILED(g_uia->ElementFromHandle(::GetForegroundWindow(), &root)) || !root) return -2;
 
   CComPtr<IUIAutomationTreeWalker> walker;
-  g_uia->get_ControlViewWalker(&walker);
+  if (FAILED(g_uia->get_ControlViewWalker(&walker)) || !walker) return -2;
 
   std::string needle = name_substr ? name_substr : "";
   std::string wantType = control_type ? control_type : "";
@@ -140,6 +162,7 @@ extern "C" int32_t an_ui_find(const char* name_substr, const char* control_type,
   size_t pos = 0;
   while ((pos = json.find("{\"name\":\"", pos)) != std::string::npos) {
     size_t end = json.find('}', pos);
+    if (end == std::string::npos) break;
     std::string obj = json.substr(pos, end - pos);
     bool nameOk = needle.empty() || obj.find(json_escape(needle)) != std::string::npos;
     bool typeOk = wantType.empty() || obj.find("\"type\":\"" + wantType + "\"") != std::string::npos;

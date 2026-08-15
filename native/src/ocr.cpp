@@ -61,7 +61,11 @@ SoftwareBitmap make_bitmap(const an_image* img) {
 }  // namespace
 
 extern "C" int32_t an_ocr(const an_image* img, const char* lang_bcp47, char** out_json) {
-  if (!img || !img->data) { an_set_error("ocr: пустое изображение"); return -1; }
+  if (!img || !img->data || !out_json) { an_set_error("ocr: пустое изображение или out == null"); return -1; }
+  // stride меньше строки — это чтение за концом буфера в make_bitmap.
+  if (img->width <= 0 || img->height <= 0 || img->stride < img->width * 4) {
+    an_set_error("ocr: несогласованные размеры кадра"); return -1;
+  }
   try {
     OcrEngine engine{nullptr};
     if (lang_bcp47 && *lang_bcp47) {
@@ -93,10 +97,19 @@ extern "C" int32_t an_ocr(const an_image* img, const char* lang_bcp47, char** ou
       }
     }
     json += "]";
-    *out_json = an_dup_cstr(json);
+    char* dup = an_dup_cstr(json);
+    if (!dup) { an_set_error("OOM"); return -4; }
+    *out_json = dup;
     return 0;
   } catch (hresult_error const& e) {
     an_set_error("ocr winrt: " + wide_to_utf8(std::wstring(e.message())));
+    return -3;
+  } catch (std::exception const& e) {
+    // Любое исключение, пересекающее C ABI, — это UB и падение процесса.
+    an_set_error(std::string("ocr: ") + e.what());
+    return -3;
+  } catch (...) {
+    an_set_error("ocr: неизвестная ошибка");
     return -3;
   }
 }

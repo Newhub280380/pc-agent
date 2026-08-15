@@ -25,10 +25,23 @@ BOOL CALLBACK enum_mon(HMONITOR h, HDC, LPRECT r, LPARAM lp) {
   return TRUE;
 }
 
+// Потолок размера кадра. Откуда число: виртуальный экран из шести 8K-
+// мониторов — около 46080×8640. Ограничение важно не столько от реальных
+// мониторов, сколько от чужого HWND и прямых вызовов C ABI: без него
+// w*h*4 улетает в переполнение и в int32 внутри WIC.
+constexpr int kMaxDim = 65535;
+constexpr int64_t kMaxPixels = 512ll * 1024 * 1024;  // ~2 ГБ RGBA
+
 // Общий путь: DC источника -> DIB 32bpp -> RGBA.
 int32_t capture_dc(HDC src, int x, int y, int w, int h, an_image* out) {
+  if (!out) { an_set_error("capture: out == null"); return -1; }
+  if (!src) { an_set_error("capture: нет DC"); return -1; }
   if (w <= 0 || h <= 0) { an_set_error("capture: пустая область"); return -1; }
+  if (w > kMaxDim || h > kMaxDim || (int64_t)w * h > kMaxPixels) {
+    an_set_error("capture: слишком большая область"); return -1;
+  }
   HDC mem = ::CreateCompatibleDC(src);
+  if (!mem) { an_set_error("CreateCompatibleDC failed"); return -2; }
   BITMAPINFO bi{};
   bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
   bi.bmiHeader.biWidth = w;
@@ -39,7 +52,10 @@ int32_t capture_dc(HDC src, int x, int y, int w, int h, an_image* out) {
 
   void* bits = nullptr;
   HBITMAP bmp = ::CreateDIBSection(src, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-  if (!bmp) { ::DeleteDC(mem); an_set_error("CreateDIBSection failed"); return -2; }
+  if (!bmp || !bits) {
+    if (bmp) ::DeleteObject(bmp);
+    ::DeleteDC(mem); an_set_error("CreateDIBSection failed"); return -2;
+  }
   HGDIOBJ old = ::SelectObject(mem, bmp);
 
   // CAPTUREBLT нужен, чтобы попадали слоистые окна (подсказки, меню, курсорные
@@ -98,8 +114,9 @@ extern "C" int32_t an_capture_window(uint64_t hwnd, an_image* out) {
   HWND h = reinterpret_cast<HWND>(hwnd);
   if (!::IsWindow(h)) { an_set_error("невалидный HWND"); return -1; }
   RECT r{};
-  ::GetWindowRect(h, &r);
+  if (!::GetWindowRect(h, &r)) { an_set_error("GetWindowRect failed"); return -1; }
   HDC wdc = ::GetWindowDC(h);
+  if (!wdc) { an_set_error("GetWindowDC failed"); return -1; }
   int32_t rc = capture_dc(wdc, 0, 0, r.right - r.left, r.bottom - r.top, out);
   ::ReleaseDC(h, wdc);
   return rc;
@@ -112,7 +129,16 @@ extern "C" void an_free_image(an_image* img) {
 extern "C" int32_t an_encode_png(const an_image* img, uint8_t** out_buf, int32_t* out_len) {
   // WIC вместо libpng/stb: уже есть в системе, ноль зависимостей и он
   // аппаратно оптимизирован. Минус — только Windows, но нам туда и надо.
-  if (!img || !img->data) { an_set_error("png: пустое изображение"); return -1; }
+  if (!img || !img->data || !out_buf || !out_len) {
+    an_set_error("png: пустое изображение или out == null"); return -1;
+  }
+  if (img->width <= 0 || img->height <= 0 || img->stride < img->width * 4) {
+    an_set_error("png: несогласованные размеры"); return -1;
+  }
+  // Перемножаем в 64 битах: stride*height в int32 переполняется уже на
+  // многомониторном 8K и даёт WIC отрицательный размер буфера.
+  const int64_t total = (int64_t)img->stride * img->height;
+  if (total > (int64_t)0x7fffffff) { an_set_error("png: кадр слишком большой"); return -1; }
   IWICImagingFactory* factory = nullptr;
   if (FAILED(::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&factory)))) {
@@ -132,20 +158,25 @@ extern "C" int32_t an_encode_png(const an_image* img, uint8_t** out_buf, int32_t
     frame->SetSize(img->width, img->height);
     frame->SetPixelFormat(&fmt);
     if (SUCCEEDED(frame->WritePixels(img->height, img->stride,
-                                     img->stride * img->height, img->data)) &&
+                                     (UINT)total, img->data)) &&
         SUCCEEDED(frame->Commit()) && SUCCEEDED(enc->Commit())) {
       HGLOBAL hg = nullptr;
-      ::GetHGlobalFromStream(stream, &hg);
-      SIZE_T sz = ::GlobalSize(hg);
-      void* src = ::GlobalLock(hg);
-      auto* buf = static_cast<uint8_t*>(::CoTaskMemAlloc(sz));
-      if (buf) {
-        memcpy(buf, src, sz);
-        *out_buf = buf;
-        *out_len = (int32_t)sz;
-        rc = 0;
+      if (SUCCEEDED(::GetHGlobalFromStream(stream, &hg)) && hg) {
+        SIZE_T sz = ::GlobalSize(hg);
+        void* src = ::GlobalLock(hg);
+        // Размер отдаётся наружу как int32_t — обрезание дало бы Rust-стороне
+        // короткий срез чужой памяти, поэтому лучше честная ошибка.
+        if (src && sz > 0 && sz <= (SIZE_T)0x7fffffff) {
+          auto* buf = static_cast<uint8_t*>(::CoTaskMemAlloc(sz));
+          if (buf) {
+            memcpy(buf, src, sz);
+            *out_buf = buf;
+            *out_len = (int32_t)sz;
+            rc = 0;
+          }
+        }
+        if (src) ::GlobalUnlock(hg);
       }
-      ::GlobalUnlock(hg);
     }
   }
   if (frame) frame->Release();

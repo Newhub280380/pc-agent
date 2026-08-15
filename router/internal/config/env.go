@@ -12,6 +12,8 @@ package config
 
 import (
 	"bufio"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -63,6 +65,24 @@ var providerSpecs = []struct {
 	{"local", "openai", "LOCAL_API_KEY", "LOCAL_MODEL", "LOCAL_BASE_URL", "", "qwen2.5-vl-7b", true},
 }
 
+// checkLoopback не даёт роутеру с чужими API-ключами уехать в локальную сеть.
+// Опечатка в ROUTER_LISTEN ("0.0.0.0:8713") иначе превращает ноутбук в
+// открытый LLM-прокси для всех соседей по Wi-Fi.
+func checkLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("ROUTER_LISTEN должен быть вида host:port: %w", err)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("ROUTER_LISTEN=%q: разрешён только loopback (127.0.0.1/::1)", addr)
+	}
+	return nil
+}
+
 // Load читает .env (если есть) и переменные процесса.
 // Переменные процесса имеют приоритет над файлом — так удобнее отлаживать.
 func Load(envPath string) (*Config, error) {
@@ -77,8 +97,13 @@ func Load(envPath string) (*Config, error) {
 		return strings.TrimSpace(fileVals[k])
 	}
 
+	listen := firstNonEmpty(get("ROUTER_LISTEN"), "127.0.0.1:8713")
+	if err := checkLoopback(listen); err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
-		Listen:     firstNonEmpty(get("ROUTER_LISTEN"), "127.0.0.1:8713"),
+		Listen:     listen,
 		AuthToken:  get("ROUTER_TOKEN"),
 		LogDir:     firstNonEmpty(get("LOG_DIR"), filepath.Join(".", "logs")),
 		MaxRetries: atoiDefault(get("LLM_MAX_RETRIES"), 3),
