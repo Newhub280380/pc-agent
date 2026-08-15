@@ -28,10 +28,10 @@ type Request struct {
 	Messages     []Message `json:"messages"`
 	Temperature  float64   `json:"temperature"`
 	MaxTokens    int       `json:"max_tokens"`
-	JSONMode     bool      `json:"json_mode"`     // просим строгий JSON (план/действие)
-	NeedVision   bool      `json:"need_vision"`   // отсечь провайдеров без картинок
-	ForceProvide string    `json:"provider"`      // жёстко выбрать провайдера (отладка)
-	Purpose      string    `json:"purpose"`       // plan|act|reflect|summarize — для логов и метрик
+	JSONMode     bool      `json:"json_mode"`   // просим строгий JSON (план/действие)
+	NeedVision   bool      `json:"need_vision"` // отсечь провайдеров без картинок
+	ForceProvide string    `json:"provider"`    // жёстко выбрать провайдера (отладка)
+	Purpose      string    `json:"purpose"`     // plan|act|reflect|summarize — для логов и метрик
 }
 
 // Response — что возвращает роутер.

@@ -153,13 +153,60 @@ pub fn extract_json(text: &str) -> Result<serde_json::Value> {
     if let Ok(v) = serde_json::from_str(cleaned) {
         return Ok(v);
     }
-    let start = cleaned
-        .find(['{', '['])
-        .ok_or_else(|| anyhow!("в ответе нет JSON: {t}"))?;
+    let start = cleaned.find(['{', '[']).ok_or_else(|| {
+        // Обрезаем: ответ модели может содержать пересказ введённых данных,
+        // а ошибка уходит в лог на диске.
+        let head: String = t.chars().take(200).collect();
+        anyhow!("в ответе нет JSON: {head}")
+    })?;
     let open = cleaned.as_bytes()[start] as char;
     let close = if open == '{' { '}' } else { ']' };
     let end = cleaned
         .rfind(close)
         .ok_or_else(|| anyhow!("незакрытый JSON"))?;
+    // Ответ вида "} текст {" даёт end < start — срез такого диапазона
+    // паникует и убивает поток агента, поэтому возвращаем ошибку.
+    if end < start {
+        bail!("в ответе нет целого JSON-объекта");
+    }
     Ok(serde_json::from_str(&cleaned[start..=end])?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_json;
+
+    /// Мини-фаззер: агент не имеет права падать ни на одном ответе модели.
+    #[test]
+    fn extract_json_never_panics() {
+        let cases = [
+            "",
+            "   ",
+            "```",
+            "```json```",
+            "}{",
+            "] тут текст [",
+            "{\"a\":",
+            "{{{{{{{{",
+            "]]]]]]",
+            "привет {ключ} мир",
+            "```json\n{\"a\":1}\n```",
+            "текст [1,2,3] хвост",
+            "{\"кириллица\":\"да\"} и ещё } скобка",
+            "\u{1f600}{}\u{1f600}",
+            "{\"a\":\"\u{0}\"}",
+        ];
+        for c in cases {
+            let _ = extract_json(c); // важно: Result, а не паника
+        }
+        assert!(extract_json("}{").is_err());
+        assert!(extract_json("текст [1,2,3] хвост").is_ok());
+    }
+
+    #[test]
+    fn extract_json_handles_long_garbage() {
+        let long = "ц".repeat(100_000) + "{\"a\":1}";
+        assert!(extract_json(&long).is_ok());
+        assert!(extract_json(&"{".repeat(50_000)).is_err());
+    }
 }

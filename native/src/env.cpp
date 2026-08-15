@@ -26,12 +26,17 @@ extern "C" void an_shutdown(void) {
 }
 
 extern "C" int32_t an_foreground_window(uint64_t* hwnd, char** out_title) {
+  if (!hwnd || !out_title) { an_set_error("foreground_window: out == null"); return -1; }
   HWND h = ::GetForegroundWindow();
   if (!h) { an_set_error("нет активного окна"); return -1; }
-  *hwnd = reinterpret_cast<uint64_t>(h);
   wchar_t buf[512]{};
-  ::GetWindowTextW(h, buf, 511);
-  *out_title = an_dup_cstr(wide_to_utf8(buf));
+  // Предпоследний аргумент — размер буфера ВМЕСТЕ с \0, поэтому честный
+  // ARRAYSIZE, а не магическое 511.
+  int n = ::GetWindowTextW(h, buf, ARRAYSIZE(buf));
+  char* title = an_dup_cstr(wide_to_utf8(std::wstring(buf, buf + (n > 0 ? n : 0))));
+  if (!title) { an_set_error("OOM"); return -2; }
+  *hwnd = reinterpret_cast<uint64_t>(h);
+  *out_title = title;
   return 0;
 }
 
@@ -86,24 +91,39 @@ BOOL CALLBACK enum_proc(HWND h, LPARAM lp) {
 // Альтернатива — обход UIA-дерева рабочего стола, но он в разы медленнее
 // (десятки мс против сотен микросекунд) и требует COM в каждом потоке.
 extern "C" int32_t an_find_window(const char* title_substr, uint64_t* out_hwnd, char** out_title) {
+  if (!out_hwnd || !out_title) { an_set_error("find_window: out == null"); return -1; }
   FindCtx ctx;
   ctx.needle = lower_w(utf8_to_wide(title_substr));
   ::EnumWindows(&enum_proc, reinterpret_cast<LPARAM>(&ctx));
   if (!ctx.hit) { an_set_error("окно с таким заголовком не найдено"); return -1; }
+  char* title = an_dup_cstr(wide_to_utf8(ctx.title));
+  if (!title) { an_set_error("OOM"); return -2; }
   *out_hwnd = reinterpret_cast<uint64_t>(ctx.hit);
-  *out_title = an_dup_cstr(wide_to_utf8(ctx.title));
+  *out_title = title;
   return 0;
 }
 
 extern "C" int32_t an_clipboard_get(char** out_utf8) {
+  if (!out_utf8) { an_set_error("clipboard_get: out == null"); return -1; }
   if (!::OpenClipboard(nullptr)) { an_set_error("буфер обмена занят"); return -1; }
   HANDLE h = ::GetClipboardData(CF_UNICODETEXT);
-  if (!h) { ::CloseClipboard(); *out_utf8 = an_dup_cstr(""); return 0; }
-  auto* p = static_cast<wchar_t*>(::GlobalLock(h));
-  std::string s = p ? wide_to_utf8(p) : "";
-  ::GlobalUnlock(h);
+  std::string s;
+  if (h) {
+    auto* p = static_cast<wchar_t*>(::GlobalLock(h));
+    if (p) {
+      // Ограничиваем длину размером самого блока: чужое приложение могло
+      // положить в буфер текст без терминатора.
+      const size_t cap = ::GlobalSize(h) / sizeof(wchar_t);
+      size_t len = 0;
+      while (len < cap && p[len] != L'\0') ++len;
+      s = wide_to_utf8(std::wstring(p, p + len));
+      ::GlobalUnlock(h);
+    }
+  }
   ::CloseClipboard();
-  *out_utf8 = an_dup_cstr(s);
+  char* dup = an_dup_cstr(s);
+  if (!dup) { an_set_error("OOM"); return -2; }
+  *out_utf8 = dup;
   return 0;
 }
 
@@ -114,14 +134,24 @@ extern "C" int32_t an_clipboard_set(const char* utf8) {
   const size_t bytes = (w.size() + 1) * sizeof(wchar_t);
   HGLOBAL g = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
   if (!g) { ::CloseClipboard(); an_set_error("OOM"); return -2; }
-  memcpy(::GlobalLock(g), w.c_str(), bytes);
+  void* dst = ::GlobalLock(g);
+  if (!dst) { ::GlobalFree(g); ::CloseClipboard(); an_set_error("GlobalLock failed"); return -3; }
+  memcpy(dst, w.c_str(), bytes);
   ::GlobalUnlock(g);
-  ::SetClipboardData(CF_UNICODETEXT, g);  // владение переходит системе
+  // Владение переходит системе ТОЛЬКО при успехе; иначе память наша
+  // и её нужно освободить — иначе течь на каждой неудачной вставке.
+  if (!::SetClipboardData(CF_UNICODETEXT, g)) {
+    ::GlobalFree(g);
+    ::CloseClipboard();
+    an_set_error("SetClipboardData failed");
+    return -4;
+  }
   ::CloseClipboard();
   return 0;
 }
 
 extern "C" int32_t an_screen_size(int32_t* w, int32_t* h) {
+  if (!w || !h) { an_set_error("screen_size: out == null"); return -1; }
   *w = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
   *h = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
   return 0;

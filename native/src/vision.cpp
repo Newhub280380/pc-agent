@@ -130,7 +130,18 @@ bool decode_png(const uint8_t* buf, int len, Gray& out) {
       SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone,
                                  nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
     UINT w = 0, h = 0;
-    conv->GetSize(&w, &h);
+    if (FAILED(conv->GetSize(&w, &h))) { w = 0; h = 0; }
+    // Предел шаблона: это картинка кнопки, а не обои. Специально
+    // сжатый PNG на 20000×20000 иначе съедает память и время процесса.
+    constexpr UINT kMaxTplDim = 4096;
+    if (w == 0 || h == 0 || w > kMaxTplDim || h > kMaxTplDim) {
+      if (conv) conv->Release();
+      if (frame) frame->Release();
+      if (dec) dec->Release();
+      if (stream) stream->Release();
+      f->Release();
+      return false;
+    }
     std::vector<uint8_t> px((size_t)w * h * 4);
     if (SUCCEEDED(conv->CopyPixels(nullptr, w * 4, (UINT)px.size(), px.data()))) {
       out = to_gray(px.data(), (int)w, (int)h, (int)w * 4);
@@ -149,8 +160,16 @@ bool decode_png(const uint8_t* buf, int len, Gray& out) {
 
 extern "C" int32_t an_find_template(const an_image* haystack, const uint8_t* png, int32_t png_len,
                                     float min_score, an_rect* out, int32_t max_out, int32_t* found) {
+  // found разыменовывался до проверки — на нулевом указателе это падение
+  // всего процесса, а не код ошибки.
+  if (!found) { an_set_error("find_template: found == null"); return -1; }
   *found = 0;
   if (!haystack || !haystack->data || !png || png_len <= 0) { an_set_error("find_template: пустой вход"); return -1; }
+  if (max_out < 0 || (max_out > 0 && !out)) { an_set_error("find_template: out == null"); return -1; }
+  if (haystack->width <= 0 || haystack->height <= 0 ||
+      haystack->stride < haystack->width * 4) {
+    an_set_error("find_template: несогласованный кадр"); return -1;
+  }
   Gray tpl;
   if (!decode_png(png, png_len, tpl)) { an_set_error("не удалось декодировать PNG шаблона"); return -2; }
   Gray img = to_gray(haystack->data, haystack->width, haystack->height, haystack->stride);
@@ -164,7 +183,8 @@ extern "C" int32_t an_find_template(const an_image* haystack, const uint8_t* png
     Gray st = (s == 1.0f) ? tpl : resize(tpl, tw, th);
 
     // Грубый проход на 1/4 разрешения — быстро отсекаем пустые области.
-    Gray simg = resize(img, img.w / 2, img.h / 2);
+    // max(1, ...): для кадра в 1 пиксель деление даёт ноль и деление на ноль в resize.
+    Gray simg = resize(img, std::max(1, img.w / 2), std::max(1, img.h / 2));
     Gray stpl = resize(st, std::max(4, tw / 2), std::max(4, th / 2));
     std::vector<Hit> coarse;
     match(simg, stpl, std::max(0.5f, min_score - 0.15f), 2, coarse);

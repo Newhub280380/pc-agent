@@ -20,9 +20,17 @@
 #include <winrt/Windows.Graphics.Imaging.h>
 #include <winrt/Windows.Media.Ocr.h>
 #include <winrt/Windows.Storage.Streams.h>
-#include <robuffer.h>
 #include <string>
 #include <vector>
+
+// IMemoryBufferByteAccess нет ни в одном публичном заголовке C++/WinRT:
+// Microsoft в документации предписывает объявлять её вручную. robuffer.h
+// содержит только IBufferByteAccess (для IBuffer), а нам нужен доступ
+// к сырым байтам IMemoryBufferReference от BitmapBuffer.
+MIDL_INTERFACE("5b0d3235-4dba-4d44-865e-8f1d0e4fd04d")
+IMemoryBufferByteAccessLocal : ::IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE GetBuffer(BYTE** value, UINT32* capacity) = 0;
+};
 
 using namespace winrt;
 using namespace winrt::Windows::Graphics::Imaging;
@@ -39,7 +47,7 @@ SoftwareBitmap make_bitmap(const an_image* img) {
   {
     BitmapBuffer buffer = bmp.LockBuffer(BitmapBufferAccessMode::Write);
     auto ref = buffer.CreateReference();
-    auto access = ref.as<::Windows::Foundation::IMemoryBufferByteAccess>();
+    auto access = ref.as<IMemoryBufferByteAccessLocal>();
     uint8_t* dst = nullptr;
     uint32_t cap = 0;
     check_hresult(access->GetBuffer(&dst, &cap));
@@ -61,7 +69,11 @@ SoftwareBitmap make_bitmap(const an_image* img) {
 }  // namespace
 
 extern "C" int32_t an_ocr(const an_image* img, const char* lang_bcp47, char** out_json) {
-  if (!img || !img->data) { an_set_error("ocr: пустое изображение"); return -1; }
+  if (!img || !img->data || !out_json) { an_set_error("ocr: пустое изображение или out == null"); return -1; }
+  // stride меньше строки — это чтение за концом буфера в make_bitmap.
+  if (img->width <= 0 || img->height <= 0 || img->stride < img->width * 4) {
+    an_set_error("ocr: несогласованные размеры кадра"); return -1;
+  }
   try {
     OcrEngine engine{nullptr};
     if (lang_bcp47 && *lang_bcp47) {
@@ -93,10 +105,19 @@ extern "C" int32_t an_ocr(const an_image* img, const char* lang_bcp47, char** ou
       }
     }
     json += "]";
-    *out_json = an_dup_cstr(json);
+    char* dup = an_dup_cstr(json);
+    if (!dup) { an_set_error("OOM"); return -4; }
+    *out_json = dup;
     return 0;
   } catch (hresult_error const& e) {
     an_set_error("ocr winrt: " + wide_to_utf8(std::wstring(e.message())));
+    return -3;
+  } catch (std::exception const& e) {
+    // Любое исключение, пересекающее C ABI, — это UB и падение процесса.
+    an_set_error(std::string("ocr: ") + e.what());
+    return -3;
+  } catch (...) {
+    an_set_error("ocr: неизвестная ошибка");
     return -3;
   }
 }

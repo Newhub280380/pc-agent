@@ -1,0 +1,59 @@
+# Политика зависимостей для cargo-deny.
+#
+# Зачем файл: без него cargo-deny запрещает вообще все лицензии и падает
+# на 345 «ошибок», которые ничего не значат. Здесь явно записано, что мы
+# считаем допустимым в продукте, который раздаётся как один .exe.
+
+[advisories]
+# unmaintained-предупреждения не блокируют сборку, но видны в отчёте.
+ignore = [
+    # ttf-parser заброшен автором. Тянется транзитивно: eframe -> egui ->
+    # epaint -> ab_glyph -> owned_ttf_parser. Безопасного апгрейда нет
+    # (апстрим egui ещё не перешёл на skrifa), уязвимости с CVE тоже нет —
+    # это парсер шрифтов, работающий только на встроенных шрифтах GUI,
+    # внешние .ttf мы не грузим. Снять после апгрейда egui.
+    "RUSTSEC-2026-0192",
+]
+
+[licenses]
+# Разрешаем пермиссивные лицензии и слабый копилефт файлового уровня
+# (MPL-2.0): мы не модифицируем эти файлы, а линкуемся.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "OFL-1.1",
+]
+confidence-threshold = 0.9
+
+# epaint везёт встроенные шрифты (Ubuntu Font под UFL-1.0). SPDX такого
+# идентификатора не знает, поэтому подтверждаем вручную: шрифт распространяется
+# как есть, без модификаций — условия UFL это позволяют.
+[[licenses.clarify]]
+crate = "epaint"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# Само приложение не публикуется в crates.io и лицензии в манифесте не имеет —
+# это продукт пользователя, а не библиотека.
+[licenses.private]
+ignore = true

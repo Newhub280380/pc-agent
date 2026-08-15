@@ -5,6 +5,7 @@
 //!   - безопасность: агент физически не может выполнить произвольную команду;
 //!   - валидация: неизвестное действие отсекается до выполнения;
 //!   - воспроизводимость: каждый шаг сериализуем в журнал и повторяем.
+//!
 //! Минус — ограниченный набор возможностей; поэтому набор расширяемый и
 //! включает `Shell` под явным разрешением пользователя (см. Permissions).
 
@@ -164,12 +165,29 @@ impl Action {
                 .any(|k| n.contains(k))
             }
             Action::AdbShell { .. } => true,
+            // Запуск произвольного exe с аргументами — это фактически «выполни
+            // что угодно» (powershell -enc ...). Модель может получить такую
+            // команду со страницы (prompt injection), поэтому спрашиваем человека.
+            Action::LaunchApp { .. } => true,
             _ => false,
         }
     }
 
+    /// Короткая запись действия для истории, промпта и журнала в БД.
+    /// Содержимое type_text/adb_text намеренно не пишем целиком: там бывают
+    /// пароли и коды, а memory.db лежит на диске в открытом виде.
     pub fn short(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "?".into())
+        match self {
+            Action::TypeText { text, press_enter } => format!(
+                "{{\"action\":\"type_text\",\"len\":{},\"press_enter\":{press_enter}}}",
+                text.chars().count()
+            ),
+            Action::AdbText { text } => format!(
+                "{{\"action\":\"adb_text\",\"len\":{}}}",
+                text.chars().count()
+            ),
+            _ => serde_json::to_string(self).unwrap_or_else(|_| "?".into()),
+        }
     }
 }
 

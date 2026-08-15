@@ -27,6 +27,9 @@ pub struct Screenshot {
     pub png: Vec<u8>,
 }
 
+/// Найденное вхождение шаблона: x, y, ширина, высота, score 0..1.
+pub type TemplateHit = (i32, i32, i32, i32, f32);
+
 /// Элемент интерфейса из UI Automation или OCR.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiElement {

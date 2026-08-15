@@ -107,6 +107,9 @@ impl Adb {
     /// Подключение по Wi-Fi: телефон и ПК в одной сети, порт 5555.
     /// Первый раз всё равно нужен кабель — это ограничение Android, не наше.
     pub fn connect_wifi(&mut self, ip: &str) -> Result<()> {
+        if !is_host(ip) {
+            bail!("некорректный адрес телефона: {ip}");
+        }
         self.run(&["tcpip", "5555"]).ok();
         std::thread::sleep(Duration::from_millis(1500));
         let out = self.run(&["connect", &format!("{ip}:5555")])?;
@@ -135,8 +138,10 @@ impl Adb {
     /// сообщаем, что нужно поставить (агент просит инструмент, а не молчит).
     pub fn type_text(&self, text: &str) -> Result<()> {
         if text.is_ascii() {
-            let escaped = text.replace(' ', "%s").replace('\'', "\\'");
-            return self.shell(&format!("input text '{escaped}'")).map(|_| ());
+            // Кавычим по правилам sh: без этого текст вида `'; reboot; '`
+            // выполнился бы на телефоне как отдельная команда.
+            let escaped = sh_quote(&text.replace(' ', "%s"));
+            return self.shell(&format!("input text {escaped}")).map(|_| ());
         }
         let has_kb = self
             .shell("ime list -a")
@@ -147,15 +152,30 @@ impl Adb {
         }
         self.shell("ime set com.android.adbkeyboard/.AdbIME").ok();
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text);
-        self.shell(&format!("am broadcast -a ADB_INPUT_B64 --es msg '{b64}'"))
-            .map(|_| ())
+        self.shell(&format!(
+            "am broadcast -a ADB_INPUT_B64 --es msg {}",
+            sh_quote(&b64)
+        ))
+        .map(|_| ())
     }
 
     pub fn key(&self, keycode: &str) -> Result<()> {
+        // keyevent — это имя константы или число, ничего другого туда попасть
+        // не должно: строка идёт в sh на телефоне.
+        if keycode.is_empty()
+            || !keycode
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            bail!("недопустимый keycode: {keycode}");
+        }
         self.shell(&format!("input keyevent {keycode}")).map(|_| ())
     }
 
     pub fn open_app(&self, package: &str) -> Result<()> {
+        if !is_package(package) {
+            bail!("недопустимое имя пакета: {package}");
+        }
         self.shell(&format!(
             "monkey -p {package} -c android.intent.category.LAUNCHER 1"
         ))
@@ -187,9 +207,30 @@ impl Adb {
     }
 }
 
+/// Кавычки для sh на телефоне: одинарные кавычки + разрыв для '.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+fn is_package(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= 255
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+fn is_host(h: &str) -> bool {
+    let host = h.split(':').next().unwrap_or(h);
+    !host.is_empty()
+        && host.len() <= 255
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
 /// Минимальный парсер атрибутов uiautomator. Полноценный XML-парсер здесь
 /// избыточен: структура плоская и генерируется машиной.
-fn parse_ui_xml(xml: &str) -> Vec<AndroidElement> {
+pub(crate) fn parse_ui_xml(xml: &str) -> Vec<AndroidElement> {
     let mut out = vec![];
     for node in xml.split("<node ").skip(1) {
         let attr = |k: &str| -> String {
@@ -199,9 +240,9 @@ fn parse_ui_xml(xml: &str) -> Vec<AndroidElement> {
                 .unwrap_or("")
                 .to_string()
         };
-        let bounds = attr("bounds"); // формат [x1,y1][x2,y2]
-        let nums: Vec<i32> = bounds
-            .split(|c: char| !c.is_ascii_digit())
+        let bounds = attr("bounds"); // формат [x1,y1][x2,y2], координаты бывают < 0
+        let nums: Vec<i64> = bounds
+            .split(|c: char| !c.is_ascii_digit() && c != '-')
             .filter(|s| !s.is_empty())
             .filter_map(|s| s.parse().ok())
             .collect();
@@ -218,12 +259,21 @@ fn parse_ui_xml(xml: &str) -> Vec<AndroidElement> {
             desc,
             class: attr("class"),
             clickable: attr("clickable") == "true",
-            cx: (nums[0] + nums[2]) / 2,
-            cy: (nums[1] + nums[3]) / 2,
+            // i64 и clamp: кривой dump с гигантскими числами не должен
+            // ронять агента переполнением i32.
+            cx: (nums[0].saturating_add(nums[2]) / 2).clamp(i32::MIN as i64, i32::MAX as i64)
+                as i32,
+            cy: (nums[1].saturating_add(nums[3]) / 2).clamp(i32::MIN as i64, i32::MAX as i64)
+                as i32,
         });
+        if out.len() >= MAX_ELEMENTS {
+            break; // защита от гигантского dump: память и промпт не резиновые
+        }
     }
     out
 }
+
+const MAX_ELEMENTS: usize = 2000;
 
 /// Текстовое описание экрана телефона для промпта.
 pub fn android_screen_prompt(adb: &Adb) -> Result<String> {
@@ -246,4 +296,34 @@ pub fn android_screen_prompt(adb: &Adb) -> Result<String> {
         ));
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoting_blocks_shell_injection() {
+        assert_eq!(sh_quote("a'b"), r"'a'\''b'");
+        assert!(!is_package("com.app; rm -rf /"));
+        assert!(is_package("com.google.android.youtube"));
+        assert!(!is_host("1.2.3.4; reboot"));
+        assert!(is_host("192.168.1.50:5555"));
+    }
+
+    #[test]
+    fn ui_xml_survives_garbage() {
+        assert!(parse_ui_xml("").is_empty());
+        assert!(parse_ui_xml("<node text=\"a\"").is_empty());
+        assert!(parse_ui_xml("<node bounds=\"[1,2][3\" text=\"a\"/>").is_empty());
+        let big = format!(
+            "<node text=\"x\" bounds=\"[{m},{m}][{m},{m}]\"/>",
+            m = i64::MAX
+        );
+        let els = parse_ui_xml(&big);
+        assert_eq!(els.len(), 1);
+        assert_eq!(els[0].cx, i32::MAX);
+        let neg = parse_ui_xml("<node text=\"x\" bounds=\"[-40,-10][60,30]\"/>");
+        assert_eq!((neg[0].cx, neg[0].cy), (10, 10));
+    }
 }

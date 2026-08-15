@@ -28,7 +28,7 @@ pub fn ocr(_png: &[u8], _lang: &str) -> Result<Vec<UiElement>> {
 pub fn ui_tree(_hwnd: u64) -> Result<Vec<UiElement>> {
     bail!(MSG)
 }
-pub fn find_template(_png: &[u8], _min_score: f32) -> Result<Vec<(i32, i32, i32, i32, f32)>> {
+pub fn find_template(_png: &[u8], _min_score: f32) -> Result<Vec<super::TemplateHit>> {
     bail!(MSG)
 }
 pub fn mouse_move(_x: i32, _y: i32) -> Result<()> {

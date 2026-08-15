@@ -16,8 +16,11 @@ fn main() {
     }
 
     let mut b = cc::Build::new();
+    // C++20, а не 17: C++/WinRT под C++17 тянет <experimental/coroutine>,
+    // который в свежих MSVC (VS2026) выдаёт static_assert «REMOVED SOON».
+    // Это же снимает нужду в /await — корутины теперь штатные.
     b.cpp(true)
-        .std("c++17")
+        .std("c++20")
         .include("../native/include")
         .file("../native/src/common.cpp")
         .file("../native/src/capture.cpp")
@@ -27,7 +30,6 @@ fn main() {
         .file("../native/src/env.cpp")
         .file("../native/src/ocr.cpp")
         .flag_if_supported("/EHsc")
-        .flag_if_supported("/await")
         .define("UNICODE", None)
         .define("_UNICODE", None);
     b.compile("agent_native");

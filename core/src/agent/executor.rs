@@ -129,7 +129,9 @@ impl Executor {
                 Ok(Outcome::Ok(format!("клавиши {combo}")))
             }
             Action::Scroll { clicks, horizontal } => {
-                platform::scroll(*clicks, *horizontal)?;
+                // Модель любит попросить «скролл 100000» — это часы зависания в SendInput.
+                let clicks = (*clicks).clamp(-50, 50);
+                platform::scroll(clicks, *horizontal)?;
                 Ok(Outcome::Ok(format!("скролл {clicks}")))
             }
             Action::Drag { x1, y1, x2, y2 } => {
@@ -137,6 +139,7 @@ impl Executor {
                 Ok(Outcome::Ok("перетаскивание выполнено".into()))
             }
             Action::OpenUrl { url } => {
+                check_url(url)?;
                 // Открываем в браузере ПО УМОЛЧАНИЮ и в профиле пользователя:
                 // его куки, его сессии, его «отпечаток». Никакого headless —
                 // именно этого требует режим «Человек».
@@ -217,14 +220,29 @@ impl Executor {
     }
 }
 
+/// URL приходит от модели, а значит может быть подсунут через prompt injection
+/// на странице. Пускаем только http/https без управляющих символов:
+/// file://, а тем более `"& calc.exe`, открывать нельзя.
+fn check_url(url: &str) -> Result<()> {
+    let u = url.trim();
+    if !(u.starts_with("http://") || u.starts_with("https://")) {
+        bail!("разрешены только http(s)-ссылки, получено: {u}");
+    }
+    if u.len() > 2048 || u.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        bail!("подозрительный URL");
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn open_default(url: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
-    // cmd /c start открывает URL в браузере по умолчанию с профилем
-    // пользователя. CREATE_NO_WINDOW — чтобы не моргало чёрное окно.
+    // Без cmd.exe: `cmd /C start "" <url>` интерпретирует &, |, ^ и превращает
+    // любой подсунутый URL в выполнение команд. explorer.exe отдаёт
+    // ссылку браузеру по умолчанию так же, но без оболочки.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
+    std::process::Command::new("explorer.exe")
+        .arg(url)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
@@ -232,6 +250,7 @@ fn open_default(url: &str) -> Result<()> {
 
 #[cfg(not(windows))]
 fn open_default(url: &str) -> Result<()> {
+    // на Linux это только режим разработки
     std::process::Command::new("xdg-open").arg(url).spawn()?;
     Ok(())
 }
@@ -253,5 +272,22 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_url;
+
+    #[test]
+    fn only_http_urls_are_opened() {
+        assert!(check_url("https://facebook.com/adsmanager").is_ok());
+        assert!(check_url("http://localhost:3000/x?a=1&b=2").is_ok());
+        // Именно эти строки раньше уезжали в cmd.exe как команды.
+        assert!(check_url("https://a.com\" & calc.exe").is_err());
+        assert!(check_url("file:///C:/Windows/System32/cmd.exe").is_err());
+        assert!(check_url("javascript:alert(1)").is_err());
+        assert!(check_url("").is_err());
+        assert!(check_url(&("https://a.com/".to_string() + &"x".repeat(3000))).is_err());
     }
 }
