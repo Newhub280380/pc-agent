@@ -1,0 +1,48 @@
+[package]
+name = "pcagent"
+version = "1.0.0"
+edition = "2021"
+build = "build.rs"
+description = "Автономный PC-агент: ядро (Rust) + руки/глаза (C++) + сеть (Go)"
+
+[dependencies]
+# GUI: egui/eframe — immediate mode, собирается в тот же .exe, без Electron
+# и без WebView2 (это было бы +100 МБ рантайма и внешняя зависимость).
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.28"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+# ureq: блокирующий HTTP без tokio. Агент по своей природе последователен
+# (один экран — одно действие), поэтому async-рантайм тут только усложнил бы код.
+ureq = { version = "2", features = ["json", "tls"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+# SQLite с FTS5 — «полки» памяти. bundled: sqlite компилируется внутрь .exe,
+# внешних DLL не требуется.
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+rand = "0.8"
+dirs = "5"
+log = "0.4"
+env_logger = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+  "Win32_Security",
+] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

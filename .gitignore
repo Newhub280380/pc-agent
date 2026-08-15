@@ -1,0 +1,8 @@
+core/target/
+dist/
+router/pcagent-router
+router/pcagent-router.exe
+.env
+*.db
+*.db-wal
+*.db-shm
