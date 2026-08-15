@@ -20,9 +20,17 @@
 #include <winrt/Windows.Graphics.Imaging.h>
 #include <winrt/Windows.Media.Ocr.h>
 #include <winrt/Windows.Storage.Streams.h>
-#include <robuffer.h>
 #include <string>
 #include <vector>
+
+// IMemoryBufferByteAccess нет ни в одном публичном заголовке C++/WinRT:
+// Microsoft в документации предписывает объявлять её вручную. robuffer.h
+// содержит только IBufferByteAccess (для IBuffer), а нам нужен доступ
+// к сырым байтам IMemoryBufferReference от BitmapBuffer.
+MIDL_INTERFACE("5b0d3235-4dba-4d44-865e-8f1d0e4fd04d")
+IMemoryBufferByteAccessLocal : ::IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE GetBuffer(BYTE** value, UINT32* capacity) = 0;
+};
 
 using namespace winrt;
 using namespace winrt::Windows::Graphics::Imaging;
@@ -39,7 +47,7 @@ SoftwareBitmap make_bitmap(const an_image* img) {
   {
     BitmapBuffer buffer = bmp.LockBuffer(BitmapBufferAccessMode::Write);
     auto ref = buffer.CreateReference();
-    auto access = ref.as<::Windows::Foundation::IMemoryBufferByteAccess>();
+    auto access = ref.as<IMemoryBufferByteAccessLocal>();
     uint8_t* dst = nullptr;
     uint32_t cap = 0;
     check_hresult(access->GetBuffer(&dst, &cap));
