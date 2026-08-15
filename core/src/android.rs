@@ -62,27 +62,44 @@ impl Adb {
             .unwrap_or(false)
     }
 
+    /// Все вызовы adb идут через песочницу: таймаут (телефон умеет уснуть
+    /// посреди команды и держать конвейер вечно) и лимит вывода (uiautomator
+    /// dump на «тяжёлом» экране — сотни килобайт, а это платные токены).
+    /// Повтор с экспонентой закрывает типовое «device offline» после засыпания.
     fn run(&self, args: &[&str]) -> Result<String> {
         if !self.available() {
             // Явная просьба вместо тихого отказа — как требовал пользователь.
             bail!("ADB не найден. Установи Android Platform Tools и укажи путь в .env (ADB_PATH), либо добавь adb в PATH");
         }
-        let mut cmd = Command::new(&self.exe);
+        let mut argv: Vec<String> = Vec::with_capacity(args.len() + 2);
         if let Some(s) = &self.serial {
-            cmd.args(["-s", s]);
+            argv.push("-s".into());
+            argv.push(s.clone());
         }
-        cmd.args(args);
-        let out = cmd.output()?;
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        if !out.status.success() {
-            bail!(
-                "adb {:?} упал: {}",
-                args,
-                if stderr.is_empty() { stdout } else { stderr }
-            );
+        argv.extend(args.iter().map(|a| a.to_string()));
+
+        let limits = crate::sandbox::Limits {
+            timeout: Duration::from_secs(45),
+            max_output: 2 * 1024 * 1024,
+        };
+        let out = crate::retry::retry(&crate::retry::Backoff::quick(), "adb", |_| {
+            let o = crate::sandbox::run(&self.exe, &argv, &limits)?;
+            if !o.ok() {
+                let msg = if o.stderr.trim().is_empty() {
+                    o.stdout.clone()
+                } else {
+                    o.stderr.clone()
+                };
+                bail!("adb {:?} упал: {}", args, msg.trim());
+            }
+            Ok(o)
+        })?;
+        // Обрезку показываем модели явно: иначе она сделает вывод по половине
+        // дампа и решит, что элемента на экране нет.
+        if out.truncated {
+            return Ok(format!("{}\n[вывод adb обрезан по лимиту]", out.stdout));
         }
-        Ok(stdout)
+        Ok(out.stdout)
     }
 
     /// Список устройств. Если ровно одно — сразу выбираем его.

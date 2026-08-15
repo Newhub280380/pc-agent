@@ -136,10 +136,14 @@ pub struct Decision {
     #[serde(default)]
     pub thought: String,
     pub next: Action,
-    /// Уверенность 0..1. Ниже порога — агент сначала уточняет экран, а не
-    /// делает необратимое действие (оплата, отправка, удаление).
+    /// Уверенность 0..1. Ниже порога (react::MIN_CONFIDENCE) агент не действует,
+    /// а задаёт уточняющий вопрос — неверный клик дороже вопроса.
     #[serde(default = "half")]
     pub confidence: f64,
+    /// Что именно спросить у человека при низкой уверенности. Модель
+    /// формулирует вопрос точнее, чем автошаблон «что делать дальше?».
+    #[serde(default)]
+    pub question: String,
 }
 
 impl Action {
@@ -207,6 +211,9 @@ mod tests {
         let d: Decision = serde_json::from_value(extract_json(raw).unwrap()).unwrap();
         assert!(matches!(d.next, Action::ClickElement { .. }));
         assert!(!d.next.is_destructive());
+        // Отсутствие question — норма: при высокой уверенности он не нужен.
+        assert!(d.question.is_empty());
+        assert!(d.confidence > 0.8);
     }
 
     #[test]
