@@ -36,6 +36,10 @@ log = "0.4"
 env_logger = "0.11"
 
 [target.'cfg(windows)'.dependencies]
+# egui-wgpu сам не включает ни одного бэкенда, поэтому DX12 включаем явно:
+# иначе wgpu пробует только Vulkan/GL, которых на машине без драйвера
+# видеокарты нет, а DX12 даёт хотя бы программный адаптер WARP.
+wgpu = { version = "0.20", default-features = false, features = ["dx12"] }
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_System_Threading",
