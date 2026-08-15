@@ -36,6 +36,35 @@ jobs:
         with:
           name: pcagent-windows-x64
           path: core/target/release/pcagent.exe
+      # Дым-проверка на живой Windows: exe стартует, роутер отвечает,
+      # native-слой видит экран, GUI рисуется. Не валит сборку: на раннере
+      # нет полноценной интерактивной сессии, поэтому часть проверок экрана
+      # может быть недоступна — но отчёт и снимок всё равно сохраняются.
+      - name: Smoke на Windows (selfcheck + скриншоты)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path core/target/release/pcagent.exe
+          New-Item -ItemType Directory -Force "$env:APPDATA\PCAgent" | Out-Null
+          # Согласие проставляем заранее: модальное окно первого запуска
+          # в CI нажать некому.
+          Set-Content "$env:APPDATA\PCAgent\consent.json" "ci"
+          $dir = (New-Item -ItemType Directory -Force ci-evidence).FullName
+          # Start-Process -Wait обязателен: exe собран как windows-подсистема,
+          # PowerShell такие процессы не ждёт и отчёта бы ещё не было.
+          $sc = Start-Process $exe -ArgumentList "--selfcheck","--report","$dir\selfcheck.txt" -Wait -PassThru
+          if (Test-Path "$dir\selfcheck.txt") { Get-Content "$dir\selfcheck.txt" }
+          $gui = Start-Process $exe -PassThru
+          Start-Sleep -Seconds 20
+          Start-Process $exe -ArgumentList "--shot","$dir\gui.png" -Wait
+          Stop-Process -Id $gui.Id -Force -ErrorAction SilentlyContinue
+          Copy-Item "$env:APPDATA\PCAgent\logs\*.log" $dir -ErrorAction SilentlyContinue
+          exit $sc.ExitCode
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pcagent-windows-smoke
+          path: ci-evidence
 
   linux-core:
     runs-on: ubuntu-latest

@@ -47,6 +47,16 @@ const CONSENT_TEXT: &str = "\
 Ключи API берутся из .env в %APPDATA%\\PCAgent — ими распоряжаешься только ты.";
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Два служебных режима без GUI: нужны, чтобы Windows-машина (в том числе
+    // CI) могла доказать, что .exe реально стартует и видит экран.
+    if args.iter().any(|a| a == "--selfcheck") {
+        return selfcheck(flag_value(&args, "--report").as_deref());
+    }
+    if let Some(path) = flag_value(&args, "--shot") {
+        return shot(std::path::Path::new(&path));
+    }
+
     let paths = config::Paths::resolve()?;
     init_logging(&paths.logs);
 
@@ -198,6 +208,130 @@ fn worker_loop(agent: &mut Agent, ev_tx: &Sender<AgentEvent>) {
             AgentCommand::Answer(_) => {}
         }
     }
+}
+
+/// Значение флага в виде `--flag value`. Своего парсера аргументов достаточно:
+/// флагов два, тянуть clap ради них — лишние 300 КБ в .exe.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+}
+
+/// Самопроверка: пути, .env, роутер, native-слой, экран, память.
+/// Пишет отчёт в файл, потому что в релизе консоли у GUI-приложения нет.
+fn selfcheck(report: Option<&str>) -> Result<()> {
+    let mut lines: Vec<String> = vec![format!(
+        "pcagent selfcheck {}  exe={}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    )];
+    let mut failed = 0usize;
+    let mut step = |name: &str, r: Result<String>| -> bool {
+        match r {
+            Ok(d) => {
+                lines.push(format!("[ok]   {name}: {d}"));
+                true
+            }
+            Err(e) => {
+                failed += 1;
+                lines.push(format!("[FAIL] {name}: {e}"));
+                false
+            }
+        }
+    };
+
+    let paths = config::Paths::resolve()?;
+    step("пути", Ok(paths.root.display().to_string()));
+    step(
+        ".env",
+        config::ensure_env_file(&paths.env_file).map(|created| {
+            if created {
+                "создан шаблон".to_string()
+            } else {
+                "уже есть".to_string()
+            }
+        }),
+    );
+    let settings = config::Settings::load(&paths.env_file)?;
+    let router = supervisor::Router::start(
+        &paths.router_exe,
+        &paths.env_file,
+        &format!("{}/health", settings.router_url),
+    );
+    match router {
+        Ok(r) => {
+            step(
+                "роутер",
+                Ok(format!("{} /health отвечает", settings.router_url)),
+            );
+            drop(r);
+        }
+        Err(e) => {
+            step("роутер", Err(e));
+        }
+    }
+    if step(
+        "native-слой",
+        platform::init().map(|()| "инициализирован".into()),
+    ) {
+        step(
+            "экран",
+            platform::screen_size().map(|(w, h)| format!("{w}x{h}")),
+        );
+        step(
+            "скриншот",
+            platform::capture_screen()
+                .map(|s| format!("{}x{}, PNG {} КБ", s.width, s.height, s.png.len() / 1024)),
+        );
+        step(
+            "активное окно",
+            platform::foreground_window().map(|(_, title)| title),
+        );
+    }
+    step(
+        "память",
+        memory::Memory::open(&paths.memory_db).and_then(|m| {
+            let (mm, sh, ls) = m.stats()?;
+            Ok(format!("{mm} записей / {sh} полок / {ls} уроков"))
+        }),
+    );
+    platform::shutdown();
+
+    lines.push(format!(
+        "итог: проверок {}, провалено {failed}",
+        lines.len() - 1
+    ));
+    let text = lines.join("\n");
+    println!("{text}");
+    if let Some(path) = report {
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        std::fs::write(path, format!("{text}\n"))?;
+    }
+    if failed > 0 {
+        anyhow::bail!("selfcheck: провалено проверок: {failed}");
+    }
+    Ok(())
+}
+
+/// Снимок экрана в файл — тем же путём, которым агент «видит» экран.
+fn shot(path: &std::path::Path) -> Result<()> {
+    platform::init()?;
+    let s = platform::capture_screen();
+    platform::shutdown();
+    let s = s?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    std::fs::write(path, &s.png)?;
+    println!("{}x{} -> {}", s.width, s.height, path.display());
+    Ok(())
 }
 
 fn describe_providers(llm: &llm::LlmClient, mem: &Arc<Mutex<memory::Memory>>) -> String {
