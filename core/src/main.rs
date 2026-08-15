@@ -191,6 +191,17 @@ fn run_gui(app: gui::AppState) -> Result<()> {
                 .with_inner_size([1100.0, 680.0])
                 .with_min_inner_size([820.0, 520.0]),
             renderer,
+            // DX12 первым: на машинах без видеокарты Windows всё равно даёт
+            // программный адаптер WARP, а Vulkan/GL там просто отсутствуют.
+            wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+                supported_backends: eframe::wgpu::util::backend_bits_from_env().unwrap_or(
+                    eframe::wgpu::Backends::DX12
+                        | eframe::wgpu::Backends::VULKAN
+                        | eframe::wgpu::Backends::GL,
+                ),
+                power_preference: eframe::wgpu::PowerPreference::None,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let slot = pending.clone();
