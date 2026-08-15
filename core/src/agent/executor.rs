@@ -213,6 +213,12 @@ impl Executor {
                 Ok(Outcome::Ok(format!("открыто приложение {package}")))
             }
             Action::AdbShell { cmd } => {
+                if cmd.trim().is_empty() {
+                    bail!("пустая adb-команда");
+                }
+                if cmd.chars().count() > 2000 {
+                    bail!("слишком длинная adb-команда");
+                }
                 let out = self.adb.shell(cmd)?;
                 Ok(Outcome::Ok(format!("adb shell: {}", truncate(&out, 500))))
             }
@@ -255,14 +261,17 @@ fn open_default(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Запуск программы проходит через песочницу: имя и аргументы пришли от
+/// модели, а та читала текст с экрана — значит их могли подсунуть.
+/// GUI-приложения не ждём (spawn, не wait): иначе агент висел бы, пока
+/// пользователь не закроет браузер.
 fn launch(path: &str, args: &str) -> Result<()> {
-    if path.trim().is_empty() {
-        bail!("пустой путь к приложению");
-    }
+    crate::sandbox::check_program(path, args)?;
     let mut cmd = std::process::Command::new(path);
     if !args.trim().is_empty() {
         cmd.args(args.split_whitespace());
     }
+    cmd.stdin(std::process::Stdio::null());
     cmd.spawn()?;
     Ok(())
 }

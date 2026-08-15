@@ -1,80 +1,47 @@
-//! Планировщик: разбивает задачу человека на подзадачи и умеет
-//! перепланировать на ходу.
+//! Планировщик: превращает задачу человека в TaskGraph (DAG подзадач) и
+//! умеет перепланировать на ходу.
 //!
 //! Требование: «Зарегистрируйся на сайте» агент сам раскладывает на
-//! «найти форму → заполнить → пройти капчу → подтвердить почту».
+//! «найти форму → заполнить → пройти капчу → подтвердить почту», а
+//! «поставь мне Fable 5» — на «проверить диск → скачать → установить → запустить»
+//! с явными зависимостями и откатом.
 //!
 //! Почему план строится ОДИН раз и потом правится, а не заново на каждом шаге:
 //!   - стабильность: иначе агент «забывает» цель и ходит по кругу;
 //!   - деньги: перепланирование — самый дорогой вызов (длинный контекст).
 //!
-//! Перепланирование запускается по триггерам: 2 провала подряд, экран
+//! Перепланирование запускается по триггерам: узел исчерпал попытки, экран
 //! радикально изменился, или подзадача оказалась неактуальной.
 
+use super::graph::TaskGraph;
 use crate::llm::{extract_json, LlmClient, Message};
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Subtask {
-    pub id: u32,
-    pub goal: String,
-    /// Как понять, что подзадача выполнена. Без явного критерия агент либо
-    /// зацикливается, либо объявляет успех раньше времени.
-    pub done_when: String,
-    #[serde(default)]
-    pub done: bool,
-    #[serde(default)]
-    pub notes: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Plan {
-    pub goal: String,
-    pub subtasks: Vec<Subtask>,
-    #[serde(default)]
-    pub risks: Vec<String>,
-}
-
-impl Plan {
-    pub fn current(&self) -> Option<&Subtask> {
-        self.subtasks.iter().find(|s| !s.done)
-    }
-    pub fn complete_current(&mut self, note: &str) {
-        if let Some(s) = self.subtasks.iter_mut().find(|s| !s.done) {
-            s.done = true;
-            s.notes = note.to_string();
-        }
-    }
-    pub fn progress(&self) -> (usize, usize) {
-        (
-            self.subtasks.iter().filter(|s| s.done).count(),
-            self.subtasks.len(),
-        )
-    }
-    pub fn to_prompt(&self) -> String {
-        let mut s = format!("ЦЕЛЬ: {}\nПЛАН:\n", self.goal);
-        for t in &self.subtasks {
-            s.push_str(&format!(
-                "{} [{}] {} (готово когда: {})\n",
-                t.id,
-                if t.done { "x" } else { " " },
-                t.goal,
-                t.done_when
-            ));
-        }
-        s
-    }
-}
+use crate::retry::{retry, Backoff};
+use anyhow::{Context, Result};
 
 const PLANNER_SYSTEM: &str = r#"Ты — планировщик автономного агента, который управляет компьютером Windows и телефоном Android как человек.
-Разбей задачу пользователя на 3-8 подзадач. Каждая подзадача — наблюдаемый результат на экране, а не абстракция.
-Учитывай реальность: авторизация, 2FA, капчи, всплывающие окна, подтверждение почты, медленная загрузка.
-Если для задачи нужен доступ, которого может не быть (аккаунт, приложение, ADB, платёжка) — добавь это отдельной подзадачей проверки.
-Отвечай СТРОГО JSON:
-{"goal":"...","subtasks":[{"id":1,"goal":"...","done_when":"..."}],"risks":["..."]}"#;
+Построй ГРАФ задач (DAG) из 3-8 узлов. Каждый узел — наблюдаемый результат на экране, а не абстракция.
 
-pub fn make_plan(llm: &LlmClient, task: &str, memory_hints: &str) -> Result<Plan> {
+Требования к графу:
+1. deps — список id узлов, без которых этот узел бессмысленен. Не выстраивай всё в одну цепочку, если шаги независимы.
+2. done_when — как ПО ЭКРАНУ понять, что узел выполнен. Без наблюдаемого критерия узел невалиден.
+3. rollback — как отменить узел, если дальше всё сломается (удалить скачанное, закрыть окно, вернуть настройку). Пусто, если узел ничего не менял.
+4. Учитывай реальность: авторизация, 2FA, капчи, всплывающие окна, подтверждение почты, медленная загрузка.
+5. Если нужен доступ, которого может не быть (аккаунт, приложение, ADB, платёжка, место на диске) — отдельный узел проверки БЕЗ зависимостей.
+
+Пример: "поставь мне Fable 5"
+{"goal":"установить Fable 5","nodes":[
+ {"id":"disk","goal":"проверить свободное место","done_when":"в проводнике видно свободно > 50 ГБ","deps":[],"rollback":""},
+ {"id":"dl","goal":"скачать установщик","done_when":"в загрузках виден файл установщика","deps":["disk"],"rollback":"удалить скачанный файл"},
+ {"id":"inst","goal":"установить игру","done_when":"установщик показал 'Готово' и появился ярлык","deps":["dl"],"rollback":"удалить игру через программы и компоненты"},
+ {"id":"run","goal":"запустить игру","done_when":"открылось окно игры","deps":["inst"],"rollback":""}],
+ "risks":["может не хватить места","установщик может требовать права администратора"]}
+
+Отвечай СТРОГО JSON того же формата."#;
+
+/// Построение графа. Ошибка формата не должна ронять задачу: повторяем запрос,
+/// добавляя в промпт причину отказа. Если валидный граф так и не получен —
+/// вызывающий (agent::run_task) переходит на линейный план из одной цели.
+pub fn make_graph(llm: &LlmClient, task: &str, memory_hints: &str) -> Result<TaskGraph> {
     let mut user = format!("ЗАДАЧА ПОЛЬЗОВАТЕЛЯ: {task}\n");
     if !memory_hints.trim().is_empty() {
         // Прошлый опыт в планировщик — иначе агент каждый раз заново
@@ -83,31 +50,50 @@ pub fn make_plan(llm: &LlmClient, task: &str, memory_hints: &str) -> Result<Plan
             "\nЧТО АГЕНТ УЖЕ ЗНАЕТ ПО ЭТОЙ ТЕМЕ:\n{memory_hints}\n"
         ));
     }
-    let resp = llm.complete(
-        &[Message::system(PLANNER_SYSTEM), Message::user(user)],
-        "plan",
-        true,
-        0.2,
-    )?;
-    let v = extract_json(&resp.text)?;
-    let mut plan: Plan = serde_json::from_value(v)?;
-    if plan.goal.is_empty() {
-        plan.goal = task.to_string();
-    }
-    for (i, st) in plan.subtasks.iter_mut().enumerate() {
-        st.id = i as u32 + 1;
-    }
-    Ok(plan)
+
+    retry(&Backoff::default(), "планирование", |attempt| {
+        let mut u = user.clone();
+        if attempt > 0 {
+            u.push_str("\nПРЕДЫДУЩИЙ ОТВЕТ НЕ ПРОШЁЛ ВАЛИДАЦИЮ. Верни строго JSON с полями goal, nodes[id,goal,done_when,deps,rollback], risks. Циклов в deps быть не должно.\n");
+        }
+        let resp = llm.complete(
+            &[Message::system(PLANNER_SYSTEM), Message::user(u)],
+            "plan",
+            true,
+            0.2,
+        )?;
+        parse_graph(&resp.text, task)
+    })
 }
 
-const REPLAN_SYSTEM: &str = r#"Ты — планировщик автономного агента. Текущий план не работает.
-Проанализируй, что пошло не так, и выдай ИСПРАВЛЕННЫЙ план оставшихся шагов (выполненное не повторяй).
-Отвечай СТРОГО JSON того же формата: {"goal":"...","subtasks":[{"id":1,"goal":"...","done_when":"..."}],"risks":["..."]}"#;
+/// Разбор и валидация ответа модели. Вынесено отдельно, чтобы тестировать
+/// без сети — именно здесь ловятся циклы, дубли и висячие зависимости.
+pub fn parse_graph(raw: &str, task: &str) -> Result<TaskGraph> {
+    let v = extract_json(raw).context("планировщик вернул не JSON")?;
+    let mut g: TaskGraph = serde_json::from_value(v).context("не разобрал граф задач")?;
+    if g.goal.trim().is_empty() {
+        g.goal = task.to_string();
+    }
+    g.validate().map_err(anyhow::Error::msg)?;
+    Ok(g)
+}
 
-pub fn replan(llm: &LlmClient, plan: &Plan, screen: &str, failures: &[String]) -> Result<Plan> {
+const REPLAN_SYSTEM: &str = r#"Ты — планировщик автономного агента. Текущий граф задач не работает.
+Проанализируй, что пошло не так, и выдай ИСПРАВЛЕННЫЙ граф ОСТАВШИХСЯ узлов (выполненное не повторяй).
+Не ссылайся в deps на узлы, которых нет в твоём ответе.
+Отвечай СТРОГО JSON: {"goal":"...","nodes":[{"id":"...","goal":"...","done_when":"...","deps":[],"rollback":"..."}],"risks":["..."]}"#;
+
+/// Перепланирование. Выполненные узлы сохраняем: они история, а не мусор,
+/// и их rollback ещё может понадобиться.
+pub fn replan(
+    llm: &LlmClient,
+    graph: &TaskGraph,
+    screen: &str,
+    failures: &[String],
+) -> Result<TaskGraph> {
     let user = format!(
         "{}\n\nТЕКУЩИЙ ЭКРАН:\n{}\n\nПОСЛЕДНИЕ ОШИБКИ:\n- {}",
-        plan.to_prompt(),
+        graph.to_prompt(),
         screen,
         failures.join("\n- ")
     );
@@ -117,19 +103,91 @@ pub fn replan(llm: &LlmClient, plan: &Plan, screen: &str, failures: &[String]) -
         true,
         0.3,
     )?;
-    let mut new_plan: Plan = serde_json::from_value(extract_json(&resp.text)?)?;
-    // Сохраняем уже выполненные подзадачи: они — история, а не мусор.
-    let done: Vec<Subtask> = plan.subtasks.iter().filter(|s| s.done).cloned().collect();
-    let mut merged = done;
-    for st in new_plan.subtasks.drain(..) {
-        merged.push(st);
+    let fresh = parse_graph(&resp.text, &graph.goal)?;
+    Ok(merge(graph, fresh))
+}
+
+/// Склейка старого и нового графа. id новых узлов префиксуем, чтобы они не
+/// столкнулись с историческими, а их deps переписываем на новые имена.
+pub fn merge(old: &TaskGraph, mut fresh: TaskGraph) -> TaskGraph {
+    let gen = old.nodes.iter().filter(|n| n.id.starts_with("r")).count() + 1;
+    let rename = |id: &str| format!("r{gen}_{id}");
+    for n in &mut fresh.nodes {
+        n.id = rename(&n.id);
+        n.deps = n.deps.iter().map(|d| rename(d)).collect();
+        n.state = super::graph::NodeState::Pending;
+        n.attempts = 0;
     }
-    for (i, st) in merged.iter_mut().enumerate() {
-        st.id = i as u32 + 1;
+    let mut nodes: Vec<super::graph::Node> = old
+        .nodes
+        .iter()
+        .filter(|n| n.state != super::graph::NodeState::Pending)
+        .cloned()
+        .collect();
+    nodes.extend(fresh.nodes);
+    let mut out = TaskGraph {
+        goal: old.goal.clone(),
+        nodes,
+        risks: fresh.risks,
+        completed_order: old.completed_order.clone(),
+    };
+    // Если склейка дала невалидный граф — оставляем только новые узлы:
+    // потерять историю неприятно, но работать без плана нельзя.
+    if out.validate().is_err() {
+        out.nodes.retain(|n| n.id.starts_with(&format!("r{gen}_")));
+        out.completed_order.clear();
+        let _ = out.validate();
     }
-    Ok(Plan {
-        goal: plan.goal.clone(),
-        subtasks: merged,
-        risks: new_plan.risks,
-    })
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_graph_with_fences_and_text() {
+        let raw = r#"Вот план:
+```json
+{"goal":"установить игру","nodes":[
+ {"id":"disk","goal":"проверить место","done_when":"видно свободно","deps":[]},
+ {"id":"dl","goal":"скачать","done_when":"файл в загрузках","deps":["disk"],"rollback":"удалить файл"}],
+ "risks":["мало места"]}
+```"#;
+        let g = parse_graph(raw, "поставь игру").expect("граф должен разобраться");
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.next().map(|n| n.id.clone()), Some("disk".into()));
+    }
+
+    #[test]
+    fn cyclic_plan_from_model_is_error_not_panic() {
+        let raw = r#"{"goal":"g","nodes":[{"id":"a","goal":"a","deps":["b"]},{"id":"b","goal":"b","deps":["a"]}]}"#;
+        assert!(parse_graph(raw, "t").is_err());
+        assert!(parse_graph("вообще не json", "t").is_err());
+        assert!(parse_graph(r#"{"goal":"g","nodes":[]}"#, "t").is_err());
+    }
+
+    #[test]
+    fn replan_keeps_history_and_renames_new_nodes() {
+        let mut old = TaskGraph::linear(
+            "цель",
+            &[
+                ("шаг 1".into(), "видно 1".into()),
+                ("шаг 2".into(), "".into()),
+            ],
+        );
+        assert!(old.validate().is_ok());
+        old.mark_done("n1", "готово");
+        let fresh = parse_graph(
+            r#"{"goal":"g","nodes":[{"id":"n1","goal":"иначе","done_when":"видно"}]}"#,
+            "t",
+        )
+        .expect("парсинг");
+        let mut merged = merge(&old, fresh);
+        assert!(merged.validate().is_ok(), "склейка должна быть валидной");
+        // История сохранена, новый узел не столкнулся с ней по id.
+        assert!(merged.nodes.iter().any(|n| n.id == "n1"));
+        assert!(merged.nodes.iter().any(|n| n.id == "r1_n1"));
+        assert_eq!(merged.next().map(|n| n.id.clone()), Some("r1_n1".into()));
+    }
 }

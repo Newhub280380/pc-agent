@@ -19,6 +19,8 @@ mod gui;
 mod llm;
 mod memory;
 mod platform;
+mod retry;
+mod sandbox;
 mod supervisor;
 
 use agent::{Agent, AgentCommand, AgentConfig, AgentEvent};
