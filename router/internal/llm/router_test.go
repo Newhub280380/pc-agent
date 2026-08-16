@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/newhub280380/pc-agent/router/internal/config"
@@ -106,5 +107,49 @@ func TestBreakerOpensAfterRepeatedFailures(t *testing.T) {
 	}
 	if hits != before {
 		t.Fatalf("circuit breaker не разомкнулся: %d -> %d", before, hits)
+	}
+}
+
+func TestUnreachableServerReportsDownInsteadOfRetries(t *testing.T) {
+	// Порт закрыт: раньше это выглядело как «не вышло за 3 попытки».
+	var hits int
+	dead := openaiStub(t, 200, okBody, &hits)
+	url := dead.URL
+	dead.Close()
+
+	r := New(&config.Config{
+		MaxRetries: 3,
+		TimeoutSec: 5,
+		Providers:  []config.Provider{{Name: "youtoria", Kind: "openai", BaseURL: url, APIKey: "k", Model: "m"}},
+	}, quietLogger())
+
+	_, err := r.Complete(context.Background(), Request{Purpose: "act", Messages: []Message{{Role: "user", Text: "привет"}}})
+	if err == nil {
+		t.Fatal("ожидалась ошибка")
+	}
+	if !strings.Contains(err.Error(), "Сервер LLM недоступен") {
+		t.Fatalf("неинформативная ошибка: %v", err)
+	}
+	if hits != 0 {
+		t.Fatalf("до мёртвого сервера не должно быть запросов, было %d", hits)
+	}
+}
+
+func TestReachableServerStillReportsAuthError(t *testing.T) {
+	// 401 — доказательство, что сервер жив: нельзя писать «недоступен».
+	var hits int
+	s := openaiStub(t, 401, `{"error":{"message":"bad key"}}`, &hits)
+	r := New(&config.Config{
+		MaxRetries: 3,
+		TimeoutSec: 5,
+		Providers:  []config.Provider{{Name: "youtoria", Kind: "openai", BaseURL: s.URL, APIKey: "k", Model: "m"}},
+	}, quietLogger())
+
+	_, err := r.Complete(context.Background(), Request{Purpose: "act", Messages: []Message{{Role: "user", Text: "привет"}}})
+	if err == nil || strings.Contains(err.Error(), "недоступен") {
+		t.Fatalf("401 не должен превращаться в «недоступен»: %v", err)
+	}
+	if hits == 0 {
+		t.Fatal("запрос до живого сервера не дошёл")
 	}
 }

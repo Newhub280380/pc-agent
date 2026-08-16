@@ -23,6 +23,15 @@ Go-роутер вшивается внутрь `.exe` ядра (`include_bytes!
 4. Перезапустить, написать задачу, нажать **Старт**.
 
 Файлы приложения: `%LOCALAPPDATA%\PCAgent\` (`.env`, `memory.db`, `consent.json`, логи).
+Конфиг ищется в четырёх местах, первый найденный побеждает: `%PCAGENT_HOME%`,
+папка рядом с `pcagent.exe`, текущая папка, `%LOCALAPPDATA%\PCAgent`.
+В логе на старте видно, откуда прочитано:
+
+```text
+Loading LLM config from: C:\agent\config.json | .env: C:\agent\.env | искали в: ...
+Found key: true (provider: youtoria, source: config.json)
+Using base_url: https://api.youtoria.ai/v1 (model: gpt-4o)
+```
 
 ---
 
@@ -83,7 +92,25 @@ dist\pcagent.exe --shot screen.png                    # снимок экран�
 
 ## LLM-провайдеры
 
-Ключи берутся из `.env`, привязки к одному вендору нет. Поддержаны:
+Приоритет источников: **`config.json` → переменные окружения → `.env`**.
+Любой OpenAI-совместимый сервис (Youtoria и т. п.) подключается тремя полями
+в `config.json` рядом с `pcagent.exe` — см. `config.example.json`:
+
+```json
+{
+  "llm_provider": "youtoria",
+  "base_url": "https://api.youtoria.ai/v1",
+  "api_key": "sk-xxx",
+  "model": "gpt-4o"
+}
+```
+
+`base_url` и `model` берутся из кабинета провайдера: если хост не отвечает,
+роутер сразу пишет `Сервер LLM недоступен`, а не «не вышло за 3 попытки».
+
+Те же значения можно задать через `.env`/окружение как `LLM_PROVIDER`,
+`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`. Привязки к одному вендору нет,
+поддержаны также:
 
 | Провайдер | Ключ | Vision |
 |---|---|---|
@@ -94,9 +121,11 @@ dist\pcagent.exe --shot screen.png                    # снимок экран�
 | Grok / xAI | `XAI_API_KEY` | да |
 | Qwen | `QWEN_API_KEY` | да |
 | OpenRouter (любые OpenSource-модели) | `OPENROUTER_API_KEY` | зависит от модели |
+| Youtoria (OpenAI-совместимый) | `YOUTORIA_API_KEY` + `YOUTORIA_BASE_URL` | да |
 | Локальная модель (LM Studio / Ollama / llama.cpp) | `LOCAL_BASE_URL` | зависит от модели |
 
-Порядок задаётся `LLM_PRIORITY`. Роутер сам:
+Порядок задаётся `LLM_PRIORITY` (провайдер из `config.json`/`LLM_*` всегда первый). Роутер сам:
+- перед попытками проверяет, живой ли хост, и на мёртвом отвечает `Сервер LLM недоступен` без ретраев;
 - ретраит с экспоненциальной паузой на 429/5xx;
 - уходит на следующего провайдера при отказе;
 - размыкает цепь (circuit breaker) на 60 с после серии ошибок, чтобы не жечь лимиты;

@@ -25,7 +25,14 @@ pub struct Router {
 impl Router {
     /// Распаковывает (если нужно) и запускает роутер. Уже запущенный
     /// экземпляр переиспользуется — второй запуск агента не поднимет дубль.
-    pub fn start(exe_path: &Path, env_file: &Path, health_url: &str) -> Result<Self> {
+    /// `extra_env` — старший слой конфига (config.json): роутер читает только
+    /// окружение и `.env`, поэтому значения из JSON доезжают до него так.
+    pub fn start(
+        exe_path: &Path,
+        env_file: &Path,
+        health_url: &str,
+        extra_env: &[(String, String)],
+    ) -> Result<Self> {
         if ping(health_url) {
             log::info!("роутер уже запущен, переиспользую");
             return Ok(Self { child: None });
@@ -52,6 +59,7 @@ impl Router {
         let mut cmd = Command::new(exe_path);
         cmd.arg("-env")
             .arg(env_file)
+            .envs(extra_env.iter().cloned())
             .current_dir(exe_path.parent().unwrap_or(Path::new(".")))
             .stdout(Stdio::null())
             .stderr(Stdio::null());

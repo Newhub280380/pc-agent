@@ -3,6 +3,7 @@ dist/
 router/pcagent-router
 router/pcagent-router.exe
 .env
+config.json
 *.db
 *.db-wal
 *.db-shm
