@@ -125,7 +125,8 @@ impl Layers {
     pub fn load(paths: &Paths) -> Result<Self> {
         let mut json = BTreeMap::new();
         if let Some(p) = &paths.config_json {
-            let text = std::fs::read_to_string(p)?;
+            let text =
+                read_text(p).ok_or_else(|| anyhow::anyhow!("{}: не читается", p.display()))?;
             let v: serde_json::Value = serde_json::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("{}: битый JSON: {e}", p.display()))?;
             if let Some(obj) = v.as_object() {
@@ -336,7 +337,7 @@ impl Layers {
     /// Сам ключ НИКОГДА не логируется — только факт наличия и источник.
     pub fn describe(&self, searched: &[PathBuf]) -> Vec<String> {
         let s = self.llm_summary();
-        vec![
+        let mut lines = vec![
             format!(
                 "Loading LLM config from: {} | .env: {} | искали в: {}",
                 self.json_path
@@ -373,13 +374,63 @@ impl Layers {
                     s.model.as_str()
                 }
             ),
-        ]
+        ];
+        // Файл есть, но ни одной переменной — почти всегда кодировка UTF-16
+        // из Блокнота или строки без `=`. Без этой подсказки выглядит так,
+        // будто агент игнорирует ключ.
+        if self.env_path.is_file() && self.dotenv.is_empty() {
+            lines.push(format!(
+                "{}: файл прочитан, но переменных не найдено — сохрани его как UTF-8 в виде КЛЮЧ=значение",
+                self.env_path.display()
+            ));
+        }
+        lines
+    }
+}
+
+/// Блокнот на Windows охотно сохраняет файл в UTF-16 или с BOM, а тогда
+/// `read_to_string` либо падает, либо приклеивает BOM к первому ключу — и
+/// ключ «есть в .env, но не виден». Поэтому декодируем сами.
+fn read_text(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = match bytes.as_slice() {
+        [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, false),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        rest => String::from_utf8_lossy(rest).into_owned(),
+    };
+    Some(text)
+}
+
+fn decode_utf16(bytes: &[u8], little: bool) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| {
+            if little {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Привычные короткие имена из чужих туториалов (`BASE_URL=`, `API_KEY=`)
+/// раньше просто игнорировались: агент молчал, что строка не понята.
+fn dotenv_key(k: &str) -> String {
+    match k.trim().to_ascii_uppercase().as_str() {
+        "BASE_URL" => "LLM_BASE_URL".into(),
+        "API_KEY" => "LLM_API_KEY".into(),
+        "MODEL" => "LLM_MODEL".into(),
+        "PROVIDER" => "LLM_PROVIDER".into(),
+        other => other.to_string(),
     }
 }
 
 fn parse_dotenv(path: &Path) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_text(path) else {
         return out;
     };
     for line in text.lines() {
@@ -390,9 +441,14 @@ fn parse_dotenv(path: &Path) -> BTreeMap<String, String> {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
+        // Хвостовой комментарий после значения — частая причина «ключ с мусором».
+        let v = match v.split_once(" #") {
+            Some((head, _)) => head,
+            None => v,
+        };
         let v = v.trim().trim_matches('"').trim_matches('\'').trim();
         if !v.is_empty() {
-            out.insert(k.trim().to_string(), v.to_string());
+            out.insert(dotenv_key(k), v.to_string());
         }
     }
     out
@@ -604,6 +660,45 @@ mod tests {
             .describe(&p.searched)
             .join("\n")
             .contains("Found key: false"));
+    }
+
+    #[test]
+    fn utf16_dotenv_from_notepad_is_read() {
+        let dir = tmp("utf16");
+        let text = "OPENAI_API_KEY=sk-utf16\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(dir.join(".env"), bytes).unwrap();
+        let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
+        assert!(s.key_found, "UTF-16 .env из Блокнота должен читаться");
+        assert_eq!(s.provider, "openai");
+    }
+
+    #[test]
+    fn bom_short_names_and_trailing_comment_are_understood() {
+        let dir = tmp("aliases");
+        std::fs::write(
+            dir.join(".env"),
+            "\u{feff}BASE_URL=https://api.openai.com/v1 # мой ключ\nAPI_KEY=\"sk-short\"\n",
+        )
+        .unwrap();
+        let l = Layers::load(&paths_in(&dir)).unwrap();
+        assert_eq!(
+            l.get("LLM_BASE_URL").as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(l.get("LLM_API_KEY").as_deref(), Some("sk-short"));
+    }
+
+    #[test]
+    fn unreadable_dotenv_is_flagged_in_diagnostics() {
+        let dir = tmp("garbage");
+        std::fs::write(dir.join(".env"), "тут просто текст без знака равно\n").unwrap();
+        let p = paths_in(&dir);
+        let text = Layers::load(&p).unwrap().describe(&p.searched).join("\n");
+        assert!(text.contains("переменных не найдено"), "{text}");
     }
 
     #[test]
