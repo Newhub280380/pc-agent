@@ -1,0 +1,6 @@
+{
+  "llm_provider": "youtoria",
+  "base_url": "https://api.youtoria.ai/v1",
+  "api_key": "sk-xxx",
+  "model": "gpt-4o"
+}

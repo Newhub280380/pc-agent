@@ -441,7 +441,9 @@ impl Agent {
             }) {
                 Ok(r) => r,
                 Err(e) => {
-                    self.log(format!("LLM недоступна: {e}"));
+                    // {e:#} — вся цепочка причин: без неё в логе оставалось
+                    // одно «не вышло за 3 попыток» без слова о причине.
+                    self.log(format!("LLM недоступна: {e:#}"));
                     std::thread::sleep(Duration::from_secs(3));
                     continue;
                 }

@@ -60,6 +60,7 @@ var providerSpecs = []struct {
 	{"grok", "openai", "XAI_API_KEY", "XAI_MODEL", "XAI_BASE_URL", "https://api.x.ai/v1", "grok-2-vision-1212", true},
 	{"qwen", "openai", "QWEN_API_KEY", "QWEN_MODEL", "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "qwen-vl-max", true},
 	{"openrouter", "openai", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1", "qwen/qwen2.5-vl-72b-instruct", true},
+	{"youtoria", "openai", "YOUTORIA_API_KEY", "YOUTORIA_MODEL", "YOUTORIA_BASE_URL", "https://api.youtoria.ai/v1", "gpt-4o", true},
 	// local: llama.cpp / LM Studio / Ollama в OpenAI-совместимом режиме.
 	// Ключ не обязателен, поэтому активируется наличием LOCAL_BASE_URL.
 	{"local", "openai", "LOCAL_API_KEY", "LOCAL_MODEL", "LOCAL_BASE_URL", "", "qwen2.5-vl-7b", true},
@@ -84,7 +85,8 @@ func checkLoopback(addr string) error {
 }
 
 // Load читает .env (если есть) и переменные процесса.
-// Переменные процесса имеют приоритет над файлом — так удобнее отлаживать.
+// Переменные процесса имеют приоритет над файлом — так удобнее отлаживать;
+// ядро через них же прокидывает содержимое config.json.
 func Load(envPath string) (*Config, error) {
 	fileVals, err := parseDotenv(envPath)
 	if err != nil {
@@ -116,6 +118,44 @@ func Load(envPath string) (*Config, error) {
 		prio[n] = i
 	}
 
+	// Любой OpenAI-совместимый сервис одним набором LLM_*: без этого
+	// провайдера, которого нет в таблице, подключить было невозможно —
+	// именно на этом ломалась Youtoria. Приоритет -1: если человек задал
+	// это явно, значит хочет именно его, а не забытый ключ из шаблона.
+	if base, key := get("LLM_BASE_URL"), get("LLM_API_KEY"); base != "" || key != "" {
+		name := strings.ToLower(firstNonEmpty(get("LLM_PROVIDER"), "custom"))
+		kind := "openai"
+		switch name {
+		case "anthropic", "gemini":
+			kind = name
+		}
+		if base == "" {
+			// Имя без адреса имеет смысл только для известного провайдера.
+			for _, s := range providerSpecs {
+				if s.name == name {
+					base, kind = s.defaultBase, s.kind
+				}
+			}
+		}
+		if base == "" {
+			return nil, fmt.Errorf("LLM_PROVIDER=%q неизвестен: укажи LLM_BASE_URL", name)
+		}
+		cfg.Providers = append(cfg.Providers, Provider{
+			Name:     name,
+			Kind:     kind,
+			BaseURL:  strings.TrimRight(base, "/"),
+			APIKey:   key,
+			Model:    firstNonEmpty(get("LLM_MODEL"), "gpt-4o"),
+			Priority: -1,
+			Vision:   true,
+		})
+	}
+
+	added := map[string]bool{}
+	for _, p := range cfg.Providers {
+		added[p.Name] = true
+	}
+
 	for _, s := range providerSpecs {
 		key := get(s.envKey)
 		base := firstNonEmpty(get(s.envBase), s.defaultBase)
@@ -132,6 +172,10 @@ func Load(envPath string) (*Config, error) {
 			APIKey:  key,
 			Model:   firstNonEmpty(get(s.envModel), s.defModel),
 			Vision:  s.vision,
+		}
+		// Не дублируем того, кого уже добавили через LLM_*.
+		if added[s.name] {
+			continue
 		}
 		if v, ok := prio[s.name]; ok {
 			p.Priority = v

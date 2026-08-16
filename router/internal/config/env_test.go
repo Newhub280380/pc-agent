@@ -67,3 +67,63 @@ func TestMissingEnvFileIsNotAnError(t *testing.T) {
 		t.Fatalf("ожидался пустой список: %+v", cfg.Providers)
 	}
 }
+
+func TestYoutoriaProviderFromKeyAlone(t *testing.T) {
+	cfg, err := Load(writeEnv(t, "YOUTORIA_API_KEY=sk-y\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Providers) != 1 {
+		t.Fatalf("ожидался 1 провайдер: %+v", cfg.Providers)
+	}
+	p := cfg.Providers[0]
+	if p.Name != "youtoria" || p.Kind != "openai" || p.BaseURL != "https://api.youtoria.ai/v1" {
+		t.Fatalf("youtoria настроена неверно: %+v", p)
+	}
+}
+
+func TestGenericLLMBlockConfiguresAnyProvider(t *testing.T) {
+	// Главный сценарий бага: провайдера нет в таблице, задан только LLM_*.
+	cfg, err := Load(writeEnv(t, `
+LLM_PROVIDER=youtoria
+LLM_BASE_URL=https://api.youtoria.ai/v1
+LLM_API_KEY=sk-json
+LLM_MODEL=gpt-4o
+OPENAI_API_KEY=sk-old
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers[0].Name != "youtoria" || cfg.Providers[0].Priority != -1 {
+		t.Fatalf("LLM_* не стал первым: %+v", cfg.Providers)
+	}
+	if cfg.Providers[0].Model != "gpt-4o" || cfg.Providers[0].APIKey != "sk-json" {
+		t.Fatalf("значения LLM_* потеряны: %+v", cfg.Providers[0])
+	}
+	// Дубля youtoria быть не должно, а openai остаётся резервом.
+	seen := map[string]int{}
+	for _, p := range cfg.Providers {
+		seen[p.Name]++
+	}
+	if seen["youtoria"] != 1 || seen["openai"] != 1 {
+		t.Fatalf("дубли/потери провайдеров: %+v", seen)
+	}
+}
+
+func TestUnknownProviderWithoutBaseURLIsRejected(t *testing.T) {
+	_, err := Load(writeEnv(t, "LLM_PROVIDER=неведомый\nLLM_API_KEY=sk-x\n"))
+	if err == nil {
+		t.Fatal("нужна понятная ошибка вместо тихого падения на запросе")
+	}
+}
+
+func TestProcessEnvBeatsDotenv(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-from-env")
+	cfg, err := Load(writeEnv(t, "OPENAI_API_KEY=sk-from-file\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers[0].APIKey != "sk-from-env" {
+		t.Fatalf("приоритет окружения сломан: %+v", cfg.Providers[0])
+	}
+}

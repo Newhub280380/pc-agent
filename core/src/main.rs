@@ -74,11 +74,18 @@ fn main() -> Result<()> {
         }
     }
 
-    let settings = config::Settings::load(&paths.env_file)?;
+    let layers = config::Layers::load(&paths)?;
+    // Три строки диагностики до всего остального: когда ключ «не виден»,
+    // первый вопрос — какой файл он вообще прочитал.
+    for line in layers.describe(&paths.searched) {
+        log::info!("{line}");
+    }
+    let settings = config::Settings::load(&layers)?;
     let _router = match supervisor::Router::start(
         &paths.router_exe,
         &paths.env_file,
         &format!("{}/health", settings.router_url),
+        &layers.router_env(),
     ) {
         Ok(r) => Some(r),
         Err(e) => {
@@ -125,7 +132,7 @@ fn main() -> Result<()> {
     let (cmd_tx, cmd_rx) = channel::<AgentCommand>();
     let stop = Arc::new(AtomicBool::new(false));
 
-    let providers = describe_providers(&llm, &mem);
+    let providers = describe_providers(&llm, &mem, &layers);
 
     // Рабочий поток: GUI не должен блокироваться на сетевых вызовах ни на мс.
     {
@@ -151,12 +158,17 @@ fn main() -> Result<()> {
         });
     }
 
+    // Диагностика конфига видна и в окне: человек, у которого «не видит ключ»,
+    // читает лог в GUI, а не файл в %APPDATA%.
+    let mut initial_log = vec![format!(
+        "{}  Агент готов. Опиши задачу и нажми Старт.",
+        chrono::Local::now().format("%H:%M:%S")
+    )];
+    initial_log.extend(layers.describe(&paths.searched));
+
     let app = gui::AppState {
         task: String::new(),
-        log: vec![format!(
-            "{}  Агент готов. Опиши задачу и нажми Старт.",
-            chrono::Local::now().format("%H:%M:%S")
-        )],
+        log: initial_log,
         thought: String::new(),
         plan: vec![],
         running: false,
@@ -257,11 +269,16 @@ fn selfcheck(report: Option<&str>) -> Result<()> {
             }
         }),
     );
-    let settings = config::Settings::load(&paths.env_file)?;
+    let layers = config::Layers::load(&paths)?;
+    for line in layers.describe(&paths.searched) {
+        step("config", Ok(line));
+    }
+    let settings = config::Settings::load(&layers)?;
     let router = supervisor::Router::start(
         &paths.router_exe,
         &paths.env_file,
         &format!("{}/health", settings.router_url),
+        &layers.router_env(),
     );
     match router {
         Ok(r) => {
@@ -334,11 +351,23 @@ fn shot(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn describe_providers(llm: &llm::LlmClient, mem: &Arc<Mutex<memory::Memory>>) -> String {
+fn describe_providers(
+    llm: &llm::LlmClient,
+    mem: &Arc<Mutex<memory::Memory>>,
+    layers: &config::Layers,
+) -> String {
     let health = if llm.health() {
         "роутер: ок"
     } else {
         "роутер: НЕ ОТВЕЧАЕТ (проверь .env)"
+    };
+    // «роутер: ок» вводил в заблуждение: локальный процесс жив, а ключа
+    // нет. Показываем рядом провайдера и факт наличия ключа.
+    let s = layers.llm_summary();
+    let key = if s.key_found {
+        format!("ключ: {} ({})", s.provider, s.key_source.as_str())
+    } else {
+        "ключ: нет — впиши в .env или config.json".to_string()
     };
     let stats = mem
         .lock()
@@ -346,7 +375,7 @@ fn describe_providers(llm: &llm::LlmClient, mem: &Arc<Mutex<memory::Memory>>) ->
         .and_then(|m| m.stats().ok())
         .map(|(mm, sh, ls)| format!("память: {mm} записей / {sh} полок / {ls} уроков"))
         .unwrap_or_default();
-    format!("{health} | {stats}")
+    format!("{health} | {key} | {stats}")
 }
 
 fn init_logging(dir: &std::path::Path) {

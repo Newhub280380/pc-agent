@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,7 +128,17 @@ func (r *Router) Complete(ctx context.Context, req Request) (*Response, error) {
 
 	attempts := 0
 	var lastErr error
+	unreachable := []string{}
 	for _, p := range cands {
+		// Пинг до ретраев: три таймаута по 120с на мёртвом адресе выглядят как
+		// «не вышло за 3 попытки», хотя причина — недоступный сервер или опечатка
+		// в base_url. Проверяем только TCP+TLS, ключ никуда не уходит.
+		if err := reachable(ctx, p.BaseURL); err != nil {
+			unreachable = append(unreachable, p.Name+" "+p.BaseURL)
+			lastErr = err
+			r.log.Warn("llm unreachable", "provider", p.Name, "base_url", p.BaseURL, "err", err.Error())
+			continue
+		}
 		for try := 0; try < r.cfg.MaxRetries; try++ {
 			attempts++
 			start := time.Now()
@@ -156,7 +169,33 @@ func (r *Router) Complete(ctx context.Context, req Request) (*Response, error) {
 		}
 		r.penalize(p.Name)
 	}
+	if attempts == 0 && len(unreachable) > 0 {
+		return nil, fmt.Errorf("Сервер LLM недоступен (%s): %w", strings.Join(unreachable, ", "), lastErr)
+	}
 	return nil, fmt.Errorf("все провайдеры отказали (%d попыток): %w", attempts, lastErr)
+}
+
+// reachable проверяет только сеть: любой ответ сервера (даже 401/404)
+// считается доступностью — такие ошибки должен объяснять реальный запрос,
+// а не пинг.
+func reachable(ctx context.Context, baseURL string) error {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("неверный base_url %q", baseURL)
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+		if strings.EqualFold(u.Scheme, "http") {
+			port = "80"
+		}
+	}
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(u.Hostname(), port))
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 func (r *Router) dispatch(ctx context.Context, p config.Provider, req Request) (*Response, error) {

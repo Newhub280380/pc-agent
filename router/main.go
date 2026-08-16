@@ -43,9 +43,11 @@ func main() {
 
 	log := newLogger(cfg.LogDir)
 	log.Info("router start", "version", Version, "listen", cfg.Listen, "providers", len(cfg.Providers))
+	log.Info("Loading LLM config from", "env", *envPath)
 	for _, p := range cfg.Providers {
-		// Ключи НИКОГДА не логируем — только имя провайдера и модель.
-		log.Info("provider", "name", p.Name, "model", p.Model, "vision", p.Vision, "priority", p.Priority)
+		// Ключи НИКОГДА не логируем — только факт наличия и адрес.
+		log.Info("provider", "name", p.Name, "model", p.Model, "base_url", p.BaseURL,
+			"key", p.APIKey != "", "vision", p.Vision, "priority", p.Priority)
 	}
 	if len(cfg.Providers) == 0 {
 		log.Warn("нет ни одного ключа — агент не сможет думать; заполни .env")
