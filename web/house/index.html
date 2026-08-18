@@ -23,6 +23,10 @@
          border: 1px solid var(--neon); border-radius: 50%; opacity: .55; }
   #look { position: fixed; left: 50%; top: calc(50% + 26px); transform: translateX(-50%);
           font: 12px monospace; letter-spacing: 1px; color: var(--neon); text-shadow: 0 0 8px #000; }
+  #floor-tag { position: fixed; right: 18px; top: 50%; transform: translateY(-50%);
+               font: 12px monospace; letter-spacing: 2px; color: var(--neon); text-align: right;
+               text-shadow: 0 0 8px #000; opacity: .85; }
+  #floor-tag b { display: block; font-size: 26px; letter-spacing: 4px; }
 
   #start { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 14px;
            align-items: center; justify-content: center; text-align: center;
@@ -56,15 +60,16 @@
   <div class="panel">
     <h3>THE MANAGEMENT HOUSE // HQ-01</h3>
     <div id="clock">—</div>
-    <small>шесть отделов на одном этаже, живые показатели по клику</small>
+    <small>два этажа, семь отделов, живые показатели по клику</small>
   </div>
   <div id="row">
-    <div class="panel"><small>WASD — идти, Shift — бежать, мышь — смотреть,<br>ЛКМ на комнате — открыть отдел, E — войти в модуль, Esc — выйти из обзора</small></div>
-    <div class="panel" style="max-width:210px"><small id="stat">отделов: 6</small></div>
+    <div class="panel"><small>WASD — идти, Shift — бежать, мышь — смотреть,<br>ЛКМ на комнате — открыть отдел, E — войти в модуль, Esc — выйти из обзора<br>лестница — в правом конце коридора</small></div>
+    <div class="panel" style="max-width:210px"><small id="stat">отделов: 7 · этажей: 2</small></div>
   </div>
 </div>
 <div id="aim"></div>
 <div id="look"></div>
+<div id="floor-tag"><b>1</b>ЭТАЖ</div>
 
 <div id="card">
   <h2 id="c-title">Отдел</h2>
@@ -81,9 +86,9 @@
 
 <div id="start">
   <h1>MANAGEMENT HOUSE</h1>
-  <div id="keys">WASD — движение · мышь — обзор · ЛКМ — данные отдела · Esc — выход</div>
+  <div id="keys">WASD — движение · мышь — обзор · ЛКМ — данные отдела · E — модуль · Esc — выход</div>
   <button id="go">ВОЙТИ В ДОМ</button>
-  <div id="keys">рендер: WebGL2 · данные: shared/data.js и leads.json, без сервера</div>
+  <div id="keys">два этажа · 7 интерактивных комнат · стены светятся на подходе</div>
   <div id="keys"><a href="../" style="color:#00ffcc">генеральный хаб — список модулей списком</a></div>
 </div>
 
@@ -100,44 +105,53 @@ import { PointerLockControls } from 'three/addons/controls/PointerLockControls.j
 import { moduleByRoom, ROOT } from '../shared/modules.js';
 import { STATS, PRODUCTS, money } from '../shared/data.js';
 
-/* ---------- Отделы. Показатели живут отдельно от геометрии, чтобы данные
-   можно было подменить экспортом агента, не трогая сцену. ---------- */
-const ROOM = 16, GAP = 9, DOOR = 5, WALL = 0.4, H = 7;
+/* ---------- Планировка. Дом на два этажа: 4 отдела внизу, 3 наверху,
+   между ними пандус-лестница в правом конце коридора. ---------- */
+const ROOM = 16, WALL = 0.4, H = 8, LIFT = 10;
+const COL = 22, ROWZ = 13, HALF = ROOM / 2, DOOR = 5;
+const RAMP_X0 = 26, RAMP_X1 = 42, RAMP_HALF = 4;
+const PLAN_X0 = -40, PLAN_X1 = 44, PLAN_Z = 24;
 
 const last = STATS.revenue.at(-1);
 const lowStock = PRODUCTS.filter(p => p.stock < 15).length;
 const paid = STATS.funnel.at(-1).v, leadsAll = STATS.funnel[0].v;
 
 const DEPARTMENTS = [
-  { id: 'sales',      name: 'ОТДЕЛ ПРОДАЖ',   col: 0, row: 0, hue: 0x00ffcc,
+  { id: 'reception',  name: 'РЕСЕПШН',        floor: 0, col: 1,  row: 1,  hue: 0x9df9ff,
+    sub: 'первое касание: визитка, профиль, ссылки',
+    rows: [['Обращений в Instagram', STATS.funnel[1].v],
+           ['Ответ в среднем', '4 мин'],
+           ['Переходов из bio', 318],
+           ['Город', 'Алматы']] },
+  { id: 'sales',      name: 'ОТДЕЛ ПРОДАЖ',   floor: 0, col: -1, row: -1, hue: 0x00ffcc,
     sub: 'входящие заявки и обзвон базы',
     rows: [['Лидов в базе', leadsAll], ['HOT-лидов', '—'],
            ['Счётов выставлено', STATS.funnel[3].v],
            ['Оплат', paid],
            ['Конверсия в оплату', Math.round(paid / leadsAll * 100) + '%']],
     note: 'лиды подхватываются из leads.json радара' },
-  { id: 'marketing',  name: 'МАРКЕТИНГ',      col: 1, row: 0, hue: 0x00ffff,
+  { id: 'marketing',  name: 'МАРКЕТИНГ',      floor: 0, col: 1,  row: -1, hue: 0x00ffff,
     sub: 'реклама, креативы, тесты',
     rows: [['Бюджет за месяц', money(STATS.ads.budget)], ['CPL', money(STATS.ads.cpl)],
            ['CTR', STATS.ads.ctr.toString().replace('.', ',') + '%'],
            ['Лучший креатив', STATS.ads.best]] },
-  { id: 'warehouse',  name: 'СКЛАД',          col: 2, row: 0, hue: 0x7cf9ff,
+  { id: 'warehouse',  name: 'СКЛАД',          floor: 0, col: -1, row: 1,  hue: 0x7cf9ff,
     sub: 'остатки и отгрузки',
     rows: [['Позиций в линейке', PRODUCTS.length],
            ['Штук на складе', PRODUCTS.reduce((s, p) => s + p.stock, 0)],
            ['Ниже минимума', [String(lowStock), lowStock ? 'bad' : 'good']],
            ['Стоимость остатков', money(PRODUCTS.reduce((s, p) => s + p.stock * p.price, 0))]] },
-  { id: 'accounting', name: 'БУХГАЛТЕРИЯ',    col: 0, row: 1, hue: 0x00d9ff,
+  { id: 'accounting', name: 'БУХГАЛТЕРИЯ',    floor: 1, col: -1, row: -1, hue: 0x00d9ff,
     sub: 'деньги, налоги, сверки',
     rows: [['Приход за месяц', money(last.in)], ['Расход', money(last.out)],
            ['Дебиторка', [money(STATS.finance.receivable), 'bad']],
            ['Налоги к сроку', STATS.finance.tax_due]] },
-  { id: 'admin',      name: 'АДМИНИСТРАЦИЯ',  col: 1, row: 1, hue: 0x66ffd9,
+  { id: 'admin',      name: 'АДМИНИСТРАЦИЯ',  floor: 1, col: 1,  row: -1, hue: 0x66ffd9,
     sub: 'персонал и процессы',
     rows: [['Сотрудников', STATS.team.people], ['На смене сейчас', STATS.team.on_shift],
            ['Задач в работе', STATS.team.tasks],
            ['Просрочено', [String(STATS.team.overdue), 'bad']]] },
-  { id: 'director',   name: 'ДИРЕКТОР',       col: 2, row: 1, hue: 0x3dfbe0,
+  { id: 'director',   name: 'ДИРЕКТОР',       floor: 1, col: 0,  row: 1,  hue: 0x3dfbe0,
     sub: 'то, что решается только здесь',
     rows: [['Чистая прибыль', [money(last.in - last.out), 'good']],
            ['Рост к первому месяцу',
@@ -152,7 +166,7 @@ for (const dep of DEPARTMENTS) dep.mod = moduleByRoom(dep.id);
 /* ---------- Сцена ---------- */
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x05070a);
-scene.fog = new THREE.Fog(0x05070a, 30, 120);
+scene.fog = new THREE.Fog(0x05070a, 34, 130);
 
 const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.1, 400);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -165,20 +179,24 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
 });
 
-scene.add(new THREE.HemisphereLight(0x3a4d5c, 0x0a0a0a, 0.9));
+scene.add(new THREE.HemisphereLight(0x22323c, 0x06090c, 0.6));
 
-const planW = 3 * ROOM + 2 * GAP + 30;
-const planD = 2 * ROOM + GAP + 30;
-const floor = new THREE.Mesh(
-  new THREE.PlaneGeometry(planW, planD),
-  new THREE.MeshStandardMaterial({ color: 0x0b0f12, roughness: 0.85, metalness: 0.1 }));
-floor.rotation.x = -Math.PI / 2;
-scene.add(floor);
-const grid = new THREE.GridHelper(Math.max(planW, planD), Math.max(planW, planD) / 2, 0x113033, 0x0a1a1c);
-grid.position.y = 0.02;
-scene.add(grid);
+/* Плита этажа. Верхняя короче нижней: справа остаётся проём под лестницу. */
+function slab(y, x0, x1) {
+  const w = x1 - x0, d = PLAN_Z * 2;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, d),
+    new THREE.MeshStandardMaterial({ color: 0x0b0f12, roughness: 0.85, metalness: 0.1 }));
+  m.rotation.x = -Math.PI / 2;
+  m.position.set((x0 + x1) / 2, y, 0);
+  scene.add(m);
+  const grid = new THREE.GridHelper(Math.max(w, d), Math.max(w, d) / 2, 0x113033, 0x0a1a1c);
+  grid.position.set((x0 + x1) / 2, y + 0.02, 0);
+  scene.add(grid);
+}
+slab(0, PLAN_X0, PLAN_X1);
+slab(LIFT, PLAN_X0, RAMP_X0);
 
-/* Плоские подписи комнат: текст на canvas дешевле, чем шрифтовая геометрия,
+/* Плоские подписи: текст на canvas дешевле шрифтовой геометрии
    и читается с любого расстояния. */
 function label(text, color) {
   const c = document.createElement('canvas');
@@ -193,74 +211,108 @@ function label(text, color) {
   g.fillText(text, 256, 68);
   const tex = new THREE.CanvasTexture(c);
   tex.anisotropy = 4;
-  const m = new THREE.Mesh(new THREE.PlaneGeometry(8, 2),
+  return new THREE.Mesh(new THREE.PlaneGeometry(8, 2),
     new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
-  return m;
 }
 
 /* Стены собираем сегментами и складываем их AABB — по ним же считаем
-   столкновения, поэтому «пройти сквозь стену» нельзя по построению. */
+   столкновения, поэтому «пройти сквозь стену» нельзя по построению.
+   Стены отдела получают собственный материал: он подсвечивается,
+   когда игрок подходит ближе REACT_NEAR. */
 const colliders = [];
 const clickable = [];
-const wallMat = new THREE.MeshStandardMaterial({ color: 0x16202a, roughness: 0.7, metalness: 0.25 });
+const reactive = [];
+const REACT_FAR = 15, REACT_NEAR = 4;
 
-function wall(cx, cz, w, d) {
-  const m = new THREE.Mesh(new THREE.BoxGeometry(w, H, d), wallMat);
-  m.position.set(cx, H / 2, cz);
+function wall(cx, y, cz, w, d, hue) {
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x0b1014, roughness: 0.85, metalness: 0.12,
+    emissive: new THREE.Color(hue ?? 0x000000), emissiveIntensity: 0,
+  });
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, H, d), mat);
+  m.position.set(cx, y + H / 2, cz);
   scene.add(m);
   colliders.push(new THREE.Box3().setFromObject(m));
+  if (hue) {
+    reactive.push(m);
+    // Неоновый кант по верху стены: планировка читается даже в темноте.
+    const trim = new THREE.Mesh(new THREE.BoxGeometry(w + 0.02, 0.08, d + 0.02),
+      new THREE.MeshBasicMaterial({ color: hue }));
+    trim.position.set(cx, y + H - 0.5, cz);
+    scene.add(trim);
+  }
   return m;
 }
 
+function dashboard(dep, x0, y, z0) {
+  // Настольный 3D-дэшборд: выручка по месяцам столбиками, чтобы цифры
+  // читались прямо из комнаты, а не только из карточки.
+  const group = new THREE.Group();
+  const max = Math.max(...STATS.revenue.map(r => r.in));
+  STATS.revenue.forEach((r, i) => {
+    const h = 0.4 + 2.6 * (r.in / max);
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(0.5, h, 0.5),
+      new THREE.MeshStandardMaterial({ color: 0x0a1418, emissive: new THREE.Color(dep.hue),
+                                       emissiveIntensity: 0.7, roughness: 0.4 }));
+    bar.position.set((i - (STATS.revenue.length - 1) / 2) * 0.9, h / 2, 0);
+    group.add(bar);
+  });
+  group.position.set(x0, y + 2.6, z0 - 3);
+  scene.add(group);
+  group.traverse(o => { o.userData.dep = dep; if (o.isMesh) clickable.push(o); });
+}
+
 function room(dep) {
-  const x0 = (dep.col - 1) * (ROOM + GAP);
-  const z0 = dep.row === 0 ? -(ROOM + GAP) / 2 - ROOM / 2 : (ROOM + GAP) / 2 + ROOM / 2;
-  const half = ROOM / 2;
-  const doorSide = dep.row === 0 ? 1 : -1; // дверь всегда в коридор
+  const x0 = dep.col * COL;
+  const z0 = dep.row * ROWZ;
+  const y = dep.floor * LIFT;
+  const doorSide = dep.row === -1 ? 1 : -1; // дверь всегда в коридор
   const side = (ROOM - DOOR) / 2;
 
-  wall(x0, z0 - doorSide * half, ROOM, WALL);                       // глухая стена
-  wall(x0 - half, z0, WALL, ROOM);
-  wall(x0 + half, z0, WALL, ROOM);
-  wall(x0 - (DOOR / 2 + side / 2), z0 + doorSide * half, side, WALL); // стена с проёмом
-  wall(x0 + (DOOR / 2 + side / 2), z0 + doorSide * half, side, WALL);
+  wall(x0, y, z0 - doorSide * HALF, ROOM, WALL, dep.hue);              // глухая стена
+  wall(x0 - HALF, y, z0, WALL, ROOM, dep.hue);
+  wall(x0 + HALF, y, z0, WALL, ROOM, dep.hue);
+  wall(x0 - (DOOR / 2 + side / 2), y, z0 + doorSide * HALF, side, WALL, dep.hue);
+  wall(x0 + (DOOR / 2 + side / 2), y, z0 + doorSide * HALF, side, WALL, dep.hue);
 
   // Пол-подсветка отдела: видно, где стоишь, и куда идти дальше.
   const pad = new THREE.Mesh(new THREE.PlaneGeometry(ROOM - 1, ROOM - 1),
     new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.07 }));
   pad.rotation.x = -Math.PI / 2;
-  pad.position.set(x0, 0.05, z0);
+  pad.position.set(x0, y + 0.05, z0);
   scene.add(pad);
 
-  const lamp = new THREE.PointLight(dep.hue, 55, ROOM * 1.6, 2);
-  lamp.position.set(x0, H - 1.2, z0);
+  const lamp = new THREE.PointLight(dep.hue, 46, ROOM * 1.6, 2);
+  lamp.position.set(x0, y + H - 1.2, z0);
   scene.add(lamp);
 
   // Терминал отдела — цель для клика.
   const kiosk = new THREE.Mesh(new THREE.BoxGeometry(3.2, 0.35, 2),
     new THREE.MeshStandardMaterial({ color: 0x0d1519, roughness: 0.5, metalness: 0.6 }));
-  kiosk.position.set(x0, 1.1, z0);
+  kiosk.position.set(x0, y + 1.1, z0);
   const legs = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.1, 1.4),
     new THREE.MeshStandardMaterial({ color: 0x090d10 }));
-  legs.position.set(x0, 0.55, z0);
+  legs.position.set(x0, y + 0.55, z0);
   const screen = new THREE.Mesh(new THREE.PlaneGeometry(3, 1.7),
     new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.5,
                                  side: THREE.DoubleSide }));
-  screen.position.set(x0, 2.1, z0);
+  screen.position.set(x0, y + 2.1, z0);
   screen.rotation.x = -0.35;
   scene.add(kiosk, legs, screen);
   colliders.push(new THREE.Box3().setFromObject(legs));
 
   const tag = label(dep.name, dep.hue);
-  tag.position.set(x0, 3.9, z0 + doorSide * (half - 0.35));
+  tag.position.set(x0, y + 3.9, z0 + doorSide * (HALF - 0.35));
   tag.rotation.y = doorSide === 1 ? 0 : Math.PI;
   scene.add(tag);
+
+  if (dep.id === 'director') dashboard(dep, x0, y, z0);
 
   // Портал в модуль: светящаяся рамка на глухой стене — видно, куда ведёт комната.
   if (dep.mod) {
     const portal = new THREE.Mesh(new THREE.PlaneGeometry(6, 3.4),
       new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.12 }));
-    portal.position.set(x0, 2.1, z0 - doorSide * (half - 0.3));
+    portal.position.set(x0, y + 2.1, z0 - doorSide * (HALF - 0.3));
     portal.rotation.y = doorSide === 1 ? Math.PI : 0;
     const frame = new THREE.LineSegments(
       new THREE.EdgesGeometry(new THREE.PlaneGeometry(6, 3.4)),
@@ -269,7 +321,7 @@ function room(dep) {
     frame.rotation.copy(portal.rotation);
     const sign = label(dep.mod.name, dep.hue);
     sign.scale.set(0.62, 0.62, 1);
-    sign.position.set(x0, 4.3, z0 - doorSide * (half - 0.32));
+    sign.position.set(x0, y + 4.3, z0 - doorSide * (HALF - 0.32));
     sign.rotation.y = portal.rotation.y;
     scene.add(portal, frame, sign);
     for (const o of [portal, sign]) { o.userData.dep = dep; clickable.push(o); }
@@ -279,22 +331,70 @@ function room(dep) {
 }
 DEPARTMENTS.forEach(room);
 
-// Коридор: холодные лампы, чтобы от входа было видно, куда идти.
-for (const x of [-(ROOM + GAP), 0, ROOM + GAP]) {
-  const l = new THREE.PointLight(0xbfe9ff, 40, 34, 2);
-  l.position.set(x, H - 1.5, 0);
-  scene.add(l);
+/* Лестница: пандус со ступенями. Ступени — только декор, ходьба идёт
+   по аналитической высоте (groundAt), поэтому подъём всегда плавный. */
+const STEPS = 18;
+for (let i = 0; i < STEPS; i++) {
+  const t = i / STEPS;
+  const step = new THREE.Mesh(
+    new THREE.BoxGeometry((RAMP_X1 - RAMP_X0) / STEPS + 0.05, 0.35, RAMP_HALF * 2),
+    new THREE.MeshStandardMaterial({ color: 0x101a1f, roughness: 0.6, metalness: 0.35,
+                                     emissive: 0x00ffcc, emissiveIntensity: 0.06 }));
+  step.position.set(RAMP_X1 - (i + 0.5) * (RAMP_X1 - RAMP_X0) / STEPS,
+                    t * LIFT - 0.17, 0);
+  scene.add(step);
+}
+for (const z of [-RAMP_HALF, RAMP_HALF]) {
+  const rail = new THREE.Mesh(
+    new THREE.BoxGeometry(RAMP_X1 - RAMP_X0, 0.12, 0.12),
+    new THREE.MeshBasicMaterial({ color: 0x00ffcc }));
+  rail.position.set((RAMP_X0 + RAMP_X1) / 2, LIFT / 2 + 1.1, z);
+  rail.rotation.z = Math.atan2(LIFT, RAMP_X1 - RAMP_X0);
+  scene.add(rail);
+}
+const stairTag = label('ЛЕСТНИЦА · 2 ЭТАЖ', 0x00ffcc);
+stairTag.scale.set(0.7, 0.7, 1);
+stairTag.position.set(RAMP_X1 - 1, 3.4, -RAMP_HALF - 0.1);
+stairTag.rotation.y = -0.5;
+scene.add(stairTag);
+
+// Коридорные лампы на каждом этаже.
+for (const y of [0, LIFT]) {
+  for (const x of [-COL, 0, COL, RAMP_X0]) {
+    const l = new THREE.PointLight(0x9fdcf0, 48, 36, 2);
+    l.position.set(x, y + H - 1.5, 0);
+    scene.add(l);
+  }
 }
 
-// Внешний периметр, чтобы не улететь в пустоту.
-const px = planW / 2 - 2, pz = planD / 2 - 2;
-wall(0, -pz, px * 2, WALL); wall(0, pz, px * 2, WALL);
-wall(-px, 0, WALL, pz * 2); wall(px, 0, WALL, pz * 2);
+/* Периметр: снизу полный, сверху с обрывом у лестничного проёма. */
+for (const y of [0, LIFT]) {
+  const x1 = y === 0 ? PLAN_X1 : RAMP_X0;
+  wall((PLAN_X0 + x1) / 2, y, -PLAN_Z, x1 - PLAN_X0, WALL);
+  wall((PLAN_X0 + x1) / 2, y, PLAN_Z, x1 - PLAN_X0, WALL);
+  wall(PLAN_X0, y, 0, WALL, PLAN_Z * 2);
+  wall(x1, y, 0, WALL, PLAN_Z * 2);
+}
+// Ограждение проёма второго этажа: пройти можно только через лестницу.
+for (const sgn of [-1, 1]) {
+  const len = PLAN_Z - RAMP_HALF;
+  wall(RAMP_X0, LIFT, sgn * (RAMP_HALF + len / 2), WALL, len);
+}
 
-/* ---------- Ходьба от первого лица ---------- */
+/* ---------- Ходьба от первого лица с переходом между этажами ---------- */
 const EYE = 1.7, RADIUS = 0.55;
 const controls = new PointerLockControls(camera, renderer.domElement);
+let levelY = 0;
 camera.position.set(0, EYE, 0);
+
+/** Высота пола под точкой: на лестнице интерполируется, иначе — текущий этаж. */
+function groundAt(x, z) {
+  if (x > RAMP_X0 - 0.3 && x < RAMP_X1 + 0.3 && Math.abs(z) < RAMP_HALF + 0.3) {
+    const t = THREE.MathUtils.clamp((RAMP_X1 - x) / (RAMP_X1 - RAMP_X0), 0, 1);
+    return t * LIFT;
+  }
+  return levelY;
+}
 
 const keys = new Set();
 addEventListener('keydown', e => {
@@ -314,13 +414,14 @@ controls.addEventListener('unlock', () => {
   if (card.style.display !== 'block') startEl.style.display = 'flex';
 });
 
-function blocked(pos) {
+function blocked(x, z, baseY) {
   const box = new THREE.Box3(
-    new THREE.Vector3(pos.x - RADIUS, 0.2, pos.z - RADIUS),
-    new THREE.Vector3(pos.x + RADIUS, H - 0.2, pos.z + RADIUS));
+    new THREE.Vector3(x - RADIUS, baseY + 0.4, z - RADIUS),
+    new THREE.Vector3(x + RADIUS, baseY + H * 0.7, z + RADIUS));
   return colliders.some(c => c.intersectsBox(box));
 }
 
+const floorTag = document.getElementById('floor-tag');
 function move(dt) {
   const speed = (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 12 : 5.5) * dt;
   let f = 0, s = 0;
@@ -328,21 +429,37 @@ function move(dt) {
   if (keys.has('KeyS') || keys.has('ArrowDown')) f -= 1;
   if (keys.has('KeyD') || keys.has('ArrowRight')) s += 1;
   if (keys.has('KeyA') || keys.has('ArrowLeft')) s -= 1;
-  if (!f && !s) return;
 
-  const dir = new THREE.Vector3();
-  camera.getWorldDirection(dir);
-  dir.y = 0; dir.normalize();
-  const right = new THREE.Vector3().crossVectors(camera.up, dir).normalize().negate();
-  const step = dir.multiplyScalar(f).add(right.multiplyScalar(s)).normalize().multiplyScalar(speed);
-
-  // Оси проверяем раздельно — иначе игрок «залипает» в углах.
   const p = camera.position;
-  const tryX = p.clone(); tryX.x += step.x;
-  if (!blocked(tryX)) p.x = tryX.x;
-  const tryZ = p.clone(); tryZ.z += step.z;
-  if (!blocked(tryZ)) p.z = tryZ.z;
-  p.y = EYE;
+  if (f || s) {
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    dir.y = 0; dir.normalize();
+    const right = new THREE.Vector3().crossVectors(camera.up, dir).normalize().negate();
+    const step = dir.multiplyScalar(f).add(right.multiplyScalar(s)).normalize().multiplyScalar(speed);
+
+    // Оси проверяем раздельно — иначе игрок «залипает» в углах.
+    const base = groundAt(p.x, p.z);
+    if (!blocked(p.x + step.x, p.z, base)) p.x += step.x;
+    if (!blocked(p.x, p.z + step.z, base)) p.z += step.z;
+  }
+
+  const g = groundAt(p.x, p.z);
+  // На лестнице этаж определяется пройденной половиной подъёма.
+  if (g !== levelY) levelY = g > LIFT / 2 ? LIFT : 0;
+  p.y = g + EYE;
+  floorTag.innerHTML = `<b>${g > LIFT / 2 ? 2 : 1}</b>ЭТАЖ`;
+}
+
+/* ---------- Реактивные стены: цвет отдела разгорается на подходе ---------- */
+function react() {
+  const p = camera.position;
+  for (const m of reactive) {
+    const d = m.position.distanceTo(p);
+    const k = THREE.MathUtils.clamp((REACT_FAR - d) / (REACT_FAR - REACT_NEAR), 0, 1);
+    m.material.emissiveIntensity = 0.55 * k * k;
+    m.material.color.setHex(0x0b1014).lerp(m.material.emissive, 0.22 * k);
+  }
 }
 
 /* ---------- Наведение и клик ---------- */
@@ -397,7 +514,8 @@ fetch('leads.json').then(r => r.ok ? r.json() : null).then(leads => {
   const sales = DEPARTMENTS.find(d => d.id === 'sales');
   sales.rows[0][1] = leads.length;
   sales.rows[1][1] = [String(hot), hot ? 'good' : ''];
-  document.getElementById('stat').textContent = `отделов: 6 · лидов из радара: ${leads.length}`;
+  document.getElementById('stat').textContent =
+    `отделов: ${DEPARTMENTS.length} · этажей: 2 · лидов из радара: ${leads.length}`;
   if (card.style.display === 'block' &&
       document.getElementById('c-title').textContent === sales.name) openCard(sales);
 }).catch(() => {});
@@ -409,10 +527,17 @@ function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
   if (controls.isLocked) { move(dt); pick(); } else { lookEl.textContent = ''; }
+  react();
   clockEl.textContent = new Date().toLocaleTimeString('ru-RU');
   renderer.render(scene, camera);
 }
 animate();
+
+// Отладочная ручка: позволяет проверить планировку и переходы между этажами
+// из консоли, не проходя дом руками.
+window.house = { scene, camera, controls, DEPARTMENTS, reactive, teleport(x, z, y = 0) {
+  levelY = y; camera.position.set(x, y + EYE, z);
+} };
 </script>
 </body>
 </html>
