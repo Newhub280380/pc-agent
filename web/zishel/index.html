@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ZISHEL PHALLO — премиальные филлеры в Казахстане</title>
 <meta name="description" content="Zishel Phallo — премиальные филлеры для клиник и косметологов Казахстана. Прайс, сертификаты, доставка по РК из Алматы.">
+<link rel="stylesheet" href="../shared/theme.css">
 <style>
   :root { --gold: #c5a059; --ink: #0d0d0d; --paper: #f5f5f5; --dim: #a2a2a2; }
   * { box-sizing: border-box; }
@@ -24,7 +25,7 @@
                        url('https://images.unsplash.com/photo-1512290923902-8a9f81dc236c?w=1600&q=70') center/cover,
                        #0d0d0d; }
   header h1 { font-size: clamp(34px, 8vw, 62px); color: var(--gold); letter-spacing: 8px; }
-  header p.tag { letter-spacing: 6px; color: var(--paper); margin: 0; }
+  header p.claim { letter-spacing: 6px; color: var(--paper); margin: 0; }
   .cta { display: inline-block; border: 2px solid var(--gold); padding: 14px 34px; color: var(--gold);
          text-decoration: none; font-weight: bold; letter-spacing: 2px; transition: .2s; }
   .cta:hover { background: var(--gold); color: var(--ink); }
@@ -64,7 +65,7 @@
 
 <header>
   <h1>ZISHEL PHALLO</h1>
-  <p class="tag">ПРЕМИАЛЬНЫЕ ФИЛЛЕРЫ РК</p>
+  <p class="claim">ПРЕМИАЛЬНЫЕ ФИЛЛЕРЫ РК</p>
   <p class="lead">Оригинальная линейка для клиник и практикующих косметологов. Склад в Алматы,
      доставка по Казахстану 1–3 дня, документы на каждую партию.</p>
   <a href="#price" class="cta">ПОЛУЧИТЬ ПРАЙС</a>
@@ -172,10 +173,12 @@
 
 <a class="cta solid float" id="wa-direct" href="#" target="_blank" rel="noopener">WHATSAPP</a>
 
-<script>
-  // Номер продавца — единственное, что нужно поменять под себя.
-  const SELLER_WHATSAPP = '77000000000';
-  const waUrl = text => `https://wa.me/${SELLER_WHATSAPP}?text=${encodeURIComponent(text)}`;
+<script type="module">
+  // Номер продавца и линейка живут в общей базе экосистемы.
+  import { waUrl } from '../shared/data.js';
+  import { mountNav } from '../shared/nav.js';
+
+  mountNav('zishel');
   document.getElementById('wa-direct').href = waUrl('Здравствуйте! Интересует прайс Zishel Phallo.');
 
   const digits = s => (s.match(/\d/g) || []).join('');

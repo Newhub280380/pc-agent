@@ -4,13 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FX.atomy_ai // Series_01 — ZISHEL_ROSE_GLAM</title>
+<link rel="stylesheet" href="../shared/theme.css">
 <style>
   :root { --cyan: #00ffff; --rose: #ff4d9d; }
   * { box-sizing: border-box; }
   body { margin: 0; background: #000; overflow: hidden; color: var(--cyan);
          font: 13px/1.6 monospace; }
   canvas { display: block; }
-  #hud { position: fixed; top: 26px; left: 26px; letter-spacing: 2px; text-shadow: 0 0 12px #000; }
+  #hud { position: fixed; top: 62px; left: 26px; letter-spacing: 2px; text-shadow: 0 0 12px #000; }
   #hud b { color: var(--rose); }
   #tools { position: fixed; bottom: 22px; left: 26px; right: 26px; display: flex;
            flex-wrap: wrap; gap: 10px; align-items: center; }
@@ -46,10 +47,13 @@
 
 <script type="module">
 import * as THREE from 'three';
+import { mountNav } from '../shared/nav.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+mountNav('fx');
 
 const PALETTES = [
   { name: 'ROSE',  key: 0xff4d9d, fill: 0x00ffff },

@@ -1,0 +1,99 @@
+/* Единая тема экосистемы: неоновый циан на графитовом чёрном.
+   Все модули подключают этот файл, поэтому цвета и типографика правятся тут. */
+:root {
+  --neon: #00ffcc;
+  --cyan: #00ffff;
+  --bg: #05070a;
+  --bg-2: #080d10;
+  --panel: rgba(6, 12, 14, .86);
+  --line: #16242a;
+  --text: #e8f3f2;
+  --dim: #74898c;
+  --bad: #ff5f6d;
+  --warm: #c5a059;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.6 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--neon); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+h1, h2, h3 { letter-spacing: 3px; margin: 0 0 10px; }
+h1 { font-size: clamp(26px, 4vw, 44px); }
+h2 { font-size: clamp(19px, 2.4vw, 26px); color: var(--neon); }
+h3 { font-size: 15px; color: var(--neon); }
+
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 22px; }
+.grid { display: grid; gap: 18px; }
+.mono { font-family: var(--mono); }
+.dim { color: var(--dim); }
+.bad { color: var(--bad); }
+.good { color: var(--neon); }
+.nowrap { white-space: nowrap; }
+
+/* Навигация между модулями: рисуется скриптом shared/nav.js */
+.eco-nav {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 10px 18px;
+  background: rgba(3, 6, 8, .92);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(6px);
+  font-family: var(--mono); font-size: 12px; letter-spacing: 1px;
+}
+.eco-nav .home { color: var(--neon); border: 1px solid var(--neon); }
+.eco-nav a {
+  padding: 5px 10px; border: 1px solid var(--line); border-radius: 4px;
+  color: var(--dim); text-transform: uppercase;
+}
+.eco-nav a:hover { color: var(--neon); border-color: var(--neon); text-decoration: none; }
+.eco-nav a[aria-current="page"] { color: #04100e; background: var(--neon); border-color: var(--neon); }
+.eco-nav .spacer { flex: 1; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--neon);
+  border-radius: 8px;
+  padding: 18px 20px;
+}
+
+.btn {
+  font: inherit; letter-spacing: 2px; cursor: pointer;
+  color: #04100e; background: var(--neon);
+  border: 0; border-radius: 4px; padding: 11px 22px;
+}
+.btn:hover { filter: brightness(1.12); }
+.btn.ghost { background: transparent; color: var(--neon); border: 1px solid var(--neon); }
+.btn:disabled { opacity: .45; cursor: default; }
+
+table.data { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+table.data th, table.data td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+table.data th { color: var(--dim); font-weight: 500; font-size: 12px; letter-spacing: 1px; text-transform: uppercase; }
+table.data td.num, table.data th.num { text-align: right; }
+
+.kpi { display: flex; flex-direction: column; gap: 2px; }
+.kpi .val { font-size: 26px; font-weight: 600; color: var(--neon); font-variant-numeric: tabular-nums; }
+.kpi .lbl { color: var(--dim); font-size: 12px; letter-spacing: 1px; text-transform: uppercase; }
+
+.tag {
+  display: inline-block; padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--dim);
+  font-family: var(--mono); font-size: 11px; letter-spacing: 1px;
+}
+.tag.on { color: var(--neon); border-color: var(--neon); }
+
+footer.eco-foot {
+  margin-top: 42px; padding: 22px; border-top: 1px solid var(--line);
+  color: var(--dim); font-family: var(--mono); font-size: 12px; text-align: center;
+}

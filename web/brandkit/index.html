@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BRAND KIT // Instagram-дизайн</title>
+<link rel="stylesheet" href="../shared/theme.css">
+<style>
+  main { padding: 26px 0 0; }
+  .cols { display: grid; gap: 18px; grid-template-columns: 380px 1fr; align-items: start; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  label { display: block; margin: 12px 0 4px; color: var(--dim); font-size: 12px;
+          letter-spacing: 1px; text-transform: uppercase; }
+  input, select, textarea { font: inherit; color: var(--text); background: #0a1114;
+    border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; width: 100%; }
+  input:focus, select:focus, textarea:focus { outline: 0; border-color: var(--neon); }
+  textarea { resize: vertical; min-height: 64px; }
+  .swatches { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+  .sw { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; cursor: pointer; }
+  .sw .chip { height: 54px; }
+  .sw .meta { padding: 7px 9px; font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .preview { display: flex; justify-content: center; background: #04070a;
+             border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  #post { width: 100%; max-width: 460px; height: auto; border-radius: 4px; }
+  .type-row { border-bottom: 1px solid var(--line); padding: 12px 0; }
+  .type-row .name { color: var(--dim); font-family: var(--mono); font-size: 12px; }
+  .acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+</style>
+</head>
+<body>
+
+<main class="wrap">
+  <h1 style="color:var(--neon)">BRAND KIT</h1>
+  <p class="dim mono">палитра, типографика и генератор постов — экспорт готового PNG под Instagram</p>
+
+  <div class="cols">
+    <section class="card">
+      <h2>ГЕНЕРАТОР ПОСТА</h2>
+      <label for="fmt">Формат</label>
+      <select id="fmt">
+        <option value="1080x1080">Пост 1080×1080</option>
+        <option value="1080x1350">Пост 4:5 — 1080×1350</option>
+        <option value="1080x1920">Сторис 1080×1920</option>
+      </select>
+
+      <label for="tpl">Шаблон</label>
+      <select id="tpl">
+        <option value="offer">Оффер с ценой</option>
+        <option value="product">Карточка продукта</option>
+        <option value="tip">Совет косметологу</option>
+      </select>
+
+      <label for="prod">Позиция</label>
+      <select id="prod"></select>
+
+      <label for="head">Заголовок</label>
+      <input id="head" maxlength="42">
+
+      <label for="sub">Подпись</label>
+      <textarea id="sub" maxlength="130"></textarea>
+
+      <label for="cta">Плашка снизу</label>
+      <input id="cta" maxlength="46" value="ПРАЙС В DIRECT">
+
+      <div class="acts">
+        <button class="btn" id="png">СКАЧАТЬ PNG</button>
+        <button class="btn ghost" id="caption">ТЕКСТ ПОСТА В БУФЕР</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>ПРЕВЬЮ</h2>
+      <div class="preview"><canvas id="post" width="1080" height="1080"></canvas></div>
+
+      <h2 style="margin-top:24px">ПАЛИТРА</h2>
+      <div class="swatches" id="sw"></div>
+
+      <h2 style="margin-top:24px">ТИПОГРАФИКА</h2>
+      <div id="type"></div>
+    </section>
+  </div>
+
+  <div style="height:26px"></div>
+</main>
+
+<script type="module">
+import { BRAND, PRODUCTS, money } from '../shared/data.js';
+import { mountNav, mountFooter } from '../shared/nav.js';
+
+mountNav('brandkit');
+
+/* ---------- Палитра и типографика ---------- */
+document.getElementById('sw').innerHTML = Object.entries(BRAND.palette)
+  .map(([name, hex]) => `<div class="sw" data-hex="${hex}">
+      <div class="chip" style="background:${hex}"></div>
+      <div class="meta">${name}<br>${hex}</div></div>`).join('');
+
+document.getElementById('sw').addEventListener('click', e => {
+  const sw = e.target.closest('.sw');
+  if (sw) navigator.clipboard?.writeText(sw.dataset.hex).catch(() => {});
+});
+
+document.getElementById('type').innerHTML = [
+  ['Заголовок', BRAND.fonts.display, '32px', '6px'],
+  ['Текст', BRAND.fonts.text, '17px', '0px'],
+  ['Техничный / цифры', BRAND.fonts.mono, '15px', '1px'],
+].map(([role, font, size, ls]) => `<div class="type-row">
+    <div class="name">${role} · ${font}</div>
+    <div style="font-size:${size};letter-spacing:${ls}">Zishel Phallo · филлеры · 21 000 ₸</div>
+  </div>`).join('');
+
+/* ---------- Генератор ---------- */
+const cv = document.getElementById('post');
+const g = cv.getContext('2d');
+const prodEl = document.getElementById('prod');
+const fmtEl = document.getElementById('fmt');
+const tplEl = document.getElementById('tpl');
+const headEl = document.getElementById('head');
+const subEl = document.getElementById('sub');
+const ctaEl = document.getElementById('cta');
+
+prodEl.innerHTML = PRODUCTS.map(p => `<option value="${p.sku}">${p.name}</option>`).join('');
+
+const DEFAULTS = {
+  offer:   { head: 'ЦЕНА КЛИНИКИ', sub: 'От 10 шт — минус 12% от розницы. Склад в Алматы, отгрузка в день заказа.' },
+  product: { head: '', sub: '' },
+  tip:     { head: 'СОВЕТ', sub: 'Плотный филлер в тонкую кожу даёт бугры. Для зоны под глазами берите мягкую линейку.' },
+};
+
+function applyDefaults() {
+  const p = PRODUCTS.find(x => x.sku === prodEl.value) ?? PRODUCTS[0];
+  const d = DEFAULTS[tplEl.value];
+  headEl.value = tplEl.value === 'product' ? p.name : d.head;
+  subEl.value = tplEl.value === 'product' ? `${p.use}. Держится ${p.lasts}.` : d.sub;
+  draw();
+}
+
+/** Перенос строк вручную: canvas сам не умеет, а текст задаёт пользователь. */
+function wrap(text, maxWidth) {
+  const lines = [];
+  let line = '';
+  for (const word of text.split(/\s+/)) {
+    const probe = line ? line + ' ' + word : word;
+    if (g.measureText(probe).width > maxWidth && line) { lines.push(line); line = word; }
+    else line = probe;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function draw() {
+  const [w, h] = fmtEl.value.split('x').map(Number);
+  cv.width = w; cv.height = h;
+  const p = PRODUCTS.find(x => x.sku === prodEl.value) ?? PRODUCTS[0];
+  const accent = tplEl.value === 'product' ? p.tint : BRAND.palette.neon;
+
+  const bg = g.createLinearGradient(0, 0, w, h);
+  bg.addColorStop(0, '#04070a');
+  bg.addColorStop(0.55, '#071417');
+  bg.addColorStop(1, '#04070a');
+  g.fillStyle = bg;
+  g.fillRect(0, 0, w, h);
+
+  // Неоновое свечение и концентрические круги — узнаваемый каркас серии.
+  const glow = g.createRadialGradient(w * 0.5, h * 0.52, 0, w * 0.5, h * 0.52, w * 0.72);
+  glow.addColorStop(0, accent + '33');
+  glow.addColorStop(1, 'transparent');
+  g.fillStyle = glow;
+  g.fillRect(0, 0, w, h);
+
+  g.strokeStyle = accent + '55';
+  g.lineWidth = Math.max(2, w / 540);
+  for (let i = 1; i <= 3; i++) {
+    g.beginPath();
+    g.arc(w * 0.5, h * 0.52, w * (0.16 + i * 0.11), 0, Math.PI * 2);
+    g.stroke();
+  }
+
+  g.strokeStyle = accent;
+  g.lineWidth = Math.max(3, w / 360);
+  const m = w * 0.055;
+  g.strokeRect(m, m, w - m * 2, h - m * 2);
+
+  const cx = w / 2;
+  g.textAlign = 'center';
+
+  g.fillStyle = accent;
+  g.font = `600 ${Math.round(w * 0.032)}px ui-monospace, monospace`;
+  g.fillText(BRAND.name + '  //  ' + BRAND.city.toUpperCase(), cx, m + w * 0.075);
+
+  g.fillStyle = '#ffffff';
+  g.font = `700 ${Math.round(w * 0.085)}px "Segoe UI", system-ui, sans-serif`;
+  const headLines = wrap(headEl.value.toUpperCase(), w * 0.8);
+  headLines.forEach((l, i) => g.fillText(l, cx, h * 0.42 + i * w * 0.098));
+
+  g.fillStyle = '#cfe0df';
+  g.font = `${Math.round(w * 0.038)}px "Segoe UI", system-ui, sans-serif`;
+  const subLines = wrap(subEl.value, w * 0.76);
+  const subTop = h * 0.42 + headLines.length * w * 0.098 + w * 0.03;
+  subLines.forEach((l, i) => g.fillText(l, cx, subTop + i * w * 0.052));
+
+  if (tplEl.value !== 'tip') {
+    g.fillStyle = accent;
+    g.font = `700 ${Math.round(w * 0.062)}px ui-monospace, monospace`;
+    g.fillText(money(p.price) + ' / ' + p.volume, cx, subTop + subLines.length * w * 0.052 + w * 0.075);
+  }
+
+  const barH = w * 0.105;
+  g.fillStyle = accent;
+  g.fillRect(m, h - m - barH, w - m * 2, barH);
+  g.fillStyle = '#04100e';
+  g.font = `700 ${Math.round(w * 0.037)}px ui-monospace, monospace`;
+  g.fillText(ctaEl.value.toUpperCase() + '   ·   @' + BRAND.instagram, cx, h - m - barH / 2 + w * 0.014);
+}
+
+[fmtEl, ctaEl, headEl, subEl].forEach(el => el.addEventListener('input', draw));
+fmtEl.addEventListener('change', draw);
+tplEl.addEventListener('change', applyDefaults);
+prodEl.addEventListener('change', applyDefaults);
+applyDefaults();
+
+document.getElementById('png').onclick = () => {
+  cv.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = `zishel_${tplEl.value}_${fmtEl.value}.png`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, 'image/png');
+};
+
+document.getElementById('caption').onclick = async e => {
+  const p = PRODUCTS.find(x => x.sku === prodEl.value) ?? PRODUCTS[0];
+  const caption = [
+    headEl.value,
+    '',
+    subEl.value,
+    '',
+    `${p.name} · ${p.volume} · ${money(p.price)}`,
+    `${ctaEl.value}. Пишите в Direct или WhatsApp.`,
+    '',
+    '#филлеры #косметолог #алматы #zishel',
+  ].join('\n');
+  try {
+    await navigator.clipboard.writeText(caption);
+    const old = e.target.textContent;
+    e.target.textContent = 'СКОПИРОВАНО';
+    setTimeout(() => { e.target.textContent = old; }, 1600);
+  } catch {
+    prompt('Скопируйте текст вручную:', caption);
+  }
+};
+
+mountFooter('шрифты берутся системные — PNG выглядит одинаково у вас и в Instagram');
+</script>
+</body>
+</html>

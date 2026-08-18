@@ -45,6 +45,9 @@
   #card footer { display: flex; justify-content: space-between; align-items: center;
                  margin-top: 16px; gap: 10px; }
   #card .note { color: #6e8080; font-size: 12px; }
+  #card .open { font: inherit; letter-spacing: 2px; text-decoration: none; color: var(--neon);
+                border: 1px solid var(--neon); border-radius: 4px; padding: 11px 20px; }
+  #card .open:hover { background: rgba(0,255,204,.12); }
 </style>
 </head>
 <body>
@@ -56,7 +59,7 @@
     <small>шесть отделов на одном этаже, живые показатели по клику</small>
   </div>
   <div id="row">
-    <div class="panel"><small>WASD — идти, Shift — бежать, мышь — смотреть,<br>ЛКМ на комнате — открыть отдел, Esc — выйти из обзора</small></div>
+    <div class="panel"><small>WASD — идти, Shift — бежать, мышь — смотреть,<br>ЛКМ на комнате — открыть отдел, E — войти в модуль, Esc — выйти из обзора</small></div>
     <div class="panel" style="max-width:210px"><small id="stat">отделов: 6</small></div>
   </div>
 </div>
@@ -69,7 +72,10 @@
   <table id="c-rows"></table>
   <footer>
     <span class="note" id="c-note"></span>
-    <button onclick="window.closeCard()">ЗАКРЫТЬ</button>
+    <span style="display:flex;gap:8px">
+      <a id="c-open" class="open" href="#" hidden>ОТКРЫТЬ МОДУЛЬ</a>
+      <button onclick="window.closeCard()">ЗАКРЫТЬ</button>
+    </span>
   </footer>
 </div>
 
@@ -77,7 +83,8 @@
   <h1>MANAGEMENT HOUSE</h1>
   <div id="keys">WASD — движение · мышь — обзор · ЛКМ — данные отдела · Esc — выход</div>
   <button id="go">ВОЙТИ В ДОМ</button>
-  <div id="keys">рендер: WebGL2 · данные: локальный JSON, без сервера</div>
+  <div id="keys">рендер: WebGL2 · данные: shared/data.js и leads.json, без сервера</div>
+  <div id="keys"><a href="../" style="color:#00ffcc">генеральный хаб — список модулей списком</a></div>
 </div>
 
 <script type="importmap">
@@ -90,32 +97,57 @@
 <script type="module">
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { moduleByRoom, ROOT } from '../shared/modules.js';
+import { STATS, PRODUCTS, money } from '../shared/data.js';
 
 /* ---------- Отделы. Показатели живут отдельно от геометрии, чтобы данные
    можно было подменить экспортом агента, не трогая сцену. ---------- */
 const ROOM = 16, GAP = 9, DOOR = 5, WALL = 0.4, H = 7;
 
+const last = STATS.revenue.at(-1);
+const lowStock = PRODUCTS.filter(p => p.stock < 15).length;
+const paid = STATS.funnel.at(-1).v, leadsAll = STATS.funnel[0].v;
+
 const DEPARTMENTS = [
   { id: 'sales',      name: 'ОТДЕЛ ПРОДАЖ',   col: 0, row: 0, hue: 0x00ffcc,
     sub: 'входящие заявки и обзвон базы',
-    rows: [['Лидов в базе', '—'], ['HOT-лидов', '—'], ['Заявок сегодня', 14], ['Счётов выставлено', 6], ['Конверсия в оплату', '18%']],
-    note: 'подхватывает leads.json из радара' },
-  { id: 'marketing',  name: 'МАРКЕТИНГ',      col: 1, row: 0, hue: 0xff4d9d,
+    rows: [['Лидов в базе', leadsAll], ['HOT-лидов', '—'],
+           ['Счётов выставлено', STATS.funnel[3].v],
+           ['Оплат', paid],
+           ['Конверсия в оплату', Math.round(paid / leadsAll * 100) + '%']],
+    note: 'лиды подхватываются из leads.json радара' },
+  { id: 'marketing',  name: 'МАРКЕТИНГ',      col: 1, row: 0, hue: 0x00ffff,
     sub: 'реклама, креативы, тесты',
-    rows: [['Бюджет за месяц', '480 000 ₸'], ['Кампаний активно', 3], ['CPL', '1 240 ₸'], ['Лучший креатив', 'ROSE_GLAM_02'], ['CTR', '2,4%']] },
-  { id: 'warehouse',  name: 'СКЛАД',          col: 2, row: 0, hue: 0xffc857,
+    rows: [['Бюджет за месяц', money(STATS.ads.budget)], ['CPL', money(STATS.ads.cpl)],
+           ['CTR', STATS.ads.ctr.toString().replace('.', ',') + '%'],
+           ['Лучший креатив', STATS.ads.best]] },
+  { id: 'warehouse',  name: 'СКЛАД',          col: 2, row: 0, hue: 0x7cf9ff,
     sub: 'остатки и отгрузки',
-    rows: [['Позиций на складе', 42], ['Ниже минимума', ['3', 'bad']], ['Отгружено за неделю', 118], ['Ближайший срок годности', '02.2027']] },
-  { id: 'accounting', name: 'БУХГАЛТЕРИЯ',    col: 0, row: 1, hue: 0x7cc4ff,
+    rows: [['Позиций в линейке', PRODUCTS.length],
+           ['Штук на складе', PRODUCTS.reduce((s, p) => s + p.stock, 0)],
+           ['Ниже минимума', [String(lowStock), lowStock ? 'bad' : 'good']],
+           ['Стоимость остатков', money(PRODUCTS.reduce((s, p) => s + p.stock * p.price, 0))]] },
+  { id: 'accounting', name: 'БУХГАЛТЕРИЯ',    col: 0, row: 1, hue: 0x00d9ff,
     sub: 'деньги, налоги, сверки',
-    rows: [['Приход за месяц', '6 420 000 ₸'], ['Расход', '3 980 000 ₸'], ['Дебиторка', ['940 000 ₸', 'bad']], ['Налоги к сроку', '25.09']] },
-  { id: 'admin',      name: 'АДМИНИСТРАЦИЯ',  col: 1, row: 1, hue: 0x9d8cff,
+    rows: [['Приход за месяц', money(last.in)], ['Расход', money(last.out)],
+           ['Дебиторка', [money(STATS.finance.receivable), 'bad']],
+           ['Налоги к сроку', STATS.finance.tax_due]] },
+  { id: 'admin',      name: 'АДМИНИСТРАЦИЯ',  col: 1, row: 1, hue: 0x66ffd9,
     sub: 'персонал и процессы',
-    rows: [['Сотрудников', 11], ['На смене сейчас', 7], ['Задач в работе', 23], ['Просрочено', ['2', 'bad']]] },
-  { id: 'director',   name: 'ДИРЕКТОР',       col: 2, row: 1, hue: 0xff7a45,
+    rows: [['Сотрудников', STATS.team.people], ['На смене сейчас', STATS.team.on_shift],
+           ['Задач в работе', STATS.team.tasks],
+           ['Просрочено', [String(STATS.team.overdue), 'bad']]] },
+  { id: 'director',   name: 'ДИРЕКТОР',       col: 2, row: 1, hue: 0x3dfbe0,
     sub: 'то, что решается только здесь',
-    rows: [['Чистая прибыль', ['2 440 000 ₸', 'good']], ['План месяца', '81%'], ['Решений на подпись', 4], ['Риск №1', 'зависимость от 1 поставщика']] },
+    rows: [['Чистая прибыль', [money(last.in - last.out), 'good']],
+           ['Рост к первому месяцу',
+            Math.round(last.in / STATS.revenue[0].in * 100 - 100) + '%'],
+           ['Свободные деньги', money(STATS.finance.cash)],
+           ['Риск №1', 'зависимость от 1 поставщика']] },
 ];
+
+// Связь комната → модуль берём из манифеста, а не дублируем здесь.
+for (const dep of DEPARTMENTS) dep.mod = moduleByRoom(dep.id);
 
 /* ---------- Сцена ---------- */
 const scene = new THREE.Scene();
@@ -224,6 +256,25 @@ function room(dep) {
   tag.rotation.y = doorSide === 1 ? 0 : Math.PI;
   scene.add(tag);
 
+  // Портал в модуль: светящаяся рамка на глухой стене — видно, куда ведёт комната.
+  if (dep.mod) {
+    const portal = new THREE.Mesh(new THREE.PlaneGeometry(6, 3.4),
+      new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.12 }));
+    portal.position.set(x0, 2.1, z0 - doorSide * (half - 0.3));
+    portal.rotation.y = doorSide === 1 ? Math.PI : 0;
+    const frame = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.PlaneGeometry(6, 3.4)),
+      new THREE.LineBasicMaterial({ color: dep.hue }));
+    frame.position.copy(portal.position);
+    frame.rotation.copy(portal.rotation);
+    const sign = label(dep.mod.name, dep.hue);
+    sign.scale.set(0.62, 0.62, 1);
+    sign.position.set(x0, 4.3, z0 - doorSide * (half - 0.32));
+    sign.rotation.y = portal.rotation.y;
+    scene.add(portal, frame, sign);
+    for (const o of [portal, sign]) { o.userData.dep = dep; clickable.push(o); }
+  }
+
   for (const o of [kiosk, screen, tag]) { o.userData.dep = dep; clickable.push(o); }
 }
 DEPARTMENTS.forEach(room);
@@ -249,6 +300,10 @@ const keys = new Set();
 addEventListener('keydown', e => {
   keys.add(e.code);
   if (e.code === 'Escape') closeCard();
+  // E — быстрый вход в модуль отдела, без открытия карточки.
+  if (e.code === 'KeyE' && hovered?.mod && controls.isLocked) {
+    location.href = ROOT + hovered.mod.path;
+  }
 });
 addEventListener('keyup', e => keys.delete(e.code));
 
@@ -300,7 +355,9 @@ function pick() {
   ray.setFromCamera(centre, camera);
   const hit = ray.intersectObjects(clickable, false).find(h => h.distance < 14);
   hovered = hit ? hit.object.userData.dep : null;
-  lookEl.textContent = hovered ? `${hovered.name} — ЛКМ` : '';
+  lookEl.textContent = hovered
+    ? `${hovered.name} — ЛКМ данные` + (hovered.mod ? ` · E → ${hovered.mod.name}` : '')
+    : '';
 }
 addEventListener('mousedown', e => {
   if (e.button === 0 && hovered && controls.isLocked) openCard(hovered);
@@ -308,10 +365,18 @@ addEventListener('mousedown', e => {
 
 /* ---------- Карточка отдела ---------- */
 const card = document.getElementById('card');
+const openEl = document.getElementById('c-open');
 function openCard(dep) {
   document.getElementById('c-title').textContent = dep.name;
   document.getElementById('c-sub').textContent = dep.sub;
   document.getElementById('c-note').textContent = dep.note ?? '';
+  if (dep.mod) {
+    openEl.hidden = false;
+    openEl.href = ROOT + dep.mod.path;
+    openEl.textContent = dep.mod.name;
+  } else {
+    openEl.hidden = true;
+  }
   document.getElementById('c-rows').innerHTML = dep.rows.map(([k, v]) => {
     const [val, cls] = Array.isArray(v) ? v : [v, ''];
     return `<tr><td>${k}</td><td class="${cls}">${val}</td></tr>`;
@@ -333,6 +398,8 @@ fetch('leads.json').then(r => r.ok ? r.json() : null).then(leads => {
   sales.rows[0][1] = leads.length;
   sales.rows[1][1] = [String(hot), hot ? 'good' : ''];
   document.getElementById('stat').textContent = `отделов: 6 · лидов из радара: ${leads.length}`;
+  if (card.style.display === 'block' &&
+      document.getElementById('c-title').textContent === sales.name) openCard(sales);
 }).catch(() => {});
 
 /* ---------- Кадр ---------- */

@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BUSINESS LOGIC // прайсы и скрипты</title>
+<link rel="stylesheet" href="../shared/theme.css">
+<style>
+  main { padding: 26px 0 0; }
+  .cols { display: grid; gap: 18px; grid-template-columns: 1.35fr 1fr; align-items: start; }
+  @media (max-width: 960px) { .cols { grid-template-columns: 1fr; } }
+  .calc { display: grid; gap: 12px; grid-template-columns: 1fr auto; align-items: center; }
+  select, input { font: inherit; color: var(--text); background: #0a1114;
+                  border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; width: 100%; }
+  select:focus, input:focus { outline: 0; border-color: var(--neon); }
+  .total { display: flex; justify-content: space-between; align-items: baseline;
+           border-top: 1px solid var(--line); padding-top: 12px; margin-top: 6px; }
+  .total .sum { font-size: 30px; color: var(--neon); font-variant-numeric: tabular-nums; }
+  .script { border: 1px solid var(--line); border-radius: 6px; padding: 14px; margin-bottom: 12px; }
+  .script h3 { margin-bottom: 6px; }
+  .script p { margin: 0 0 10px; color: #cfe0df; }
+  .script .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .small { font-size: 13px; padding: 8px 14px; }
+  details { border-bottom: 1px solid var(--line); padding: 10px 0; }
+  summary { cursor: pointer; color: var(--neon); font-weight: 600; }
+  details p { color: #cfe0df; margin: 8px 0 0; }
+  .tiers { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<main class="wrap">
+  <h1 style="color:var(--neon)">BUSINESS LOGIC</h1>
+  <p class="dim mono">прайс · калькулятор сделки · скрипты и возражения — всё из общей базы shared/data.js</p>
+
+  <div class="cols">
+    <section class="card">
+      <h2>ПРАЙС-ЛИСТ</h2>
+      <table class="data" id="price"></table>
+      <div class="tiers" id="tiers"></div>
+      <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+        <button class="btn ghost small" id="csv">СКАЧАТЬ CSV</button>
+        <button class="btn ghost small" id="copy-price">СКОПИРОВАТЬ ПРАЙС ТЕКСТОМ</button>
+        <button class="btn small" id="wa-price">ОТПРАВИТЬ ПРАЙС В WHATSAPP</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>КАЛЬКУЛЯТОР СДЕЛКИ</h2>
+      <div class="calc">
+        <select id="sku"></select>
+        <input id="qty" type="number" min="1" max="999" value="10" style="width:110px">
+      </div>
+      <div id="calc-out" style="margin-top:14px"></div>
+      <div class="total"><span class="dim mono">К ОПЛАТЕ</span><span class="sum" id="sum">—</span></div>
+      <button class="btn" id="wa-offer" style="margin-top:14px;width:100%">ОФФЕР В WHATSAPP</button>
+    </section>
+  </div>
+
+  <section class="card" style="margin-top:18px">
+    <h2>СКРИПТЫ ПРОДАЖ</h2>
+    <div id="scripts"></div>
+  </section>
+
+  <section class="card" style="margin-top:18px;margin-bottom:20px">
+    <h2>ОТРАБОТКА ВОЗРАЖЕНИЙ</h2>
+    <div id="objections"></div>
+  </section>
+</main>
+
+<script type="module">
+import { BRAND, PRODUCTS, PRICE_TIERS, SCRIPTS, OBJECTIONS, tierFor, money, waUrl } from '../shared/data.js';
+import { mountNav, mountFooter } from '../shared/nav.js';
+
+mountNav('business');
+
+/* ---------- Прайс ---------- */
+const priceEl = document.getElementById('price');
+priceEl.innerHTML = `<tr><th>Позиция</th><th>Объём</th><th>Плотность</th>
+  <th class="num">Розница</th><th class="num">От 10 шт</th><th class="num">Остаток</th></tr>` +
+  PRODUCTS.map(p => `<tr>
+    <td><b>${p.name}</b><br><span class="dim mono">${p.sku}</span></td>
+    <td class="nowrap">${p.volume}</td>
+    <td>${p.density}</td>
+    <td class="num">${money(p.price)}</td>
+    <td class="num good">${money(p.price * (1 - 0.12))}</td>
+    <td class="num ${p.stock < 15 ? 'bad' : ''}">${p.stock}</td></tr>`).join('');
+
+document.getElementById('tiers').innerHTML = PRICE_TIERS
+  .map(t => `<span class="tag${t.discount ? ' on' : ''}">от ${t.from} шт · ${t.label} · −${Math.round(t.discount * 100)}%</span>`)
+  .join('');
+
+const priceText = () => [
+  `Прайс ${BRAND.name} · ${BRAND.city}`,
+  ...PRODUCTS.map(p => `${p.name} (${p.volume}) — ${money(p.price)}, в наличии ${p.stock} шт`),
+  'От 5 шт −7%, от 10 шт −12%, от 25 шт −18%, от 50 шт −24%.',
+  'Доставка по Алматы в день заказа, по РК 1–2 дня. Оплата Kaspi или счёт.',
+].join('\n');
+
+document.getElementById('csv').onclick = () => {
+  const rows = [['sku', 'name', 'volume', 'density', 'price_kzt', 'stock'],
+    ...PRODUCTS.map(p => [p.sku, p.name, p.volume, p.density, p.price, p.stock])];
+  // \ufeff нужен, иначе Excel открывает кириллицу в CSV кракозябрами.
+  const blob = new Blob(['\ufeff' + rows.map(r => r.join(';')).join('\n')],
+    { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'zishel_price.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+const flash = (btn, text) => {
+  const old = btn.textContent;
+  btn.textContent = text;
+  setTimeout(() => { btn.textContent = old; }, 1600);
+};
+
+const copy = async (btn, text) => {
+  try {
+    await navigator.clipboard.writeText(text);
+    flash(btn, 'СКОПИРОВАНО');
+  } catch {
+    // Буфер закрыт политикой браузера — показываем текст для ручного копирования.
+    prompt('Скопируйте текст вручную:', text);
+  }
+};
+
+document.getElementById('copy-price').onclick = e => copy(e.target, priceText());
+document.getElementById('wa-price').onclick = () => open(waUrl(priceText()), '_blank', 'noopener');
+
+/* ---------- Калькулятор ---------- */
+const skuEl = document.getElementById('sku');
+const qtyEl = document.getElementById('qty');
+skuEl.innerHTML = PRODUCTS.map(p => `<option value="${p.sku}">${p.name} · ${p.volume}</option>`).join('');
+
+let offerText = '';
+function recalc() {
+  const p = PRODUCTS.find(x => x.sku === skuEl.value) ?? PRODUCTS[0];
+  const qty = Math.max(1, Math.min(999, Number(qtyEl.value) || 1));
+  const tier = tierFor(qty);
+  const gross = p.price * qty;
+  const total = gross * (1 - tier.discount);
+
+  document.getElementById('calc-out').innerHTML = `<table class="data">
+    <tr><td>Цена за штуку</td><td class="num">${money(p.price)}</td></tr>
+    <tr><td>Уровень</td><td class="num">${tier.label} · −${Math.round(tier.discount * 100)}%</td></tr>
+    <tr><td>Без скидки</td><td class="num">${money(gross)}</td></tr>
+    <tr><td>Экономия</td><td class="num good">${money(gross - total)}</td></tr>
+    <tr><td>Цена за штуку в сделке</td><td class="num">${money(total / qty)}</td></tr>
+    <tr><td>Хватит остатка</td><td class="num ${qty > p.stock ? 'bad' : 'good'}">${qty > p.stock ? 'нет, на складе ' + p.stock : 'да'}</td></tr>
+  </table>`;
+  document.getElementById('sum').textContent = money(total);
+
+  offerText = [
+    `${BRAND.name}: расчёт для вас`,
+    `${p.name} (${p.volume}) — ${qty} шт`,
+    `Цена ${money(total / qty)} за штуку (${tier.label}, −${Math.round(tier.discount * 100)}%)`,
+    `Итого ${money(total)}`,
+    `Держится ${p.lasts}. ${p.use}.`,
+    'Доставка по Алматы в день заказа. Резерв держу до конца дня.',
+  ].join('\n');
+}
+skuEl.onchange = qtyEl.oninput = recalc;
+recalc();
+document.getElementById('wa-offer').onclick = () => open(waUrl(offerText), '_blank', 'noopener');
+
+/* ---------- Скрипты ---------- */
+document.getElementById('scripts').innerHTML = SCRIPTS.map(s => `
+  <div class="script">
+    <h3>${s.title}</h3>
+    <p>${s.text}</p>
+    <div class="row">
+      <button class="btn ghost small" data-copy="${s.id}">СКОПИРОВАТЬ</button>
+      <button class="btn small" data-wa="${s.id}">ОТКРЫТЬ В WHATSAPP</button>
+    </div>
+  </div>`).join('');
+
+document.getElementById('scripts').addEventListener('click', e => {
+  const btn = e.target;
+  const id = btn.dataset.copy ?? btn.dataset.wa;
+  if (!id) return;
+  const s = SCRIPTS.find(x => x.id === id);
+  if (btn.dataset.copy) copy(btn, s.text);
+  else open(waUrl(s.text), '_blank', 'noopener');
+});
+
+document.getElementById('objections').innerHTML = OBJECTIONS
+  .map(o => `<details><summary>«${o.q}»</summary><p>${o.a}</p></details>`).join('');
+
+mountFooter(`позиций: ${PRODUCTS.length} · скриптов: ${SCRIPTS.length} · возражений: ${OBJECTIONS.length} · номер WhatsApp правится в shared/data.js`);
+</script>
+</body>
+</html>

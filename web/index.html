@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HOUSE ECOSYSTEM // ГЕНЕРАЛЬНЫЙ ХАБ</title>
+<link rel="stylesheet" href="shared/theme.css">
+<style>
+  body { background: radial-gradient(circle at 50% -10%, #052a26 0%, var(--bg) 60%); min-height: 100vh; }
+  header.top { padding: 56px 22px 30px; text-align: center; }
+  header.top h1 { color: var(--neon); letter-spacing: 10px; }
+  header.top .sub { color: var(--dim); font-family: var(--mono); letter-spacing: 2px; }
+  .tiles { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  a.tile { display: block; color: inherit; text-decoration: none; transition: border-color .15s, transform .15s; }
+  a.tile:hover { text-decoration: none; transform: translateY(-2px); border-color: var(--neon); }
+  a.tile .name { color: var(--neon); font-family: var(--mono); letter-spacing: 2px; }
+  a.tile .desc { color: var(--dim); font-size: 14px; margin-top: 6px; }
+  .hero-house { display: flex; flex-wrap: wrap; align-items: center; gap: 20px; justify-content: space-between; margin-bottom: 22px; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <h1>HOUSE ECOSYSTEM</h1>
+  <div class="sub">ГЕНЕРАЛЬНЫЙ ХАБ // ВСЕ МОДУЛИ БИЗНЕСА В ОДНОМ КОНТУРЕ</div>
+</header>
+
+<main class="wrap">
+  <div class="card hero-house">
+    <div>
+      <h2 style="margin:0">MANAGEMENT HOUSE // HQ-01</h2>
+      <div class="dim">3D-штаб: комнаты — отделы, вход в модуль прямо из комнаты</div>
+    </div>
+    <a class="btn" href="house/">ВОЙТИ В ДОМ</a>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+</main>
+
+<script type="module">
+import { MODULES } from './shared/modules.js';
+import { mountFooter } from './shared/nav.js';
+
+const tiles = document.getElementById('tiles');
+for (const m of MODULES) {
+  const a = document.createElement('a');
+  a.className = 'tile card';
+  a.href = m.path;
+  a.innerHTML = `<div class="name">${m.name}</div>
+    <div style="font-weight:600;margin-top:8px">${m.short}</div>
+    <div class="desc">${m.desc}</div>`;
+  tiles.append(a);
+}
+mountFooter(`модулей: ${MODULES.length} · статический веб-стек, данные в shared/data.js`);
+</script>
+</body>
+</html>

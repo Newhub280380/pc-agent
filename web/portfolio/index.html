@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZISHEL PHALLO // PORTFOLIO</title>
+<link rel="stylesheet" href="../shared/theme.css">
+<style>
+  .hero { position: relative; min-height: 78vh; display: flex; flex-direction: column;
+          align-items: center; justify-content: center; text-align: center; overflow: hidden;
+          border-bottom: 1px solid var(--line); }
+  .hero canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .hero .inner { position: relative; z-index: 2; padding: 30px 20px; }
+  .hero h1 { font-size: clamp(34px, 8vw, 78px); letter-spacing: 14px; color: #fff;
+             text-shadow: 0 0 32px rgba(0,255,204,.45); margin-bottom: 14px; }
+  .hero .claim { font-family: var(--mono); letter-spacing: 6px; color: var(--neon); }
+  .hero .legal { color: var(--dim); margin-top: 8px; letter-spacing: 2px; font-size: 13px; }
+  .hero .acts { display: flex; gap: 12px; justify-content: center; margin-top: 26px; flex-wrap: wrap; }
+
+  section.block { padding: 56px 0; border-bottom: 1px solid var(--line); }
+  section.block:last-of-type { border-bottom: 0; }
+  .lead { max-width: 720px; color: #cfe0df; font-size: 17px; }
+  .line { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+  .item { border: 1px solid var(--line); border-radius: 8px; padding: 18px; background: var(--bg-2); }
+  .item .bar { height: 3px; border-radius: 2px; margin-bottom: 14px; }
+  .item h3 { letter-spacing: 2px; }
+  .item dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 12px 0 0; font-size: 14px; }
+  .item dt { color: var(--dim); }
+  .item dd { margin: 0; text-align: right; }
+  .cases { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .case { border-left: 3px solid var(--neon); padding: 4px 0 4px 16px; }
+  .case .num { font-size: 30px; color: var(--neon); font-weight: 600; }
+  .terms { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .contacts { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <canvas id="bg"></canvas>
+  <div class="inner">
+    <h1 id="brand">ZISHEL PHALLO</h1>
+    <div class="claim" id="claim">ПРЕМИАЛЬНЫЕ ФИЛЛЕРЫ РК</div>
+    <div class="legal" id="legal"></div>
+    <div class="acts">
+      <a class="btn" href="../zishel/">ПОЛУЧИТЬ ПРАЙС</a>
+      <a class="btn ghost" href="../showcase/">3D-ВИТРИНА</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="block">
+    <h2>О БРЕНДЕ</h2>
+    <p class="lead">Zishel Phallo — линейка гиалуроновых филлеров для контурной пластики и
+      биоревитализации. Мы работаем с кабинетами и клиниками Казахстана напрямую: официальная
+      поставка, партия с проверяемым номером, склад в Алматы и отгрузка в день заказа.
+      Косметолог получает предсказуемый продукт, а не лотерею с серым импортом.</p>
+  </section>
+
+  <section class="block">
+    <h2>ЛИНЕЙКА</h2>
+    <div class="line" id="line"></div>
+  </section>
+
+  <section class="block">
+    <h2>ЦИФРЫ</h2>
+    <div class="cases" id="cases"></div>
+  </section>
+
+  <section class="block">
+    <h2>ПАРТНЁРАМ</h2>
+    <div class="terms" id="terms"></div>
+  </section>
+
+  <section class="block">
+    <h2>КОНТАКТЫ</h2>
+    <div class="contacts">
+      <a class="btn" id="wa" href="#">НАПИСАТЬ В WHATSAPP</a>
+      <span class="tag" id="inst"></span>
+      <span class="tag" id="city"></span>
+    </div>
+  </section>
+</main>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { BRAND, PRODUCTS, PRICE_TIERS, STATS, money, waUrl } from '../shared/data.js';
+import { mountNav, mountFooter } from '../shared/nav.js';
+
+mountNav('portfolio');
+
+document.getElementById('brand').textContent = BRAND.name;
+document.getElementById('claim').textContent = BRAND.claim;
+document.getElementById('legal').textContent = BRAND.legal.toUpperCase() + ' · ' + BRAND.city.toUpperCase();
+document.getElementById('inst').textContent = '@' + BRAND.instagram;
+document.getElementById('city').textContent = BRAND.city + ' · склад и самовывоз';
+document.getElementById('wa').href = waUrl(`Здравствуйте! Интересует линейка ${BRAND.name}. Пришлите прайс и наличие.`);
+
+document.getElementById('line').innerHTML = PRODUCTS.map(p => `
+  <div class="item">
+    <div class="bar" style="background:${p.tint}"></div>
+    <h3 style="color:${p.tint}">${p.name}</h3>
+    <div class="dim">${p.use}</div>
+    <dl>
+      <dt>Объём</dt><dd>${p.volume}</dd>
+      <dt>Плотность</dt><dd>${p.density}</dd>
+      <dt>Держится</dt><dd>${p.lasts}</dd>
+      <dt>Цена</dt><dd><b>${money(p.price)}</b></dd>
+    </dl>
+  </div>`).join('');
+
+const rev = STATS.revenue;
+document.getElementById('cases').innerHTML = [
+  [Math.round(rev.at(-1).in / rev[0].in * 100 - 100) + '%', 'рост оборота за полгода'],
+  [STATS.funnel.at(-1).v, 'оплат в прошлом месяце'],
+  [PRODUCTS.reduce((s, p) => s + p.stock, 0) + ' шт', 'на складе в Алматы прямо сейчас'],
+  ['1–2 дня', 'доставка в любой город РК'],
+].map(([n, t]) => `<div class="case"><div class="num">${n}</div><div class="dim">${t}</div></div>`).join('');
+
+document.getElementById('terms').innerHTML = [
+  ['ЦЕНА ОТ ОБЪЁМА', PRICE_TIERS.filter(t => t.discount).map(t => `от ${t.from} шт −${Math.round(t.discount * 100)}%`).join(', ')],
+  ['ОПЛАТА', 'Kaspi перевод или счёт на организацию, отсрочка для постоянных клиник'],
+  ['ДОКУМЕНТЫ', 'декларация, фото партии с номером, накладная'],
+  ['ПОДДЕРЖКА', 'подбор протокола под зону и разбор сложных случаев'],
+].map(([h, t]) => `<div class="item"><h3>${h}</h3><div class="dim">${t}</div></div>`).join('');
+
+/* ---------- Фон hero: неоновая сетка частиц. Лёгкая сцена без моделей,
+   поэтому страница остаётся быстрой даже на слабой машине. ---------- */
+const cv = document.getElementById('bg');
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, 2, 0.1, 100);
+camera.position.set(0, 0.6, 6);
+const renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+
+const N = 900;
+const pos = new Float32Array(N * 3);
+for (let i = 0; i < N; i++) {
+  pos[i * 3] = (Math.random() - 0.5) * 22;
+  pos[i * 3 + 1] = (Math.random() - 0.5) * 9;
+  pos[i * 3 + 2] = (Math.random() - 0.5) * 12;
+}
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+const dust = new THREE.Points(geo, new THREE.PointsMaterial({
+  color: new THREE.Color(BRAND.palette.neon), size: 0.045, transparent: true, opacity: 0.85 }));
+scene.add(dust);
+
+const ring = new THREE.Mesh(
+  new THREE.TorusGeometry(3.4, 0.012, 8, 220),
+  new THREE.MeshBasicMaterial({ color: new THREE.Color(BRAND.palette.cyan), transparent: true, opacity: 0.4 }));
+ring.rotation.x = Math.PI / 2.2;
+ring.position.y = -1.8;
+scene.add(ring);
+
+function resize() {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+const clock = new THREE.Clock();
+(function loop() {
+  requestAnimationFrame(loop);
+  const t = clock.getElapsedTime();
+  dust.rotation.y = t * 0.05;
+  ring.rotation.z = t * 0.25;
+  renderer.render(scene, camera);
+})();
+
+mountFooter(`${BRAND.name} · ${BRAND.legal} · данные и цены берутся из shared/data.js`);
+</script>
+</body>
+</html>
