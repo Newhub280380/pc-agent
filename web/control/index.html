@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CONTROL CENTER // статистика</title>
+<link rel="stylesheet" href="../shared/theme.css">
+<style>
+  main { padding: 26px 0 0; }
+  .kpis { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); margin-bottom: 18px; }
+  .charts { display: grid; gap: 18px; grid-template-columns: 1.4fr 1fr; align-items: start; }
+  @media (max-width: 980px) { .charts { grid-template-columns: 1fr; } }
+  canvas { width: 100%; height: auto; display: block; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  .legend i { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 2px; }
+  .bars { display: grid; gap: 8px; }
+  .bar { display: grid; grid-template-columns: 150px 1fr 60px; gap: 10px; align-items: center; font-size: 14px; }
+  .bar .track { display: block; height: 14px; background: #0c1417; border: 1px solid var(--line);
+                border-radius: 3px; overflow: hidden; }
+  .bar .fill { display: block; height: 100%; background: linear-gradient(90deg, var(--neon), var(--cyan)); }
+  .bar .n { text-align: right; font-variant-numeric: tabular-nums; }
+  #leads { margin-top: 18px; }
+</style>
+</head>
+<body>
+
+<main class="wrap">
+  <h1 style="color:var(--neon)">CONTROL CENTER</h1>
+  <p class="dim mono" id="src">источник: shared/data.js · лиды радара подхватываются из leads.json</p>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="charts">
+    <section class="card">
+      <h2>ДЕНЬГИ ПО МЕСЯЦАМ</h2>
+      <canvas id="rev" width="900" height="380"></canvas>
+      <div class="legend">
+        <span><i style="background:#00ffcc"></i>приход</span>
+        <span><i style="background:#ff5f6d"></i>расход</span>
+        <span><i style="background:#7cf9ff"></i>прибыль</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>ВОРОНКА</h2>
+      <div class="bars" id="funnel"></div>
+      <h2 style="margin-top:22px">ТОП ПОЗИЦИЙ</h2>
+      <div class="bars" id="top"></div>
+    </section>
+  </div>
+
+  <section class="card" id="leads">
+    <h2>ЛИДЫ РАДАРА</h2>
+    <div id="leads-body" class="dim">файл leads.json не найден рядом со страницей — запустите
+      <span class="mono">pcagent --radar radar.json --out web/control/leads.json</span></div>
+  </section>
+
+  <section class="card" style="margin:18px 0 20px">
+    <h2>ФИНАНСЫ И КОМАНДА</h2>
+    <table class="data" id="fin"></table>
+  </section>
+</main>
+
+<script type="module">
+import { STATS, PRODUCTS, money } from '../shared/data.js';
+import { mountNav, mountFooter } from '../shared/nav.js';
+
+mountNav('control');
+
+const R = STATS.revenue, last = R.at(-1), first = R[0];
+const profit = m => m.in - m.out;
+
+const kpis = [
+  ['Приход за месяц', money(last.in)],
+  ['Чистая прибыль', money(profit(last))],
+  ['Рост к ' + first.m, Math.round(last.in / first.in * 100 - 100) + '%'],
+  ['Оплат за месяц', STATS.funnel.at(-1).v],
+  ['CPL', money(STATS.ads.cpl)],
+  ['Остатки на складе', money(PRODUCTS.reduce((s, p) => s + p.stock * p.price, 0))],
+];
+document.getElementById('kpis').innerHTML = kpis
+  .map(([lbl, val]) => `<div class="card kpi"><span class="val">${val}</span><span class="lbl">${lbl}</span></div>`)
+  .join('');
+
+/* ---------- График денег. Рисуем на canvas: библиотека графиков ради трёх
+   серий тянула бы в проект лишнюю зависимость. ---------- */
+const cv = document.getElementById('rev');
+const g = cv.getContext('2d');
+const PAD = { l: 74, r: 14, t: 16, b: 34 };
+const max = Math.max(...R.map(m => m.in)) * 1.12;
+const W = cv.width, H = cv.height;
+const px = i => PAD.l + (W - PAD.l - PAD.r) * (i + 0.5) / R.length;
+const py = v => H - PAD.b - (H - PAD.t - PAD.b) * (v / max);
+
+g.font = '13px ui-monospace, monospace';
+g.strokeStyle = '#16242a';
+g.fillStyle = '#74898c';
+for (let i = 0; i <= 4; i++) {
+  const v = max * i / 4, y = py(v);
+  g.beginPath(); g.moveTo(PAD.l, y); g.lineTo(W - PAD.r, y); g.stroke();
+  g.fillText((v / 1e6).toFixed(1) + ' млн', 8, y + 4);
+}
+
+const bw = (W - PAD.l - PAD.r) / R.length * 0.26;
+R.forEach((m, i) => {
+  g.fillStyle = '#00ffcc';
+  g.fillRect(px(i) - bw - 2, py(m.in), bw, H - PAD.b - py(m.in));
+  g.fillStyle = '#ff5f6d';
+  g.fillRect(px(i) + 2, py(m.out), bw, H - PAD.b - py(m.out));
+  g.fillStyle = '#74898c';
+  g.textAlign = 'center';
+  g.fillText(m.m, px(i), H - 12);
+  g.textAlign = 'left';
+});
+
+g.strokeStyle = '#7cf9ff';
+g.lineWidth = 2;
+g.beginPath();
+R.forEach((m, i) => i ? g.lineTo(px(i), py(profit(m))) : g.moveTo(px(i), py(profit(m))));
+g.stroke();
+g.fillStyle = '#7cf9ff';
+R.forEach((m, i) => { g.beginPath(); g.arc(px(i), py(profit(m)), 3.5, 0, 7); g.fill(); });
+
+/* ---------- Полосы ---------- */
+const bars = (el, items) => {
+  const top = Math.max(...items.map(i => i.v));
+  el.innerHTML = items.map(i => `<div class="bar">
+      <span>${i.label}</span>
+      <span class="track"><span class="fill" style="width:${(i.v / top * 100).toFixed(1)}%"></span></span>
+      <span class="n">${i.v}</span></div>`).join('');
+};
+bars(document.getElementById('funnel'), STATS.funnel.map(f => ({ label: f.step, v: f.v })));
+bars(document.getElementById('top'), STATS.top.map(t => ({
+  label: PRODUCTS.find(p => p.sku === t.sku)?.name ?? t.sku, v: t.qty })));
+
+document.getElementById('fin').innerHTML = `
+  <tr><th>Показатель</th><th class="num">Значение</th></tr>
+  <tr><td>Свободные деньги</td><td class="num">${money(STATS.finance.cash)}</td></tr>
+  <tr><td>Дебиторка</td><td class="num bad">${money(STATS.finance.receivable)}</td></tr>
+  <tr><td>Налоги к сроку</td><td class="num">${STATS.finance.tax_due}</td></tr>
+  <tr><td>Рекламный бюджет</td><td class="num">${money(STATS.ads.budget)}</td></tr>
+  <tr><td>Сотрудников / на смене</td><td class="num">${STATS.team.people} / ${STATS.team.on_shift}</td></tr>
+  <tr><td>Задач в работе / просрочено</td><td class="num">${STATS.team.tasks} / <span class="bad">${STATS.team.overdue}</span></td></tr>`;
+
+/* ---------- Лиды радара ---------- */
+fetch('leads.json').then(r => r.ok ? r.json() : null).then(leads => {
+  if (!Array.isArray(leads) || !leads.length) return;
+  const hot = leads.filter(l => l.intent === 'HOT');
+  document.getElementById('leads-body').innerHTML =
+    `<p class="mono">всего: ${leads.length} · HOT: <span class="good">${hot.length}</span></p>
+     <table class="data">
+       <tr><th>Название</th><th>Телефон</th><th>Город</th><th class="num">Интент</th></tr>
+       ${leads.slice(0, 25).map(l => `<tr>
+         <td>${l.name ?? '—'}</td><td class="mono">${(l.phones ?? [l.phone]).filter(Boolean).join(', ') || '—'}</td>
+         <td>${l.city ?? '—'}</td>
+         <td class="num ${l.intent === 'HOT' ? 'good' : 'dim'}">${l.intent ?? '—'}</td></tr>`).join('')}
+     </table>`;
+  document.getElementById('src').textContent =
+    `источник: shared/data.js · лидов из радара: ${leads.length}`;
+}).catch(() => {});
+
+mountFooter('данные подменяются экспортом агента: формат STATS в shared/data.js, лиды — leads.json');
+</script>
+</body>
+</html>

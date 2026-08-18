@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D SHOWCASE v1.8 // серебряный шейдер</title>
+<link rel="stylesheet" href="../shared/theme.css">
+<style>
+  body { overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  canvas { display: block; }
+  #panel { position: fixed; left: 18px; bottom: 18px; z-index: 20; display: flex; gap: 8px; flex-wrap: wrap; }
+  #panel .btn { font-size: 13px; padding: 9px 16px; }
+  #info { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: min(320px, 46vw); }
+  #info h2 { margin-bottom: 4px; }
+  #info dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 10px 0 0; font-size: 14px; }
+  #info dt { color: var(--dim); }
+  #info dd { margin: 0; text-align: right; }
+  #hint { position: fixed; right: 18px; top: 62px; z-index: 20;
+          font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  #state { position: fixed; left: 18px; top: 62px; z-index: 20;
+           font-family: var(--mono); font-size: 12px; color: var(--neon); }
+</style>
+</head>
+<body>
+
+<div id="stage"></div>
+<div id="state">инициализация…</div>
+<div id="hint">мышь — поворот · колесо — приближение</div>
+
+<div id="panel">
+  <button class="btn" id="next">СЛЕДУЮЩАЯ ПОЗИЦИЯ</button>
+  <button class="btn ghost" id="spin">ВРАЩЕНИЕ: ВКЛ</button>
+  <button class="btn ghost" id="finish">МЕТАЛЛ: ПОЛИРОВКА</button>
+  <button class="btn ghost" id="shot">КАДР PNG</button>
+</div>
+
+<div class="card" id="info">
+  <h2 id="i-name">—</h2>
+  <div class="dim" id="i-use"></div>
+  <dl>
+    <dt>Артикул</dt><dd class="mono" id="i-sku"></dd>
+    <dt>Объём</dt><dd id="i-vol"></dd>
+    <dt>Плотность</dt><dd id="i-den"></dd>
+    <dt>Держится</dt><dd id="i-last"></dd>
+    <dt>Цена</dt><dd id="i-price"></dd>
+  </dl>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { PRODUCTS, money } from '../shared/data.js';
+import { mountNav } from '../shared/nav.js';
+
+mountNav('showcase');
+
+const stateEl = document.getElementById('state');
+const stage = document.getElementById('stage');
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x04070a);
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(4.2, 3.2, 10.5);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+stage.append(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.9, 0);
+controls.enableDamping = true;
+controls.minDistance = 6;
+controls.maxDistance = 22;
+controls.maxPolarAngle = Math.PI / 1.95;
+
+/* Серебро без карты окружения выглядит как серый пластик, поэтому берём
+   готовую студийную комнату и запекаем её в PMREM — отражения появляются
+   без загрузки внешних HDRI-файлов. */
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.06).texture;
+
+const silver = new THREE.MeshPhysicalMaterial({
+  color: 0xdfe7ea, metalness: 1, roughness: 0.08,
+  envMapIntensity: 1.35, clearcoat: 0.6, clearcoatRoughness: 0.12,
+});
+const silverDark = new THREE.MeshPhysicalMaterial({
+  color: 0x9aa7ad, metalness: 1, roughness: 0.22, envMapIntensity: 1.1,
+});
+const gel = new THREE.MeshStandardMaterial({
+  color: PRODUCTS[0].tint, emissive: PRODUCTS[0].tint, emissiveIntensity: 0.55, roughness: 0.3,
+});
+
+/* ---------- Модель позиции: шприц-флакон из примитивов, без внешних файлов ---------- */
+const product = new THREE.Group();
+const rings = [];
+{
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.62, 3.1, 64, 1, true), silver);
+  body.position.y = 2.05;
+
+  const core = new THREE.Mesh(new THREE.CylinderGeometry(0.48, 0.48, 2.86, 48), gel);
+  core.position.y = 2.05;
+
+  const shoulder = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.62, 0.7, 64), silver);
+  shoulder.position.y = 3.9;
+
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 0.5, 48), silverDark);
+  neck.position.y = 4.45;
+
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.9, 48), silver);
+  cap.position.y = 5.05;
+
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.72, 0.78, 0.28, 64), silverDark);
+  base.position.y = 0.4;
+
+  const plunger = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 1.1, 24), silverDark);
+  plunger.position.y = -0.2;
+
+  // Гравировка: три тонких кольца, они же ловят неон и дают ощущение металла.
+  for (let i = 0; i < 3; i++) {
+    const r = new THREE.Mesh(new THREE.TorusGeometry(0.63, 0.02, 8, 96), silver);
+    r.rotation.x = Math.PI / 2;
+    r.position.y = 1.1 + i * 0.38;
+    rings.push(r);
+  }
+  product.add(body, core, shoulder, neck, cap, base, plunger, ...rings);
+}
+product.position.y = 0.1;
+scene.add(product);
+
+// Подиум: диск и концентрические неоновые круги.
+const podium = new THREE.Mesh(
+  new THREE.CylinderGeometry(3.4, 3.6, 0.25, 96),
+  new THREE.MeshPhysicalMaterial({ color: 0x0b1116, metalness: 0.9, roughness: 0.25, envMapIntensity: 0.8 }));
+podium.position.y = -0.05;
+scene.add(podium);
+
+const halo = [];
+for (let i = 0; i < 3; i++) {
+  const c = new THREE.Mesh(new THREE.TorusGeometry(2.1 + i * 0.55, 0.012, 8, 200),
+    new THREE.MeshBasicMaterial({ color: PRODUCTS[0].tint, transparent: true, opacity: 0.75 }));
+  c.rotation.x = Math.PI / 2;
+  c.position.y = 0.1;
+  halo.push(c);
+  scene.add(c);
+}
+
+const keyLight = new THREE.SpotLight(0xffffff, 320, 30, 0.5, 0.6, 2);
+keyLight.position.set(5, 11, 6);
+const rimLight = new THREE.PointLight(PRODUCTS[0].tint, 90, 24, 2);
+rimLight.position.set(-4.5, 3.2, -3.5);
+const fill = new THREE.PointLight(0x7cf9ff, 45, 26, 2);
+fill.position.set(4.5, 1.6, 4.5);
+scene.add(keyLight, rimLight, fill, new THREE.HemisphereLight(0x24333c, 0x05070a, 0.7));
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.55, 0.75, 0.62);
+composer.addPass(bloom);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+/* ---------- Переключение позиций ---------- */
+let idx = 0;
+function show(i) {
+  idx = (i + PRODUCTS.length) % PRODUCTS.length;
+  const p = PRODUCTS[idx];
+  gel.color.set(p.tint);
+  gel.emissive.set(p.tint);
+  rimLight.color.set(p.tint);
+  halo.forEach(h => h.material.color.set(p.tint));
+
+  document.getElementById('i-name').textContent = p.name;
+  document.getElementById('i-name').style.color = p.tint;
+  document.getElementById('i-use').textContent = p.use;
+  document.getElementById('i-sku').textContent = p.sku;
+  document.getElementById('i-vol').textContent = p.volume;
+  document.getElementById('i-den').textContent = p.density;
+  document.getElementById('i-last').textContent = p.lasts;
+  document.getElementById('i-price').textContent = money(p.price);
+  stateEl.textContent = `позиция ${idx + 1}/${PRODUCTS.length} · ${p.sku}`;
+}
+show(0);
+document.getElementById('next').onclick = () => show(idx + 1);
+
+let spin = true;
+document.getElementById('spin').onclick = e => {
+  spin = !spin;
+  e.target.textContent = `ВРАЩЕНИЕ: ${spin ? 'ВКЛ' : 'ВЫКЛ'}`;
+};
+
+// Полировка ↔ матовый металл: один параметр шейдера, но продукт читается иначе.
+let polished = true;
+document.getElementById('finish').onclick = e => {
+  polished = !polished;
+  silver.roughness = polished ? 0.08 : 0.34;
+  silver.clearcoat = polished ? 0.6 : 0.1;
+  silverDark.roughness = polished ? 0.22 : 0.5;
+  e.target.textContent = `МЕТАЛЛ: ${polished ? 'ПОЛИРОВКА' : 'МАТ'}`;
+};
+
+document.getElementById('shot').onclick = () => {
+  // Рендерим прямо перед снимком: иначе буфер уже очищен и PNG выходит пустым.
+  composer.render();
+  renderer.domElement.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = `${PRODUCTS[idx].sku.toLowerCase()}_showcase.png`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, 'image/png');
+  stateEl.textContent = 'кадр сохранён';
+};
+
+const clock = new THREE.Clock();
+(function loop() {
+  requestAnimationFrame(loop);
+  const dt = clock.getDelta(), t = clock.getElapsedTime();
+  if (spin) product.rotation.y += dt * 0.5;
+  halo.forEach((h, i) => { h.rotation.z = t * (0.2 + i * 0.12); });
+  controls.update();
+  composer.render();
+})();
+</script>
+</body>
+</html>

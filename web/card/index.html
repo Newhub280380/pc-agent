@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BUSINESS CARD // визитка и профиль</title>
+<link rel="stylesheet" href="../shared/theme.css">
+<style>
+  .cols { display: grid; gap: 18px; grid-template-columns: minmax(280px, 380px) 1fr; align-items: start; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+
+  /* Визитка: тот же неон-циан, что и в доме, но на стекле. */
+  .vcard { position: relative; overflow: hidden; border-radius: 12px; padding: 24px;
+           background: linear-gradient(160deg, rgba(0,255,204,.09), rgba(0,255,255,.03) 60%, transparent);
+           border: 1px solid rgba(0,255,204,.35); box-shadow: 0 0 30px rgba(0,255,204,.12) inset; }
+  .vcard::after { content: ''; position: absolute; inset: -40% -10% auto auto; width: 260px; height: 260px;
+                  border-radius: 50%; background: radial-gradient(circle, rgba(0,255,204,.18), transparent 65%); }
+  .vcard h2 { margin: 0; font-size: 26px; letter-spacing: 5px; color: var(--neon); }
+  .vcard .claim { color: var(--dim); letter-spacing: 3px; font-size: 12px; margin: 4px 0 18px; }
+  .vcard dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 0 0 18px; font-size: 13px; }
+  .vcard dt { color: var(--dim); } .vcard dd { margin: 0; text-align: right; }
+  .links { display: grid; gap: 8px; }
+  .links a { display: flex; justify-content: space-between; gap: 10px; text-decoration: none;
+             color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 11px 14px;
+             font-size: 13px; letter-spacing: 1px; transition: .2s; }
+  .links a:hover { border-color: var(--neon); box-shadow: 0 0 18px rgba(0,255,204,.18); color: var(--neon); }
+  .links a span:last-child { color: var(--dim); font-family: var(--mono); font-size: 11px; }
+
+  /* Макет профиля Instagram: как будет выглядеть шапка и сетка постов. */
+  .ig { border: 1px solid var(--line); border-radius: 12px; padding: 18px; background: #070c0e; }
+  .ig-head { display: flex; gap: 18px; align-items: center; }
+  .ig-head canvas { width: 92px; height: 92px; border-radius: 50%; border: 2px solid var(--neon); }
+  .ig-nums { display: flex; gap: 20px; font-size: 13px; }
+  .ig-nums b { display: block; font-size: 17px; }
+  .ig-bio { white-space: pre-wrap; font-size: 13px; margin: 14px 0 0; color: var(--text); }
+  .ig-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; margin-top: 16px;
+             max-width: 420px; }
+  .ig-grid div { aspect-ratio: 1; display: grid; place-items: center; font: 10px/1.4 var(--mono);
+                 text-align: center; padding: 6px; letter-spacing: 1px; background: #0a1114;
+                 border: 1px solid var(--line); }
+  .ig-grid b { display: block; font-size: 12px; letter-spacing: 2px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  textarea { width: 100%; min-height: 96px; resize: vertical; background: #05090b; color: var(--text);
+             border: 1px solid var(--line); border-radius: 6px; padding: 10px; font: inherit; }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <h1>BUSINESS CARD</h1>
+  <p class="dim">цифровая визитка, аватар и шапка профиля Instagram, ссылки для bio — всё из общих данных бренда</p>
+
+  <div class="cols">
+    <section class="vcard">
+      <h2 id="b-name">—</h2>
+      <div class="claim" id="b-claim">—</div>
+      <dl>
+        <dt>Статус</dt><dd id="b-legal">—</dd>
+        <dt>Город</dt><dd id="b-city">—</dd>
+        <dt>Instagram</dt><dd id="b-ig">—</dd>
+        <dt>Линейка</dt><dd id="b-line">—</dd>
+        <dt>Цена от</dt><dd id="b-from">—</dd>
+      </dl>
+      <div class="links" id="links"></div>
+    </section>
+
+    <section class="ig">
+      <div class="ig-head">
+        <canvas id="ava" width="640" height="640"></canvas>
+        <div>
+          <div style="letter-spacing:2px" id="ig-handle">—</div>
+          <div class="ig-nums">
+            <div><b id="ig-posts">—</b>постов</div>
+            <div><b>4</b>позиции</div>
+            <div><b id="ig-city">—</b>склад</div>
+          </div>
+        </div>
+      </div>
+      <p class="ig-bio" id="bio-preview">—</p>
+      <div class="ig-grid" id="grid"></div>
+
+      <h2 style="margin-top:22px">ТЕКСТ BIO</h2>
+      <textarea id="bio"></textarea>
+      <div class="row">
+        <button class="btn" id="copy-bio">BIO В БУФЕР</button>
+        <button class="btn" id="png">АВАТАР PNG 640×640</button>
+        <a class="btn ghost" href="../brandkit/">СОБРАТЬ ПОСТ В BRAND KIT</a>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script type="module">
+import { BRAND, PRODUCTS, STATS, money, waUrl } from '../shared/data.js';
+import { mountNav, mountFooter } from '../shared/nav.js';
+
+mountNav('card');
+
+const minPrice = Math.min(...PRODUCTS.map(p => p.price));
+
+document.getElementById('b-name').textContent = BRAND.name;
+document.getElementById('b-claim').textContent = BRAND.claim;
+document.getElementById('b-legal').textContent = BRAND.legal;
+document.getElementById('b-city').textContent = BRAND.city;
+document.getElementById('b-ig').textContent = '@' + BRAND.instagram;
+document.getElementById('b-line').textContent = PRODUCTS.length + ' позиции';
+document.getElementById('b-from').textContent = money(minPrice);
+document.getElementById('ig-handle').textContent = '@' + BRAND.instagram;
+document.getElementById('ig-city').textContent = BRAND.city;
+document.getElementById('ig-posts').textContent = PRODUCTS.length * 3;
+
+/* Ссылки для bio: те же адреса, что и в навигации экосистемы,
+   чтобы визитка не разъезжалась с остальными модулями. */
+const LINKS = [
+  { t: 'WhatsApp — запросить прайс', s: '+' + BRAND.whatsapp,
+    href: waUrl(`Здравствуйте! Интересует прайс ${BRAND.name}.`) },
+  { t: 'Instagram', s: '@' + BRAND.instagram, href: `https://instagram.com/${BRAND.instagram}` },
+  { t: 'Заявка на прайс', s: 'лендинг', href: '../zishel/' },
+  { t: 'Прайс и условия дилера', s: 'бизнес-логика', href: '../business/' },
+  { t: '3D-витрина линейки', s: 'showcase', href: '../showcase/' },
+  { t: 'Портфолио и кейсы', s: 'portfolio', href: '../portfolio/' },
+];
+document.getElementById('links').innerHTML = LINKS
+  .map(l => `<a href="${l.href}" target="_blank" rel="noopener"><span>${l.t}</span><span>${l.s}</span></a>`)
+  .join('');
+
+/* Сетка профиля: превью контент-плана по позициям линейки. */
+const PLAN = ['ЦЕНА КЛИНИКИ', 'ДО / ПОСЛЕ', 'СЕРТИФИКАТ'];
+document.getElementById('grid').innerHTML = PRODUCTS.slice(0, 3)
+  .flatMap(p => PLAN.map(t => `<div style="color:${p.tint};background:
+     radial-gradient(circle at 50% 0%, ${p.tint}2e, #0a1114 70%)"><b>${p.name.replace('ZISHEL ', '')}</b>${t}</div>`))
+  .join('');
+
+const bio = `${BRAND.claim}
+${BRAND.legal} · ${BRAND.city}
+${PRODUCTS.length} позиции · от ${money(minPrice)} · отгрузка в день заказа
+Оптом от 10 шт — цена клиники
+Прайс в WhatsApp ⬇`;
+const bioEl = document.getElementById('bio');
+bioEl.value = bio;
+const preview = document.getElementById('bio-preview');
+const syncBio = () => { preview.textContent = bioEl.value; };
+bioEl.addEventListener('input', syncBio);
+syncBio();
+
+document.getElementById('copy-bio').onclick = async () => {
+  await navigator.clipboard.writeText(bioEl.value);
+  const b = document.getElementById('copy-bio');
+  b.textContent = 'СКОПИРОВАНО';
+  setTimeout(() => (b.textContent = 'BIO В БУФЕР'), 1400);
+};
+
+/* Аватар рисуем на canvas: монограмма и неоновое кольцо, экспорт в PNG
+   под требования Instagram (квадрат, обрезается в круг). */
+const ava = document.getElementById('ava');
+const g = ava.getContext('2d');
+function drawAvatar() {
+  const S = ava.width, c = S / 2;
+  g.fillStyle = BRAND.palette.ink;
+  g.fillRect(0, 0, S, S);
+  const glow = g.createRadialGradient(c, c * 0.85, 10, c, c, c);
+  glow.addColorStop(0, 'rgba(0,255,204,.35)');
+  glow.addColorStop(1, 'rgba(0,255,204,0)');
+  g.fillStyle = glow;
+  g.fillRect(0, 0, S, S);
+
+  g.strokeStyle = BRAND.palette.neon;
+  g.lineWidth = 10;
+  for (const r of [c - 24, c - 70]) {
+    g.globalAlpha = r === c - 24 ? 1 : 0.35;
+    g.beginPath(); g.arc(c, c, r, 0, Math.PI * 2); g.stroke();
+  }
+  g.globalAlpha = 1;
+
+  g.fillStyle = BRAND.palette.neon;
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = 'bold 250px "Segoe UI", sans-serif';
+  g.fillText('ZP', c, c - 20);
+  g.fillStyle = BRAND.palette.silver;
+  g.font = '600 46px "Cascadia Mono", monospace';
+  g.fillText(BRAND.city.toUpperCase(), c, c + 150);
+}
+drawAvatar();
+
+document.getElementById('png').onclick = () => {
+  ava.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = 'zishel_avatar_640.png';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, 'image/png');
+};
+
+mountFooter(`лидов в месяц по воронке: ${STATS.funnel[0].v} — визитка стоит первой в этой цепочке`);
+</script>
+</body>
+</html>

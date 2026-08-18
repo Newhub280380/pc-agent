@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZISHEL PHALLO — премиальные филлеры в Казахстане</title>
+<meta name="description" content="Zishel Phallo — премиальные филлеры для клиник и косметологов Казахстана. Прайс, сертификаты, доставка по РК из Алматы.">
+<link rel="stylesheet" href="../shared/theme.css">
+<style>
+  :root { --gold: #c5a059; --ink: #0d0d0d; --paper: #f5f5f5; --dim: #a2a2a2; }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--ink); color: var(--paper);
+         font: 16px/1.7 Arial, Helvetica, sans-serif; }
+  a { color: inherit; }
+  .wrap { width: min(1120px, 92vw); margin: 0 auto; }
+  h1, h2, h3 { font-weight: 700; letter-spacing: 3px; margin: 0; }
+  h2 { font-size: clamp(22px, 3vw, 32px); color: var(--gold); margin-bottom: 8px; }
+  .lead { color: var(--dim); max-width: 62ch; }
+  section { padding: 72px 0; border-top: 1px solid #1d1d1d; }
+
+  header { min-height: 88vh; display: flex; flex-direction: column; justify-content: center;
+           align-items: center; text-align: center; gap: 22px; padding: 40px 20px;
+           background: linear-gradient(rgba(0,0,0,.82), rgba(0,0,0,.92)),
+                       url('https://images.unsplash.com/photo-1512290923902-8a9f81dc236c?w=1600&q=70') center/cover,
+                       #0d0d0d; }
+  header h1 { font-size: clamp(34px, 8vw, 62px); color: var(--gold); letter-spacing: 8px; }
+  header p.claim { letter-spacing: 6px; color: var(--paper); margin: 0; }
+  .cta { display: inline-block; border: 2px solid var(--gold); padding: 14px 34px; color: var(--gold);
+         text-decoration: none; font-weight: bold; letter-spacing: 2px; transition: .2s; }
+  .cta:hover { background: var(--gold); color: var(--ink); }
+  .cta.solid { background: var(--gold); color: var(--ink); }
+  .badges { display: flex; flex-wrap: wrap; gap: 10px 26px; justify-content: center;
+            color: var(--dim); font-size: 14px; letter-spacing: 1px; }
+
+  .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); margin-top: 26px; }
+  .card { background: #131313; border: 1px solid #232323; border-top: 3px solid var(--gold);
+          padding: 22px; }
+  .card h3 { color: var(--gold); font-size: 17px; letter-spacing: 2px; margin-bottom: 8px; }
+  .card p { color: var(--dim); margin: 0; font-size: 15px; }
+  .price { font-size: 15px; color: var(--paper); margin-top: 14px; letter-spacing: 1px; }
+
+  table.spec { width: 100%; border-collapse: collapse; margin-top: 22px; }
+  table.spec td { padding: 12px 0; border-bottom: 1px solid #1d1d1d; }
+  table.spec td:last-child { text-align: right; color: var(--dim); }
+
+  form { display: grid; gap: 14px; max-width: 520px; margin-top: 24px; }
+  label { font-size: 13px; letter-spacing: 2px; color: var(--dim); }
+  input, select, textarea { width: 100%; padding: 13px 14px; background: #101010; color: var(--paper);
+         border: 1px solid #2a2a2a; font: inherit; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--gold); }
+  button { font: inherit; font-weight: bold; letter-spacing: 2px; cursor: pointer;
+           border: 0; padding: 15px; background: var(--gold); color: var(--ink); }
+  .agree { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; color: var(--dim); }
+  .agree input { width: auto; }
+  .err { color: #ff6b6b; font-size: 13px; min-height: 18px; }
+  .ok { display: none; border: 1px solid var(--gold); padding: 18px; margin-top: 20px; }
+
+  footer { padding: 40px 0 60px; color: #6d6d6d; font-size: 13px; }
+  .fine { color: #6d6d6d; font-size: 12px; margin-top: 26px; }
+  .float { position: fixed; right: 18px; bottom: 18px; z-index: 5; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ZISHEL PHALLO</h1>
+  <p class="claim">ПРЕМИАЛЬНЫЕ ФИЛЛЕРЫ РК</p>
+  <p class="lead">Оригинальная линейка для клиник и практикующих косметологов. Склад в Алматы,
+     доставка по Казахстану 1–3 дня, документы на каждую партию.</p>
+  <a href="#price" class="cta">ПОЛУЧИТЬ ПРАЙС</a>
+  <div class="badges">
+    <span>СКЛАД В АЛМАТЫ</span><span>ДОСТАВКА 1–3 ДНЯ</span>
+    <span>ДОКУМЕНТЫ НА ПАРТИЮ</span><span>ОПТ И РОЗНИЦА</span>
+  </div>
+</header>
+
+<section id="line">
+  <div class="wrap">
+    <h2>ЛИНЕЙКА</h2>
+    <p class="lead">Три плотности под разные зоны. Прайс отправляем в ответ на заявку —
+       цена зависит от объёма партии.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>ZISHEL SOFT</h3>
+        <p>Мягкая когезивность для тонких зон: губы, слёзная борозда, мелкие морщины.</p>
+        <div class="price">1,0 мл · шприц + 2 канюли</div>
+      </div>
+      <div class="card">
+        <h3>ZISHEL VOLUME</h3>
+        <p>Плотный гель для объёма: скулы, подбородок, коррекция овала.</p>
+        <div class="price">1,0 мл · шприц + 2 канюли</div>
+      </div>
+      <div class="card">
+        <h3>ZISHEL ROSE GLAM</h3>
+        <p>Биоревитализант с комплексом аминокислот: тон, плотность, увлажнение.</p>
+        <div class="price">2,0 мл · курс 3 процедуры</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <h2>ПОЧЕМУ БЕРУТ У НАС</h2>
+    <table class="spec">
+      <tr><td>Оригинальность</td><td>прямые поставки, партия сверяется по коду производителя</td></tr>
+      <tr><td>Сроки годности</td><td>не меньше 18 месяцев на момент отгрузки</td></tr>
+      <tr><td>Логистика</td><td>Алматы — в день заказа, регионы РК — 1–3 дня, термоупаковка</td></tr>
+      <tr><td>Оплата</td><td>Kaspi, перевод на счёт, безнал для клиник по договору</td></tr>
+      <tr><td>Поддержка</td><td>протоколы введения и разбор случая с врачом-тренером</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="price">
+  <div class="wrap">
+    <h2>ПОЛУЧИТЬ ПРАЙС</h2>
+    <p class="lead">Заполните заявку — прайс и наличие пришлём в WhatsApp. Продукция
+       отпускается специалистам: косметологам, врачам и клиникам.</p>
+
+    <form id="lead" novalidate>
+      <div>
+        <label for="name">ИМЯ</label>
+        <input id="name" name="name" autocomplete="name" placeholder="Айгуль">
+      </div>
+      <div>
+        <label for="phone">WHATSAPP</label>
+        <input id="phone" name="phone" inputmode="tel" autocomplete="tel" placeholder="+7 701 000 00 00">
+      </div>
+      <div>
+        <label for="city">ГОРОД</label>
+        <input id="city" name="city" placeholder="Алматы">
+      </div>
+      <div>
+        <label for="role">КТО ВЫ</label>
+        <select id="role" name="role">
+          <option>Косметолог</option>
+          <option>Клиника / салон</option>
+          <option>Дистрибьютор</option>
+        </select>
+      </div>
+      <div>
+        <label for="need">ЧТО НУЖНО</label>
+        <textarea id="need" name="need" rows="3" placeholder="Soft 1 мл — 10 шт, Volume — 5 шт"></textarea>
+      </div>
+      <label class="agree">
+        <input type="checkbox" id="agree">
+        <span>Согласен(на), что со мной свяжутся в WhatsApp по этой заявке.</span>
+      </label>
+      <div class="err" id="err"></div>
+      <button type="submit">ОТПРАВИТЬ ЗАЯВКУ В WHATSAPP</button>
+    </form>
+
+    <div class="ok" id="ok">
+      Заявка собрана. Открылся WhatsApp с готовым сообщением — отправьте его,
+      и мы ответим прайсом. Если окно не открылось,
+      <a id="wa-link" href="#" target="_blank" rel="noopener">нажмите здесь</a>.
+    </div>
+
+    <p class="fine">Форма ничего не отправляет на сервер: заявка уходит в WhatsApp с вашего
+       устройства, поэтому данные никуда не утекают. Филлеры — медицинские изделия,
+       применяются только специалистом; информация на странице не является публичной офертой.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    ZISHEL PHALLO Kazakhstan · Алматы · <a href="#price">прайс по заявке</a><br>
+    Продукция для профессионального применения.
+  </div>
+</footer>
+
+<a class="cta solid float" id="wa-direct" href="#" target="_blank" rel="noopener">WHATSAPP</a>
+
+<script type="module">
+  // Номер продавца и линейка живут в общей базе экосистемы.
+  import { waUrl } from '../shared/data.js';
+  import { mountNav } from '../shared/nav.js';
+
+  mountNav('zishel');
+  document.getElementById('wa-direct').href = waUrl('Здравствуйте! Интересует прайс Zishel Phallo.');
+
+  const digits = s => (s.match(/\d/g) || []).join('');
+  // КЗ-номер: 11 цифр с 7/8 в начале либо 10 цифр без кода страны.
+  function normalizePhone(raw) {
+    const d = digits(raw);
+    if (d.length === 11 && (d[0] === '7' || d[0] === '8')) return '+7' + d.slice(1);
+    if (d.length === 10) return '+7' + d;
+    return '';
+  }
+
+  document.getElementById('lead').addEventListener('submit', e => {
+    e.preventDefault();
+    const f = e.target;
+    const err = document.getElementById('err');
+    const phone = normalizePhone(f.phone.value);
+    if (!f.name.value.trim()) return void (err.textContent = 'Укажите имя.');
+    if (!phone) return void (err.textContent = 'Проверьте номер: нужен формат +7 701 000 00 00.');
+    if (!document.getElementById('agree').checked)
+      return void (err.textContent = 'Нужно согласие на связь в WhatsApp.');
+    err.textContent = '';
+
+    const text = [
+      'Заявка с сайта Zishel Phallo',
+      `Имя: ${f.name.value.trim()}`,
+      `Телефон: ${phone}`,
+      `Город: ${f.city.value.trim() || '—'}`,
+      `Кто: ${f.role.value}`,
+      `Нужно: ${f.need.value.trim() || 'прайс и наличие'}`,
+    ].join('\n');
+
+    const url = waUrl(text);
+    document.getElementById('wa-link').href = url;
+    document.getElementById('ok').style.display = 'block';
+    window.open(url, '_blank', 'noopener');
+  });
+</script>
+</body>
+</html>

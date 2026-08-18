@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FX.atomy_ai // Series_01 — ZISHEL_ROSE_GLAM</title>
+<link rel="stylesheet" href="../shared/theme.css">
+<style>
+  :root { --cyan: #00ffff; --rose: #ff4d9d; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #000; overflow: hidden; color: var(--cyan);
+         font: 13px/1.6 monospace; }
+  canvas { display: block; }
+  #hud { position: fixed; top: 62px; left: 26px; letter-spacing: 2px; text-shadow: 0 0 12px #000; }
+  #hud b { color: var(--rose); }
+  #tools { position: fixed; bottom: 22px; left: 26px; right: 26px; display: flex;
+           flex-wrap: wrap; gap: 10px; align-items: center; }
+  button { font: inherit; letter-spacing: 2px; cursor: pointer; color: #001414;
+           background: var(--cyan); border: 0; padding: 10px 16px; border-radius: 3px; }
+  button.ghost { background: transparent; color: var(--cyan); border: 1px solid #045; }
+  button.rec { background: var(--rose); color: #200010; }
+  #tip { margin-left: auto; color: #2f7f7f; }
+  a.dl { color: var(--rose); }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  ID: ZISHEL_ROSE_GLAM | CORE: CYBER-MINIMALISM<br>
+  RENDER: <b id="fps">—</b> FPS · <span id="state">idle</span>
+</div>
+
+<div id="tools">
+  <button id="palette" class="ghost">ПАЛИТРА: ROSE</button>
+  <button id="spin" class="ghost">ВРАЩЕНИЕ: ВКЛ</button>
+  <button id="shot">КАДР PNG</button>
+  <button id="rec" class="rec">ЗАПИСЬ 8 СЕК (WEBM)</button>
+  <span id="tip">мышь — поворот, колесо — приближение</span>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { mountNav } from '../shared/nav.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+mountNav('fx');
+
+const PALETTES = [
+  { name: 'ROSE',  key: 0xff4d9d, fill: 0x00ffff },
+  { name: 'CYAN',  key: 0x00ffff, fill: 0xff4d9d },
+  { name: 'GOLD',  key: 0xffc857, fill: 0x6f7bff },
+];
+let palette = 0;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(4.6, 3.4, 11.5);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 2.1, 0);
+controls.enableDamping = true;
+controls.minDistance = 5;
+controls.maxDistance = 16;
+controls.maxPolarAngle = Math.PI / 2.05;
+
+/* ---------- Продукт: шприц-флакон, собранный из примитивов, чтобы файл
+   оставался одним HTML без внешних моделей. ---------- */
+const product = new THREE.Group();
+scene.add(product);
+
+const glass = new THREE.MeshPhysicalMaterial({
+  color: 0xffffff, metalness: 0, roughness: 0.06,
+  transmission: 0.95, thickness: 0.5, ior: 1.45, transparent: true,
+  attenuationColor: new THREE.Color(PALETTES[0].key), attenuationDistance: 2.5,
+});
+const gel = new THREE.MeshPhysicalMaterial({
+  color: PALETTES[0].key, roughness: 0.35, metalness: 0,
+  emissive: PALETTES[0].key, emissiveIntensity: 0.7,
+});
+const chrome = new THREE.MeshStandardMaterial({ color: 0xbfc6cc, metalness: 1, roughness: 0.12 });
+
+const body = new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.62, 3.2, 64, 1, true), glass);
+body.position.y = 1.9;
+const inner = new THREE.Mesh(new THREE.CylinderGeometry(0.57, 0.57, 2.3, 48), gel);
+inner.position.y = 1.55;
+const shoulder = new THREE.Mesh(new THREE.ConeGeometry(0.62, 0.7, 64, 1, true), glass);
+shoulder.position.y = 3.75;
+const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.5, 32), glass);
+neck.position.y = 4.2;
+const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.55, 48), chrome);
+cap.position.y = 4.6;
+const flange = new THREE.Mesh(new THREE.CylinderGeometry(0.78, 0.78, 0.09, 64), chrome);
+flange.position.y = 0.34;
+const plunger = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 1.1, 24), chrome);
+plunger.position.y = -0.2;
+product.add(body, inner, shoulder, neck, cap, flange, plunger);
+
+// Кольца-акценты: дают форму в темноте, где нет отражений.
+const rings = [];
+for (let i = 0; i < 3; i++) {
+  const r = new THREE.Mesh(new THREE.TorusGeometry(1.35 + i * 0.5, 0.012, 8, 128),
+    new THREE.MeshBasicMaterial({ color: PALETTES[0].key, transparent: true, opacity: 0.55 - i * 0.14 }));
+  r.rotation.x = Math.PI / 2;
+  r.position.y = 0.42;
+  rings.push(r);
+  product.add(r);
+}
+
+// Пол: тёмный лак, в котором продукт отражается пятном света.
+const floor = new THREE.Mesh(new THREE.CircleGeometry(26, 64),
+  new THREE.MeshStandardMaterial({ color: 0x05070a, roughness: 0.25, metalness: 0.8 }));
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+
+/* ---------- Свет: контровой + заполняющий, как в съёмке флакона ---------- */
+const keyLight = new THREE.PointLight(PALETTES[0].key, 130, 30, 2);
+keyLight.position.set(-3.2, 5.6, -2.6);
+const fillLight = new THREE.PointLight(PALETTES[0].fill, 22, 30, 2);
+fillLight.position.set(3.6, 2.4, 3.2);
+const rimLight = new THREE.SpotLight(0xffffff, 120, 24, 0.5, 0.6, 2);
+rimLight.position.set(0, 9, -6);
+rimLight.target = product;
+scene.add(keyLight, fillLight, rimLight, new THREE.AmbientLight(0x101820, 1.2));
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.75, 0.6, 0.35);
+composer.addPass(bloom);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+/* ---------- Управление кадром ---------- */
+let spinning = true;
+const stateEl = document.getElementById('state');
+document.getElementById('spin').onclick = e => {
+  spinning = !spinning;
+  e.target.textContent = `ВРАЩЕНИЕ: ${spinning ? 'ВКЛ' : 'ВЫКЛ'}`;
+};
+document.getElementById('palette').onclick = e => {
+  palette = (palette + 1) % PALETTES.length;
+  const p = PALETTES[palette];
+  gel.color.set(p.key); gel.emissive.set(p.key);
+  glass.attenuationColor.set(p.key);
+  keyLight.color.set(p.key); fillLight.color.set(p.fill);
+  rings.forEach(r => r.material.color.set(p.key));
+  e.target.textContent = `ПАЛИТРА: ${p.name}`;
+};
+
+function download(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+document.getElementById('shot').onclick = () => {
+  // Кадр берём сразу после рендера, иначе буфер уже очищен.
+  composer.render();
+  renderer.domElement.toBlob(b => download(b, 'zishel_rose_glam.png'), 'image/png');
+  stateEl.textContent = 'кадр сохранён';
+};
+
+const recBtn = document.getElementById('rec');
+recBtn.onclick = () => {
+  if (!window.MediaRecorder) { stateEl.textContent = 'запись не поддерживается браузером'; return; }
+  const stream = renderer.domElement.captureStream(60);
+  const type = ['video/webm;codecs=vp9', 'video/webm']
+    .find(t => MediaRecorder.isTypeSupported(t));
+  const rec = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 12e6 });
+  const chunks = [];
+  rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  rec.onstop = () => {
+    download(new Blob(chunks, { type: 'video/webm' }), 'zishel_rose_glam.webm');
+    stateEl.textContent = 'ролик сохранён';
+    recBtn.disabled = false;
+  };
+  recBtn.disabled = true;
+  stateEl.textContent = 'запись 8 сек…';
+  rec.start();
+  setTimeout(() => rec.stop(), 8000);
+};
+
+/* ---------- Кадр ---------- */
+const clock = new THREE.Clock();
+const fpsEl = document.getElementById('fps');
+let frames = 0, last = performance.now();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const t = clock.getElapsedTime();
+  if (spinning) product.rotation.y += 0.006;
+  rings.forEach((r, i) => { r.position.y = 0.42 + Math.sin(t * 0.8 + i) * 0.12; });
+  inner.material.emissiveIntensity = 0.7 + Math.sin(t * 1.6) * 0.15;
+  controls.update();
+  composer.render();
+
+  frames++;
+  const now = performance.now();
+  if (now - last > 500) {
+    fpsEl.textContent = Math.round((frames * 1000) / (now - last));
+    frames = 0; last = now;
+  }
+}
+animate();
+</script>
+</body>
+</html>
