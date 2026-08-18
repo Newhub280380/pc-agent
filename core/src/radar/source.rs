@@ -50,7 +50,17 @@ pub fn build(cfg: &SourceCfg, api_key: Option<String>) -> Box<dyn Source> {
 
 /// Нормализация номера под КЗ: 8 707…, 707…, +7 707… → +7707…
 /// Нужна для дедупликации: один бизнес встречается в нескольких источниках.
+/// Несколько номеров в одном поле (в OSM это штатный формат `a;b`, в 2ГИС
+/// бывает через запятую) — берём первый годный, иначе бизнес с двумя телефонами
+/// остался бы вообще без телефона.
 pub fn normalize_phone(raw: &str) -> String {
+    raw.split([';', ',', '/', '\n'])
+        .map(normalize_one_phone)
+        .find(|p| !p.is_empty())
+        .unwrap_or_default()
+}
+
+fn normalize_one_phone(raw: &str) -> String {
     let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     let d = match digits.len() {
         11 if digits.starts_with('8') => format!("7{}", &digits[1..]),
@@ -73,13 +83,28 @@ pub struct Overpass {
     tags: Vec<String>,
 }
 
+/// Теги из конфига попадают в текст запроса, поэтому пускаем только безобидные
+/// символы: кавычка, `]`, `;` или `(` позволили бы дописать в запрос свои
+/// инструкции (Overpass QL — исполняемый язык, а не только фильтр).
+fn is_safe_tag_part(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.' | ' '))
+}
+
 impl Overpass {
     /// Overpass QL: узлы и полигоны с нужным тегом в радиусе. `out center tags`
     /// отдаёт координату даже для way/relation.
-    fn query(&self, geo: &Geo) -> String {
+    fn query(&self, geo: &Geo) -> Result<String> {
         let mut q = String::from("[out:json][timeout:25];(");
+        let mut used = 0;
         for t in &self.tags {
             let (k, v) = t.split_once('=').unwrap_or((t.as_str(), ""));
+            if !is_safe_tag_part(k) || (!v.is_empty() && !is_safe_tag_part(v)) {
+                log::warn!("overpass: тег «{t}» пропущен — недопустимые символы");
+                continue;
+            }
+            used += 1;
             let filter = if v.is_empty() {
                 format!("[\"{k}\"]")
             } else {
@@ -92,8 +117,11 @@ impl Overpass {
                 ));
             }
         }
+        if used == 0 {
+            anyhow::bail!("overpass: не осталось ни одного допустимого тега в tags");
+        }
         q.push_str(");out center tags 200;");
-        q
+        Ok(q)
     }
 }
 
@@ -105,7 +133,7 @@ impl Source for Overpass {
     fn fetch(&self, _keywords: &[String], geo: &Geo) -> Result<Vec<Lead>> {
         let body = ureq::post(&self.url)
             .timeout(std::time::Duration::from_secs(60))
-            .send_form(&[("data", &self.query(geo))])
+            .send_form(&[("data", &self.query(geo)?)])
             .context("overpass: запрос не прошёл")?
             .into_string()?;
         let json: serde_json::Value = serde_json::from_str(&body).context("overpass: не JSON")?;
@@ -185,7 +213,10 @@ impl Source for TwoGis {
         }
         let mut out = vec![];
         for kw in keywords {
-            let resp = ureq::get(&self.url)
+            // Ключ 2ГИС принимает только в query, поэтому ошибку нельзя отдавать
+            // как есть: Display у ureq печатает полный URL и ключ уедет в лог
+            // и в отчёт. Оставляем только код и причину.
+            let called = ureq::get(&self.url)
                 .timeout(std::time::Duration::from_secs(30))
                 .query("q", kw)
                 .query("point", &format!("{},{}", geo.lon, geo.lat))
@@ -193,9 +224,17 @@ impl Source for TwoGis {
                 .query("fields", "items.point,items.contact_groups,items.rubrics")
                 .query("page_size", "50")
                 .query("key", &self.key)
-                .call()
-                .with_context(|| format!("2gis: запрос по «{kw}» не прошёл"))?
-                .into_string()?;
+                .call();
+            let resp = match called {
+                Ok(r) => r,
+                Err(ureq::Error::Status(code, _)) => {
+                    anyhow::bail!("2gis: HTTP {code} на запросе «{kw}»")
+                }
+                Err(ureq::Error::Transport(t)) => {
+                    anyhow::bail!("2gis: транспорт ({:?}) на запросе «{kw}»", t.kind())
+                }
+            }
+            .into_string()?;
             let json: serde_json::Value = serde_json::from_str(&resp).context("2gis: не JSON")?;
             out.extend(parse_2gis(&json));
         }
@@ -281,6 +320,45 @@ mod tests {
         assert_eq!(normalize_phone("707 123 45 67"), "+77071234567");
         assert_eq!(normalize_phone("звоните в инстаграм"), "");
         assert_eq!(normalize_phone("123"), "");
+    }
+
+    #[test]
+    fn first_valid_number_is_taken_from_multi_value_field() {
+        // Штатный для OSM формат «номер;номер» раньше давал пустоту.
+        assert_eq!(
+            normalize_phone("+7 727 000 00 00;+7 701 111 22 33"),
+            "+77270000000"
+        );
+        assert_eq!(
+            normalize_phone("внутренний 12, 8 701 111 22 33"),
+            "+77011112233"
+        );
+    }
+
+    #[test]
+    fn dangerous_tags_are_not_spliced_into_overpass_query() {
+        let geo = Geo {
+            lat: 43.2,
+            lon: 76.9,
+            radius_m: 1000,
+            city: String::new(),
+        };
+        let ok = Overpass {
+            url: String::new(),
+            tags: vec!["shop=beauty".into(), "amenity\"];out count;node[\"x".into()],
+        }
+        .query(&geo)
+        .unwrap();
+        assert!(ok.contains("[\"shop\"=\"beauty\"]"));
+        assert!(!ok.contains("out count"), "{ok}");
+        // Если допустимых тегов не осталось — лучше ошибка, чем запрос
+        // «отдай всё подряд» к публичному Overpass.
+        assert!(Overpass {
+            url: String::new(),
+            tags: vec!["[bad]".into()],
+        }
+        .query(&geo)
+        .is_err());
     }
 
     #[test]

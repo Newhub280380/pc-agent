@@ -70,6 +70,37 @@ impl RadarReport {
     }
 }
 
+/// Схлопывает дубли внутри одного прогона: два источника отдают один бизнес,
+/// совпадая хотя бы по одному признаку (телефон, сайт, имя+координаты). Из пары
+/// оставляем запись с большим score — у второго источника текст может быть
+/// беднее, и терять найденные маркеры нельзя.
+fn collapse(scored: Vec<ScoredLead>) -> Vec<ScoredLead> {
+    let mut kept: Vec<ScoredLead> = vec![];
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for l in scored {
+        let keys = store::dedup_keys(&l);
+        let pos = keys.iter().find_map(|k| index.get(k).copied());
+        let at = match pos {
+            Some(i) => {
+                if l.score > kept[i].score {
+                    kept[i] = l;
+                }
+                i
+            }
+            None => {
+                kept.push(l);
+                kept.len() - 1
+            }
+        };
+        // Признаки обеих записей ведут на одну позицию, иначе третий источник
+        // с другим набором контактов снова создаст дубль.
+        for k in store::dedup_keys(&kept[at]).into_iter().chain(keys) {
+            index.entry(k).or_insert(at);
+        }
+    }
+    kept
+}
+
 /// Один прогон радара. Ошибка отдельного источника не роняет весь прогон:
 /// 2ГИС может отдать 429, а OSM при этом работает.
 pub fn run(
@@ -92,13 +123,8 @@ pub fn run(
         }
     }
     let scanned = raw.len();
-    let leads: Vec<ScoredLead> = raw.iter().filter_map(|l| score::score(l, cfg)).collect();
-    // Дедуп в памяти до записи: иначе транзакция делает лишние UPDATE.
-    let mut seen = std::collections::HashSet::new();
-    let leads: Vec<ScoredLead> = leads
-        .into_iter()
-        .filter(|l| seen.insert(store::dedup_key(l)))
-        .collect();
+    let scored: Vec<ScoredLead> = raw.iter().filter_map(|l| score::score(l, cfg)).collect();
+    let leads = collapse(scored);
     let hot = leads
         .iter()
         .filter(|l| l.intent == score::Intent::Hot)
@@ -172,6 +198,43 @@ mod tests {
         let json = std::fs::read_to_string(&out).unwrap();
         assert!(json.contains("+77071112233"));
         assert!(!json.contains("Шаурма"));
+    }
+
+    #[test]
+    fn duplicates_within_one_run_collapse_to_the_better_record() {
+        let base = crate::radar::source::Lead {
+            name: "Салон".into(),
+            phone: String::new(),
+            website: "salon.kz".into(),
+            text_source: "beauty".into(),
+            lat: 43.2,
+            lon: 76.9,
+            source: "overpass".into(),
+            timestamp: "t".into(),
+        };
+        let poor = ScoredLead {
+            lead: base.clone(),
+            niche: "x".into(),
+            intent: score::Intent::Warm,
+            score: 1.0,
+            matched: vec!["beauty".into()],
+        };
+        let rich = ScoredLead {
+            lead: crate::radar::source::Lead {
+                phone: "+77070000001".into(),
+                website: "https://www.salon.kz/prices".into(),
+                source: "2gis".into(),
+                ..base
+            },
+            niche: "x".into(),
+            intent: score::Intent::Hot,
+            score: 6.0,
+            matched: vec!["beauty".into(), "цена".into()],
+        };
+        let out = collapse(vec![poor, rich]);
+        assert_eq!(out.len(), 1, "один бизнес, два источника");
+        assert_eq!(out[0].intent, score::Intent::Hot);
+        assert_eq!(out[0].lead.phone, "+77070000001");
     }
 
     #[test]

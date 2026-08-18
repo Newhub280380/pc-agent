@@ -1,8 +1,10 @@
 //! Хранилище лидов: SQLite (тот же bundled, что у памяти агента) + экспорт JSON.
 //!
-//! Дедупликация на уровне БД: `UNIQUE(niche, key)`, где key — нормализованный
-//! телефон, а если его нет — сайт или «имя+координаты». Иначе один и тот же
-//! бизнес из 2ГИС и OSM попадёт в рассылку дважды.
+//! Дедупликация по ЛЮБОМУ из опознавательных признаков сразу: телефон,
+//! сайт, «имя+координаты». Один признак не годится: OSM часто знает только
+//! сайт, 2ГИС — только телефон, и один и тот же бизнес попадёт в рассылку
+//! дважды. Поэтому признаки живут в отдельной таблице `lead_keys`: совпал хоть
+//! один — это тот же лид, а новые признаки дописываются к нему.
 
 use super::score::ScoredLead;
 use anyhow::{Context, Result};
@@ -13,19 +15,36 @@ pub struct Store {
     conn: Connection,
 }
 
-pub fn dedup_key(l: &ScoredLead) -> String {
-    if !l.lead.phone.is_empty() {
-        return l.lead.phone.clone();
-    }
-    if !l.lead.website.is_empty() {
-        return l.lead.website.to_lowercase();
-    }
-    format!(
-        "{}@{:.4},{:.4}",
-        l.lead.name.to_lowercase(),
+/// Все признаки одного бизнеса. Совпадение любого считаем тождеством.
+pub fn dedup_keys(l: &ScoredLead) -> Vec<String> {
+    let mut keys = vec![format!(
+        "geo:{}@{:.4},{:.4}",
+        l.lead.name.to_lowercase().trim(),
         l.lead.lat,
         l.lead.lon
-    )
+    )];
+    if !l.lead.phone.is_empty() {
+        keys.push(format!("tel:{}", l.lead.phone));
+    }
+    if !l.lead.website.is_empty() {
+        keys.push(format!("web:{}", normalize_site(&l.lead.website)));
+    }
+    keys
+}
+
+/// `HTTPS://Salon.KZ/prices?x=1` и `salon.kz` — один и тот же бизнес.
+fn normalize_site(raw: &str) -> String {
+    let s = raw.trim().to_lowercase();
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(&s);
+    let s = s.strip_prefix("www.").unwrap_or(s);
+    s.split(['/', '?', '#'])
+        .next()
+        .unwrap_or(s)
+        .trim_end_matches('.')
+        .to_string()
 }
 
 impl Store {
@@ -39,7 +58,6 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS leads(
                 id INTEGER PRIMARY KEY,
                 niche TEXT NOT NULL,
-                key TEXT NOT NULL,
                 name TEXT NOT NULL,
                 phone TEXT NOT NULL,
                 website TEXT NOT NULL,
@@ -51,8 +69,13 @@ impl Store {
                 score REAL NOT NULL,
                 matched TEXT NOT NULL,
                 first_seen TEXT NOT NULL,
-                last_seen TEXT NOT NULL,
-                UNIQUE(niche, key)
+                last_seen TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS lead_keys(
+                niche TEXT NOT NULL,
+                key TEXT NOT NULL,
+                lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+                PRIMARY KEY(niche, key)
             );
             CREATE INDEX IF NOT EXISTS leads_intent ON leads(niche, intent, score DESC);",
         )?;
@@ -66,41 +89,72 @@ impl Store {
         let mut fresh = 0;
         let mut updated = 0;
         for l in leads {
-            let key = dedup_key(l);
+            let keys = dedup_keys(l);
             let matched = l.matched.join(",");
-            let existed: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM leads WHERE niche=?1 AND key=?2)",
-                params![l.niche, key],
-                |r| r.get(0),
-            )?;
-            tx.execute(
-                "INSERT INTO leads(niche,key,name,phone,website,text_source,lat,lon,source,
-                                   intent,score,matched,first_seen,last_seen)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)
-                 ON CONFLICT(niche,key) DO UPDATE SET
-                   intent=excluded.intent, score=excluded.score,
-                   matched=excluded.matched, last_seen=excluded.last_seen,
-                   phone=CASE WHEN leads.phone='' THEN excluded.phone ELSE leads.phone END",
-                params![
-                    l.niche,
-                    key,
-                    l.lead.name,
-                    l.lead.phone,
-                    l.lead.website,
-                    l.lead.text_source,
-                    l.lead.lat,
-                    l.lead.lon,
-                    l.lead.source,
-                    l.intent.as_str(),
-                    l.score,
-                    matched,
-                    l.lead.timestamp,
-                ],
-            )?;
-            if existed {
-                updated += 1;
-            } else {
-                fresh += 1;
+            let mut found: Option<i64> = None;
+            for k in &keys {
+                found = tx
+                    .query_row(
+                        "SELECT lead_id FROM lead_keys WHERE niche=?1 AND key=?2",
+                        params![l.niche, k],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if found.is_some() {
+                    break;
+                }
+            }
+            let id = match found {
+                Some(id) => {
+                    // Пустые контакты не затирают уже известные: источники
+                    // дополняют друг друга, а не конкурируют.
+                    tx.execute(
+                        "UPDATE leads SET
+                           last_seen=?1,
+                           phone=CASE WHEN phone='' THEN ?2 ELSE phone END,
+                           website=CASE WHEN website='' THEN ?3 ELSE website END
+                         WHERE id=?4",
+                        params![l.lead.timestamp, l.lead.phone, l.lead.website, id],
+                    )?;
+                    // Скоринг перезаписываем только вверх: у второго источника
+                    // может быть беднее текст, и HOT не должен деградировать.
+                    tx.execute(
+                        "UPDATE leads SET intent=?1, score=?2, matched=?3, text_source=?4
+                         WHERE id=?5 AND ?2 >= score",
+                        params![l.intent.as_str(), l.score, matched, l.lead.text_source, id],
+                    )?;
+                    updated += 1;
+                    id
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO leads(niche,name,phone,website,text_source,lat,lon,source,
+                                           intent,score,matched,first_seen,last_seen)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
+                        params![
+                            l.niche,
+                            l.lead.name,
+                            l.lead.phone,
+                            l.lead.website,
+                            l.lead.text_source,
+                            l.lead.lat,
+                            l.lead.lon,
+                            l.lead.source,
+                            l.intent.as_str(),
+                            l.score,
+                            matched,
+                            l.lead.timestamp,
+                        ],
+                    )?;
+                    fresh += 1;
+                    tx.last_insert_rowid()
+                }
+            };
+            for k in &keys {
+                tx.execute(
+                    "INSERT OR IGNORE INTO lead_keys(niche,key,lead_id) VALUES(?1,?2,?3)",
+                    params![l.niche, k, id],
+                )?;
             }
         }
         tx.commit()?;
@@ -184,6 +238,48 @@ mod tests {
         let (total, hot) = s.count("косметика").unwrap();
         assert_eq!(total, 1, "один телефон — один лид");
         assert_eq!(hot, 1, "статус должен обновиться до HOT");
+    }
+
+    #[test]
+    fn one_business_from_two_sources_merges_by_website_and_gains_phone() {
+        let mut s = Store::open(&db("merge")).unwrap();
+        // OSM знает сайт, 2ГИС — телефон и тот же сайт с www/путём.
+        let mut osm = scored("Салон Алия", "", Intent::Warm);
+        osm.lead.website = "salon.kz".into();
+        let mut gis = scored("Салон Алия (2ГИС)", "+77071112233", Intent::Hot);
+        gis.lead.website = "HTTPS://WWW.salon.kz/prices?utm=1".into();
+        gis.lead.lat = 43.9; // карточки редко совпадают точкой
+        s.upsert_all(&[osm]).unwrap();
+        let (fresh, updated) = s.upsert_all(&[gis]).unwrap();
+        assert_eq!((fresh, updated), (0, 1));
+        assert_eq!(s.count("косметика").unwrap().0, 1, "один бизнес — один лид");
+        let phone: String = s
+            .conn
+            .query_row("SELECT phone FROM leads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(phone, "+77071112233", "телефон должен дописаться к лиду");
+    }
+
+    #[test]
+    fn better_scored_rerun_wins_and_worse_does_not_downgrade() {
+        let mut s = Store::open(&db("score")).unwrap();
+        let mut warm = scored("Клиника", "+77070000009", Intent::Warm);
+        warm.score = 2.0;
+        let mut hot = scored("Клиника", "+77070000009", Intent::Hot);
+        hot.score = 7.0;
+        s.upsert_all(&[warm.clone()]).unwrap();
+        s.upsert_all(&[hot]).unwrap();
+        s.upsert_all(&[warm]).unwrap(); // бедный источник не должен ломать HOT
+        assert_eq!(s.count("косметика").unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn site_normalization_ignores_scheme_www_and_path() {
+        assert_eq!(
+            normalize_site("HTTPS://WWW.Salon.kz/prices?x=1"),
+            "salon.kz"
+        );
+        assert_eq!(normalize_site("http://salon.kz."), "salon.kz");
     }
 
     #[test]
