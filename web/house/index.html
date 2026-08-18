@@ -60,11 +60,11 @@
   <div class="panel">
     <h3>THE MANAGEMENT HOUSE // HQ-01</h3>
     <div id="clock">—</div>
-    <small>два этажа, семь отделов, живые показатели по клику</small>
+    <small>два этажа, семь отделов и чилаут-зона, живые показатели по клику</small>
   </div>
   <div id="row">
     <div class="panel"><small>WASD — идти, Shift — бежать, мышь — смотреть,<br>ЛКМ на комнате — открыть отдел, E — войти в модуль, Esc — выйти из обзора<br>лестница — в правом конце коридора</small></div>
-    <div class="panel" style="max-width:210px"><small id="stat">отделов: 7 · этажей: 2</small></div>
+    <div class="panel" style="max-width:210px"><small id="stat">отделов: 7 · чилаут: 1 · этажей: 2</small></div>
   </div>
 </div>
 <div id="aim"></div>
@@ -88,7 +88,7 @@
   <h1>MANAGEMENT HOUSE</h1>
   <div id="keys">WASD — движение · мышь — обзор · ЛКМ — данные отдела · E — модуль · Esc — выход</div>
   <button id="go">ВОЙТИ В ДОМ</button>
-  <div id="keys">два этажа · 7 интерактивных комнат · стены светятся на подходе</div>
+  <div id="keys">два этажа · 7 интерактивных комнат + чилаут-зона с деревом света · стены светятся на подходе</div>
   <div id="keys"><a href="../" style="color:#00ffcc">генеральный хаб — список модулей списком</a></div>
 </div>
 
@@ -151,6 +151,14 @@ const DEPARTMENTS = [
     rows: [['Сотрудников', STATS.team.people], ['На смене сейчас', STATS.team.on_shift],
            ['Задач в работе', STATS.team.tasks],
            ['Просрочено', [String(STATS.team.overdue), 'bad']]] },
+  { id: 'chill',      name: 'ЧИЛАУТ-ЗОНА',    floor: 1, col: -1, row: 1,  hue: 0x7dffe0,
+    lounge: true, green: 0x2bff88,
+    sub: 'фуршетная кухня, дерево света и пульт с музыкой',
+    rows: [['Кофе и фуршет', 'круглосуточно'],
+           ['Мест за стойкой', 6],
+           ['Плейлист', 'LO-FI NEON'],
+           ['Правило зоны', 'идеи громче задач']],
+    note: 'ЛКМ по пульту — включить и выключить музыку' },
   { id: 'director',   name: 'ДИРЕКТОР',       floor: 1, col: 0,  row: 1,  hue: 0x3dfbe0,
     sub: 'то, что решается только здесь',
     rows: [['Чистая прибыль', [money(last.in - last.out), 'good']],
@@ -262,6 +270,238 @@ function dashboard(dep, x0, y, z0) {
   group.traverse(o => { o.userData.dep = dep; if (o.isMesh) clickable.push(o); });
 }
 
+/* Объекты, которым нужен кадр: дерево света, чешуя и эквалайзер пульта. */
+const animated = [];
+
+/** Дерево света в центре чилаут-зоны: ствол, ветви и светящаяся крона.
+    Вокруг него можно обойти 360°, ветви подсвечены снизу двумя лампами. */
+function lightTree(x0, y, z0, hue) {
+  const bark = new THREE.MeshStandardMaterial({ color: 0x0e1a16, roughness: 0.75, metalness: 0.3,
+                                                emissive: new THREE.Color(hue), emissiveIntensity: 0.12 });
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.4, 3.2, 12), bark);
+  trunk.position.set(x0, y + 1.6, z0);
+  scene.add(trunk);
+  colliders.push(new THREE.Box3().setFromObject(trunk));
+
+  // Ветви двумя ярусами по кругу — крона читается с любой стороны.
+  for (const [tier, count, len, tilt] of [[3.0, 7, 1.9, 0.85], [4.0, 5, 1.4, 0.6]]) {
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2 + tier;
+      const br = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.12, len, 8), bark);
+      br.position.set(x0 + Math.cos(a) * len * 0.35, y + tier + len * 0.3, z0 + Math.sin(a) * len * 0.35);
+      br.rotation.set(Math.sin(a) * tilt, 0, -Math.cos(a) * tilt);
+      scene.add(br);
+    }
+  }
+
+  /* Крона — облако светящихся листьев на InstancedMesh: держит объём
+     при обходе вокруг дерева и рендерится там, где точки не поддержаны. */
+  const N = 320;
+  const crown = new THREE.Group();
+  crown.position.set(x0, y, z0);
+  const leaf = new THREE.InstancedMesh(
+    new THREE.IcosahedronGeometry(0.17, 0),
+    new THREE.MeshStandardMaterial({ color: hue, roughness: 0.35, metalness: 0.2,
+                                     emissive: new THREE.Color(hue), emissiveIntensity: 0.9 }),
+    N);
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), v = new THREE.Vector3();
+  for (let i = 0; i < N; i++) {
+    const h = Math.random(), r = (1.5 + Math.random() * 1.5) * (1 - h * 0.5);
+    const a = Math.random() * Math.PI * 2;
+    v.set(Math.cos(a) * r, 3.3 + h * 2.5, Math.sin(a) * r);
+    e.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+    const s = 0.7 + Math.random() * 0.8;
+    m4.compose(v, q.setFromEuler(e), new THREE.Vector3(s, s, s));
+    leaf.setMatrixAt(i, m4);
+  }
+  crown.add(leaf);
+  scene.add(crown);
+  animated.push(t => {
+    crown.rotation.y = t * 0.08;
+    leaf.material.emissiveIntensity = 0.75 + 0.35 * Math.sin(t * 1.4);
+  });
+
+  // Подсветка снизу + светящееся кольцо на полу.
+  const up = new THREE.PointLight(hue, 18, 13, 2);
+  up.position.set(x0, y + 0.7, z0);
+  scene.add(up);
+  const ring = new THREE.Mesh(new THREE.RingGeometry(1.6, 2.4, 48),
+    new THREE.MeshBasicMaterial({ color: hue, transparent: true, opacity: 0.22,
+                                  side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.set(x0, y + 0.06, z0);
+  scene.add(ring);
+  animated.push(t => { ring.material.opacity = 0.14 + 0.12 * Math.abs(Math.sin(t * 0.9)); });
+}
+
+/** Зелёная чешуя: сетка блестящих пластин, по ней бежит волна блеска. */
+function scaleWall(x, y, z0, hue) {
+  const COLS = 26, ROWS = 12, STEP = 0.55;
+  const geom = new THREE.CircleGeometry(0.3, 12);
+  const mat = new THREE.MeshStandardMaterial({ color: hue, metalness: 0.95, roughness: 0.18,
+                                               emissive: new THREE.Color(hue), emissiveIntensity: 0.1,
+                                               side: THREE.DoubleSide });
+  const mesh = new THREE.InstancedMesh(geom, mat, COLS * ROWS);
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+  const one = new THREE.Vector3(1, 1, 1), v = new THREE.Vector3();
+  const phase = [];
+  let i = 0;
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      v.set(x, y + 1.2 + r * STEP * 0.95, z0 - (COLS - 1) * STEP / 2 + c * STEP + (r % 2) * STEP / 2);
+      e.set(0, Math.PI / 2, 0);
+      m4.compose(v, q.setFromEuler(e), one);
+      mesh.setMatrixAt(i, m4);
+      phase.push([v.clone(), r * 0.5 + c * 0.28]);
+      i++;
+    }
+  }
+  scene.add(mesh);
+  animated.push(t => {
+    for (let k = 0; k < phase.length; k++) {
+      const [p, ph] = phase[k];
+      const w = Math.sin(t * 1.6 - ph);
+      e.set(w * 0.22, Math.PI / 2, 0);
+      m4.compose(p, q.setFromEuler(e), one.set(1, 1, 0.9 + 0.25 * w));
+      mesh.setMatrixAt(k, m4);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.material.emissiveIntensity = 0.12 + 0.1 * Math.sin(t * 1.1);
+  });
+}
+
+/* Пульт с музыкой: короткий лоу-фай пэд на WebAudio, включается ЛКМ.
+   Файлов нет специально — страница остаётся статикой без ассетов. */
+let audioCtx = null, musicGain = null, musicOn = false;
+function toggleMusic() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    musicGain = audioCtx.createGain();
+    musicGain.gain.value = 0;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 900;
+    musicGain.connect(filter).connect(audioCtx.destination);
+    for (const f of [110, 164.81, 220, 277.18]) {
+      const osc = audioCtx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      const g = audioCtx.createGain();
+      g.gain.value = 0.18;
+      const lfo = audioCtx.createOscillator();
+      lfo.frequency.value = 0.07 + f / 4000;
+      const lfoGain = audioCtx.createGain();
+      lfoGain.gain.value = 0.14;
+      lfo.connect(lfoGain).connect(g.gain);
+      osc.connect(g).connect(musicGain);
+      osc.start(); lfo.start();
+    }
+  }
+  audioCtx.resume();
+  musicOn = !musicOn;
+  musicGain.gain.setTargetAtTime(musicOn ? 0.22 : 0, audioCtx.currentTime, 0.4);
+}
+
+function deck(dep, x0, y, z0) {
+  const hue = dep.hue;
+  const body = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.0, 1.2),
+    new THREE.MeshStandardMaterial({ color: 0x0b1216, roughness: 0.45, metalness: 0.7 }));
+  body.position.set(x0, y + 0.5, z0);
+  const top = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.08, 1.2),
+    new THREE.MeshStandardMaterial({ color: 0x0f1a1e, metalness: 0.9, roughness: 0.25,
+                                     emissive: new THREE.Color(hue), emissiveIntensity: 0.25 }));
+  top.position.set(x0, y + 1.02, z0);
+  scene.add(body, top);
+  colliders.push(new THREE.Box3().setFromObject(body));
+
+  const bars = [];
+  for (let i = 0; i < 9; i++) {
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(0.14, 1, 0.14),
+      new THREE.MeshBasicMaterial({ color: hue }));
+    bar.position.set(x0 - 1.0 + i * 0.25, y + 1.3, z0 - 0.2);
+    scene.add(bar);
+    bars.push(bar);
+    bar.userData = { dep, deck: true };
+    clickable.push(bar);
+  }
+  animated.push(t => {
+    for (let i = 0; i < bars.length; i++) {
+      const h = musicOn
+        ? 0.25 + 0.75 * Math.abs(Math.sin(t * (1.6 + i * 0.4) + i))
+        : 0.08;
+      bars[i].scale.y = h;
+      bars[i].position.y = y + 1.06 + h / 2;
+    }
+  });
+
+  const sign = label(musicLabel(), hue);
+  sign.scale.set(0.5, 0.5, 1);
+  sign.position.set(x0 + 0.2, y + 2.4, z0 + 0.2);
+  sign.rotation.y = Math.PI / 4;
+  scene.add(sign);
+  animated.push(() => {
+    if (sign.userData.on === musicOn) return;
+    sign.userData.on = musicOn;
+    sign.material.map.dispose();
+    sign.material.map = label(musicLabel(), hue).material.map;
+  });
+  for (const o of [body, top, sign]) { o.userData = { dep, deck: true }; clickable.push(o); }
+}
+const musicLabel = () => (musicOn ? 'МУЗЫКА: ВКЛ' : 'ПУЛЬТ · ЛКМ — МУЗЫКА');
+
+/** Фуршетная кухня: стойка, барные стулья, кофемашина и тарелки. */
+function kitchen(x0, y, z0, hue) {
+  const steel = new THREE.MeshStandardMaterial({ color: 0x1a2429, metalness: 0.85, roughness: 0.28 });
+  const counter = new THREE.Mesh(new THREE.BoxGeometry(1.1, 1.05, 7), steel);
+  counter.position.set(x0, y + 0.52, z0);
+  const topBoard = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.1, 7.2),
+    new THREE.MeshStandardMaterial({ color: 0x223038, metalness: 0.9, roughness: 0.15,
+                                     emissive: new THREE.Color(hue), emissiveIntensity: 0.12 }));
+  topBoard.position.set(x0, y + 1.08, z0);
+  scene.add(counter, topBoard);
+  colliders.push(new THREE.Box3().setFromObject(counter));
+
+  // Кофемашина и фуршетные блюда на стойке.
+  const coffee = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.9, 0.6), steel);
+  coffee.position.set(x0, y + 1.55, z0 - 2.9);
+  const screen = new THREE.Mesh(new THREE.PlaneGeometry(0.4, 0.22),
+    new THREE.MeshBasicMaterial({ color: hue }));
+  screen.position.set(x0 - 0.36, y + 1.75, z0 - 2.9);
+  screen.rotation.y = -Math.PI / 2;
+  scene.add(coffee, screen);
+  for (let i = 0; i < 5; i++) {
+    const dish = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.28, 0.12, 20),
+      new THREE.MeshStandardMaterial({ color: 0xdfe7ea, metalness: 0.9, roughness: 0.2 }));
+    dish.position.set(x0, y + 1.19, z0 - 1 + i * 0.9);
+    const food = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 10),
+      new THREE.MeshStandardMaterial({ color: i % 2 ? 0xff9ec4 : hue,
+                                       emissive: new THREE.Color(i % 2 ? 0xff9ec4 : hue),
+                                       emissiveIntensity: 0.25, roughness: 0.5 }));
+    food.position.set(x0, y + 1.3, z0 - 1 + i * 0.9);
+    scene.add(dish, food);
+  }
+
+  // Барные стулья со стороны зала.
+  for (let i = 0; i < 3; i++) {
+    const z = z0 - 2 + i * 2;
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.12, 0.85, 10), steel);
+    leg.position.set(x0 - 1.5, y + 0.42, z);
+    const seat = new THREE.Mesh(new THREE.CylinderGeometry(0.36, 0.36, 0.12, 20),
+      new THREE.MeshStandardMaterial({ color: 0x0e1a1c, roughness: 0.6,
+                                       emissive: new THREE.Color(hue), emissiveIntensity: 0.14 }));
+    seat.position.set(x0 - 1.5, y + 0.9, z);
+    scene.add(leg, seat);
+  }
+}
+
+function lounge(dep, x0, y, z0) {
+  // Зелёный только у дерева и чешуи: стены остаются в общей мятно-циановой гамме.
+  lightTree(x0, y, z0, dep.green);
+  kitchen(x0 + HALF - 1.4, y, z0 - 0.5, dep.hue);
+  scaleWall(x0 - HALF + WALL, y, z0, dep.green);
+  deck(dep, x0 - 4.6, y, z0 - 4.6);
+}
+
 function room(dep) {
   const x0 = dep.col * COL;
   const z0 = dep.row * ROWZ;
@@ -282,21 +522,24 @@ function room(dep) {
   pad.position.set(x0, y + 0.05, z0);
   scene.add(pad);
 
-  const lamp = new THREE.PointLight(dep.hue, 46, ROOM * 1.6, 2);
+  // В чилауте свет нейтральный: зелёный остаётся только у дерева и чешуи.
+  const lamp = new THREE.PointLight(dep.lounge ? 0xcfeee6 : dep.hue,
+                                    dep.lounge ? 26 : 46, ROOM * 1.6, 2);
   lamp.position.set(x0, y + H - 1.2, z0);
   scene.add(lamp);
 
-  // Терминал отдела — цель для клика.
+  // Терминал отдела — цель для клика. В чилауте центр занят деревом.
+  const kx = dep.lounge ? x0 + 4.6 : x0, kz = dep.lounge ? z0 + 4.6 : z0;
   const kiosk = new THREE.Mesh(new THREE.BoxGeometry(3.2, 0.35, 2),
     new THREE.MeshStandardMaterial({ color: 0x0d1519, roughness: 0.5, metalness: 0.6 }));
-  kiosk.position.set(x0, y + 1.1, z0);
+  kiosk.position.set(kx, y + 1.1, kz);
   const legs = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.1, 1.4),
     new THREE.MeshStandardMaterial({ color: 0x090d10 }));
-  legs.position.set(x0, y + 0.55, z0);
+  legs.position.set(kx, y + 0.55, kz);
   const screen = new THREE.Mesh(new THREE.PlaneGeometry(3, 1.7),
     new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.5,
                                  side: THREE.DoubleSide }));
-  screen.position.set(x0, y + 2.1, z0);
+  screen.position.set(kx, y + 2.1, kz);
   screen.rotation.x = -0.35;
   scene.add(kiosk, legs, screen);
   colliders.push(new THREE.Box3().setFromObject(legs));
@@ -307,6 +550,7 @@ function room(dep) {
   scene.add(tag);
 
   if (dep.id === 'director') dashboard(dep, x0, y, z0);
+  if (dep.lounge) lounge(dep, x0, y, z0);
 
   // Портал в модуль: светящаяся рамка на глухой стене — видно, куда ведёт комната.
   if (dep.mod) {
@@ -468,16 +712,22 @@ const centre = new THREE.Vector2(0, 0);
 const lookEl = document.getElementById('look');
 let hovered = null;
 
+let hoveredDeck = false;
+
 function pick() {
   ray.setFromCamera(centre, camera);
   const hit = ray.intersectObjects(clickable, false).find(h => h.distance < 14);
   hovered = hit ? hit.object.userData.dep : null;
+  hoveredDeck = !!hit?.object.userData.deck;
   lookEl.textContent = hovered
-    ? `${hovered.name} — ЛКМ данные` + (hovered.mod ? ` · E → ${hovered.mod.name}` : '')
+    ? (hoveredDeck ? `ПУЛЬТ — ЛКМ ${musicOn ? 'выключить' : 'включить'} музыку`
+                   : `${hovered.name} — ЛКМ данные`) +
+      (hovered.mod ? ` · E → ${hovered.mod.name}` : '')
     : '';
 }
 addEventListener('mousedown', e => {
-  if (e.button === 0 && hovered && controls.isLocked) openCard(hovered);
+  if (e.button !== 0 || !hovered || !controls.isLocked) return;
+  if (hoveredDeck) toggleMusic(); else openCard(hovered);
 });
 
 /* ---------- Карточка отдела ---------- */
@@ -515,7 +765,8 @@ fetch('leads.json').then(r => r.ok ? r.json() : null).then(leads => {
   sales.rows[0][1] = leads.length;
   sales.rows[1][1] = [String(hot), hot ? 'good' : ''];
   document.getElementById('stat').textContent =
-    `отделов: ${DEPARTMENTS.length} · этажей: 2 · лидов из радара: ${leads.length}`;
+    `отделов: ${DEPARTMENTS.filter(d => !d.lounge).length} · чилаут: 1 · этажей: 2 · ` +
+    `лидов из радара: ${leads.length}`;
   if (card.style.display === 'block' &&
       document.getElementById('c-title').textContent === sales.name) openCard(sales);
 }).catch(() => {});
@@ -528,6 +779,8 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
   if (controls.isLocked) { move(dt); pick(); } else { lookEl.textContent = ''; }
   react();
+  const t = clock.elapsedTime;
+  for (const fn of animated) fn(t);
   clockEl.textContent = new Date().toLocaleTimeString('ru-RU');
   renderer.render(scene, camera);
 }
