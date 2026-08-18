@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Management House // HQ-01</title>
+<style>
+  :root { --neon: #00ffcc; }
+  * { box-sizing: border-box; }
+  body { margin: 0; overflow: hidden; background: #000; color: #eaeaea;
+         font: 14px/1.5 "Segoe UI", system-ui, sans-serif; }
+  canvas { display: block; }
+
+  #hud { position: fixed; inset: 0; pointer-events: none; padding: 18px;
+         display: flex; flex-direction: column; justify-content: space-between; }
+  .panel { background: rgba(4, 8, 8, .82); border: 1px solid #1e2b2b;
+           border-left: 3px solid var(--neon); border-radius: 6px; padding: 12px 14px;
+           max-width: 340px; backdrop-filter: blur(3px); }
+  .panel h3 { margin: 0 0 4px; font-size: 14px; letter-spacing: 2px; color: var(--neon); }
+  .panel small { color: #7d8f8f; }
+  #row { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; }
+  #aim { position: fixed; left: 50%; top: 50%; width: 8px; height: 8px; margin: -4px 0 0 -4px;
+         border: 1px solid var(--neon); border-radius: 50%; opacity: .55; }
+  #look { position: fixed; left: 50%; top: calc(50% + 26px); transform: translateX(-50%);
+          font: 12px monospace; letter-spacing: 1px; color: var(--neon); text-shadow: 0 0 8px #000; }
+
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 14px;
+           align-items: center; justify-content: center; text-align: center;
+           background: radial-gradient(circle at 50% 40%, #04201c 0%, #000 70%); z-index: 30; }
+  #start h1 { margin: 0; font-size: clamp(28px, 6vw, 54px); letter-spacing: 8px; color: var(--neon); }
+  button { font: inherit; letter-spacing: 2px; cursor: pointer; color: #04100e;
+           background: var(--neon); border: 0; border-radius: 4px; padding: 12px 26px; }
+  #keys { color: #6e8080; font: 12px/1.8 monospace; }
+
+  #card { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+          width: min(440px, 92vw); background: #060a0a; border: 1px solid #1e2b2b;
+          border-top: 4px solid var(--neon); border-radius: 8px; padding: 20px 22px;
+          display: none; z-index: 40; box-shadow: 0 24px 60px rgba(0,0,0,.8); }
+  #card h2 { margin: 0; font-size: 20px; letter-spacing: 3px; color: var(--neon); }
+  #card .sub { color: #7d8f8f; margin-bottom: 14px; }
+  #card table { width: 100%; border-collapse: collapse; }
+  #card td { padding: 7px 0; border-bottom: 1px solid #141d1d; }
+  #card td:last-child { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .bad { color: #ff5f6d; } .good { color: var(--neon); }
+  #card footer { display: flex; justify-content: space-between; align-items: center;
+                 margin-top: 16px; gap: 10px; }
+  #card .note { color: #6e8080; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div class="panel">
+    <h3>THE MANAGEMENT HOUSE // HQ-01</h3>
+    <div id="clock">—</div>
+    <small>шесть отделов на одном этаже, живые показатели по клику</small>
+  </div>
+  <div id="row">
+    <div class="panel"><small>WASD — идти, Shift — бежать, мышь — смотреть,<br>ЛКМ на комнате — открыть отдел, Esc — выйти из обзора</small></div>
+    <div class="panel" style="max-width:210px"><small id="stat">отделов: 6</small></div>
+  </div>
+</div>
+<div id="aim"></div>
+<div id="look"></div>
+
+<div id="card">
+  <h2 id="c-title">Отдел</h2>
+  <div class="sub" id="c-sub"></div>
+  <table id="c-rows"></table>
+  <footer>
+    <span class="note" id="c-note"></span>
+    <button onclick="window.closeCard()">ЗАКРЫТЬ</button>
+  </footer>
+</div>
+
+<div id="start">
+  <h1>MANAGEMENT HOUSE</h1>
+  <div id="keys">WASD — движение · мышь — обзор · ЛКМ — данные отдела · Esc — выход</div>
+  <button id="go">ВОЙТИ В ДОМ</button>
+  <div id="keys">рендер: WebGL2 · данные: локальный JSON, без сервера</div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+/* ---------- Отделы. Показатели живут отдельно от геометрии, чтобы данные
+   можно было подменить экспортом агента, не трогая сцену. ---------- */
+const ROOM = 16, GAP = 9, DOOR = 5, WALL = 0.4, H = 7;
+
+const DEPARTMENTS = [
+  { id: 'sales',      name: 'ОТДЕЛ ПРОДАЖ',   col: 0, row: 0, hue: 0x00ffcc,
+    sub: 'входящие заявки и обзвон базы',
+    rows: [['Лидов в базе', '—'], ['HOT-лидов', '—'], ['Заявок сегодня', 14], ['Счётов выставлено', 6], ['Конверсия в оплату', '18%']],
+    note: 'подхватывает leads.json из радара' },
+  { id: 'marketing',  name: 'МАРКЕТИНГ',      col: 1, row: 0, hue: 0xff4d9d,
+    sub: 'реклама, креативы, тесты',
+    rows: [['Бюджет за месяц', '480 000 ₸'], ['Кампаний активно', 3], ['CPL', '1 240 ₸'], ['Лучший креатив', 'ROSE_GLAM_02'], ['CTR', '2,4%']] },
+  { id: 'warehouse',  name: 'СКЛАД',          col: 2, row: 0, hue: 0xffc857,
+    sub: 'остатки и отгрузки',
+    rows: [['Позиций на складе', 42], ['Ниже минимума', ['3', 'bad']], ['Отгружено за неделю', 118], ['Ближайший срок годности', '02.2027']] },
+  { id: 'accounting', name: 'БУХГАЛТЕРИЯ',    col: 0, row: 1, hue: 0x7cc4ff,
+    sub: 'деньги, налоги, сверки',
+    rows: [['Приход за месяц', '6 420 000 ₸'], ['Расход', '3 980 000 ₸'], ['Дебиторка', ['940 000 ₸', 'bad']], ['Налоги к сроку', '25.09']] },
+  { id: 'admin',      name: 'АДМИНИСТРАЦИЯ',  col: 1, row: 1, hue: 0x9d8cff,
+    sub: 'персонал и процессы',
+    rows: [['Сотрудников', 11], ['На смене сейчас', 7], ['Задач в работе', 23], ['Просрочено', ['2', 'bad']]] },
+  { id: 'director',   name: 'ДИРЕКТОР',       col: 2, row: 1, hue: 0xff7a45,
+    sub: 'то, что решается только здесь',
+    rows: [['Чистая прибыль', ['2 440 000 ₸', 'good']], ['План месяца', '81%'], ['Решений на подпись', 4], ['Риск №1', 'зависимость от 1 поставщика']] },
+];
+
+/* ---------- Сцена ---------- */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x05070a);
+scene.fog = new THREE.Fog(0x05070a, 30, 120);
+
+const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.1, 400);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+scene.add(new THREE.HemisphereLight(0x3a4d5c, 0x0a0a0a, 0.9));
+
+const planW = 3 * ROOM + 2 * GAP + 30;
+const planD = 2 * ROOM + GAP + 30;
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(planW, planD),
+  new THREE.MeshStandardMaterial({ color: 0x0b0f12, roughness: 0.85, metalness: 0.1 }));
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+const grid = new THREE.GridHelper(Math.max(planW, planD), Math.max(planW, planD) / 2, 0x113033, 0x0a1a1c);
+grid.position.y = 0.02;
+scene.add(grid);
+
+/* Плоские подписи комнат: текст на canvas дешевле, чем шрифтовая геометрия,
+   и читается с любого расстояния. */
+function label(text, color) {
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 128;
+  const g = c.getContext('2d');
+  g.fillStyle = '#04080a'; g.fillRect(0, 0, 512, 128);
+  g.strokeStyle = '#' + color.toString(16).padStart(6, '0');
+  g.lineWidth = 6; g.strokeRect(3, 3, 506, 122);
+  g.fillStyle = g.strokeStyle;
+  g.font = 'bold 52px "Segoe UI", sans-serif';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(text, 256, 68);
+  const tex = new THREE.CanvasTexture(c);
+  tex.anisotropy = 4;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(8, 2),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
+  return m;
+}
+
+/* Стены собираем сегментами и складываем их AABB — по ним же считаем
+   столкновения, поэтому «пройти сквозь стену» нельзя по построению. */
+const colliders = [];
+const clickable = [];
+const wallMat = new THREE.MeshStandardMaterial({ color: 0x16202a, roughness: 0.7, metalness: 0.25 });
+
+function wall(cx, cz, w, d) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, H, d), wallMat);
+  m.position.set(cx, H / 2, cz);
+  scene.add(m);
+  colliders.push(new THREE.Box3().setFromObject(m));
+  return m;
+}
+
+function room(dep) {
+  const x0 = (dep.col - 1) * (ROOM + GAP);
+  const z0 = dep.row === 0 ? -(ROOM + GAP) / 2 - ROOM / 2 : (ROOM + GAP) / 2 + ROOM / 2;
+  const half = ROOM / 2;
+  const doorSide = dep.row === 0 ? 1 : -1; // дверь всегда в коридор
+  const side = (ROOM - DOOR) / 2;
+
+  wall(x0, z0 - doorSide * half, ROOM, WALL);                       // глухая стена
+  wall(x0 - half, z0, WALL, ROOM);
+  wall(x0 + half, z0, WALL, ROOM);
+  wall(x0 - (DOOR / 2 + side / 2), z0 + doorSide * half, side, WALL); // стена с проёмом
+  wall(x0 + (DOOR / 2 + side / 2), z0 + doorSide * half, side, WALL);
+
+  // Пол-подсветка отдела: видно, где стоишь, и куда идти дальше.
+  const pad = new THREE.Mesh(new THREE.PlaneGeometry(ROOM - 1, ROOM - 1),
+    new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.07 }));
+  pad.rotation.x = -Math.PI / 2;
+  pad.position.set(x0, 0.05, z0);
+  scene.add(pad);
+
+  const lamp = new THREE.PointLight(dep.hue, 55, ROOM * 1.6, 2);
+  lamp.position.set(x0, H - 1.2, z0);
+  scene.add(lamp);
+
+  // Терминал отдела — цель для клика.
+  const kiosk = new THREE.Mesh(new THREE.BoxGeometry(3.2, 0.35, 2),
+    new THREE.MeshStandardMaterial({ color: 0x0d1519, roughness: 0.5, metalness: 0.6 }));
+  kiosk.position.set(x0, 1.1, z0);
+  const legs = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.1, 1.4),
+    new THREE.MeshStandardMaterial({ color: 0x090d10 }));
+  legs.position.set(x0, 0.55, z0);
+  const screen = new THREE.Mesh(new THREE.PlaneGeometry(3, 1.7),
+    new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.5,
+                                 side: THREE.DoubleSide }));
+  screen.position.set(x0, 2.1, z0);
+  screen.rotation.x = -0.35;
+  scene.add(kiosk, legs, screen);
+  colliders.push(new THREE.Box3().setFromObject(legs));
+
+  const tag = label(dep.name, dep.hue);
+  tag.position.set(x0, 3.9, z0 + doorSide * (half - 0.35));
+  tag.rotation.y = doorSide === 1 ? 0 : Math.PI;
+  scene.add(tag);
+
+  for (const o of [kiosk, screen, tag]) { o.userData.dep = dep; clickable.push(o); }
+}
+DEPARTMENTS.forEach(room);
+
+// Коридор: холодные лампы, чтобы от входа было видно, куда идти.
+for (const x of [-(ROOM + GAP), 0, ROOM + GAP]) {
+  const l = new THREE.PointLight(0xbfe9ff, 40, 34, 2);
+  l.position.set(x, H - 1.5, 0);
+  scene.add(l);
+}
+
+// Внешний периметр, чтобы не улететь в пустоту.
+const px = planW / 2 - 2, pz = planD / 2 - 2;
+wall(0, -pz, px * 2, WALL); wall(0, pz, px * 2, WALL);
+wall(-px, 0, WALL, pz * 2); wall(px, 0, WALL, pz * 2);
+
+/* ---------- Ходьба от первого лица ---------- */
+const EYE = 1.7, RADIUS = 0.55;
+const controls = new PointerLockControls(camera, renderer.domElement);
+camera.position.set(0, EYE, 0);
+
+const keys = new Set();
+addEventListener('keydown', e => {
+  keys.add(e.code);
+  if (e.code === 'Escape') closeCard();
+});
+addEventListener('keyup', e => keys.delete(e.code));
+
+const startEl = document.getElementById('start');
+document.getElementById('go').onclick = () => controls.lock();
+controls.addEventListener('lock', () => { startEl.style.display = 'none'; });
+controls.addEventListener('unlock', () => {
+  if (card.style.display !== 'block') startEl.style.display = 'flex';
+});
+
+function blocked(pos) {
+  const box = new THREE.Box3(
+    new THREE.Vector3(pos.x - RADIUS, 0.2, pos.z - RADIUS),
+    new THREE.Vector3(pos.x + RADIUS, H - 0.2, pos.z + RADIUS));
+  return colliders.some(c => c.intersectsBox(box));
+}
+
+function move(dt) {
+  const speed = (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 12 : 5.5) * dt;
+  let f = 0, s = 0;
+  if (keys.has('KeyW') || keys.has('ArrowUp')) f += 1;
+  if (keys.has('KeyS') || keys.has('ArrowDown')) f -= 1;
+  if (keys.has('KeyD') || keys.has('ArrowRight')) s += 1;
+  if (keys.has('KeyA') || keys.has('ArrowLeft')) s -= 1;
+  if (!f && !s) return;
+
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  dir.y = 0; dir.normalize();
+  const right = new THREE.Vector3().crossVectors(camera.up, dir).normalize().negate();
+  const step = dir.multiplyScalar(f).add(right.multiplyScalar(s)).normalize().multiplyScalar(speed);
+
+  // Оси проверяем раздельно — иначе игрок «залипает» в углах.
+  const p = camera.position;
+  const tryX = p.clone(); tryX.x += step.x;
+  if (!blocked(tryX)) p.x = tryX.x;
+  const tryZ = p.clone(); tryZ.z += step.z;
+  if (!blocked(tryZ)) p.z = tryZ.z;
+  p.y = EYE;
+}
+
+/* ---------- Наведение и клик ---------- */
+const ray = new THREE.Raycaster();
+const centre = new THREE.Vector2(0, 0);
+const lookEl = document.getElementById('look');
+let hovered = null;
+
+function pick() {
+  ray.setFromCamera(centre, camera);
+  const hit = ray.intersectObjects(clickable, false).find(h => h.distance < 14);
+  hovered = hit ? hit.object.userData.dep : null;
+  lookEl.textContent = hovered ? `${hovered.name} — ЛКМ` : '';
+}
+addEventListener('mousedown', e => {
+  if (e.button === 0 && hovered && controls.isLocked) openCard(hovered);
+});
+
+/* ---------- Карточка отдела ---------- */
+const card = document.getElementById('card');
+function openCard(dep) {
+  document.getElementById('c-title').textContent = dep.name;
+  document.getElementById('c-sub').textContent = dep.sub;
+  document.getElementById('c-note').textContent = dep.note ?? '';
+  document.getElementById('c-rows').innerHTML = dep.rows.map(([k, v]) => {
+    const [val, cls] = Array.isArray(v) ? v : [v, ''];
+    return `<tr><td>${k}</td><td class="${cls}">${val}</td></tr>`;
+  }).join('');
+  card.style.display = 'block';
+  controls.unlock();
+}
+window.closeCard = () => {
+  if (card.style.display !== 'block') return;
+  card.style.display = 'none';
+  controls.lock(); // возвращаем в дом, а не на стартовый экран
+};
+
+/* ---------- Живые данные радара, если экспорт лежит рядом ---------- */
+fetch('leads.json').then(r => r.ok ? r.json() : null).then(leads => {
+  if (!Array.isArray(leads)) return;
+  const hot = leads.filter(l => l.intent === 'HOT').length;
+  const sales = DEPARTMENTS.find(d => d.id === 'sales');
+  sales.rows[0][1] = leads.length;
+  sales.rows[1][1] = [String(hot), hot ? 'good' : ''];
+  document.getElementById('stat').textContent = `отделов: 6 · лидов из радара: ${leads.length}`;
+}).catch(() => {});
+
+/* ---------- Кадр ---------- */
+const clock = new THREE.Clock();
+const clockEl = document.getElementById('clock');
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (controls.isLocked) { move(dt); pick(); } else { lookEl.textContent = ''; }
+  clockEl.textContent = new Date().toLocaleTimeString('ru-RU');
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>
