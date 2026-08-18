@@ -9,7 +9,13 @@ description = "Автономный PC-агент: ядро (Rust) + руки/г
 [dependencies]
 # GUI: egui/eframe — immediate mode, собирается в тот же .exe, без Electron
 # и без WebView2 (это было бы +100 МБ рантайма и внешняя зависимость).
-eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
+# wgpu тут не «на вкус»: glow требует OpenGL 2.0+, которого нет на VM,
+# в RDP-сессии и на Windows Server — там окно открывается через DX12 (WARP).
+eframe = { version = "0.28", default-features = false, features = [
+  "glow",
+  "wgpu",
+  "default_fonts",
+] }
 egui = "0.28"
 
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +36,10 @@ log = "0.4"
 env_logger = "0.11"
 
 [target.'cfg(windows)'.dependencies]
+# egui-wgpu сам не включает ни одного бэкенда, поэтому DX12 включаем явно:
+# иначе wgpu пробует только Vulkan/GL, которых на машине без драйвера
+# видеокарты нет, а DX12 даёт хотя бы программный адаптер WARP.
+wgpu = { version = "0.20", default-features = false, features = ["dx12"] }
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_System_Threading",

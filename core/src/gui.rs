@@ -186,13 +186,14 @@ fn now() -> String {
 /// Никаких email-подтверждений и трёхэтапных идентификаций.
 pub fn consent_dialog(text: &str) -> bool {
     let accepted = Arc::new(AtomicBool::new(false));
+    let text_for_fallback = text.to_string();
     let flag = accepted.clone();
     let body = text.to_string();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([620.0, 420.0]),
         ..Default::default()
     };
-    let _ = eframe::run_simple_native("PC Agent — доступ", opts, move |ctx, _| {
+    let res = eframe::run_simple_native("PC Agent — доступ", opts, move |ctx, _| {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Разреши агенту работать на этом компьютере");
             ui.add_space(8.0);
@@ -209,5 +210,46 @@ pub fn consent_dialog(text: &str) -> bool {
             });
         });
     });
+    // Если egui не поднялся (нет GPU/сессии), спрашиваем нативным окном:
+    // иначе первый запуск молча закончился бы отказом в доступе.
+    if let Err(e) = res {
+        log::error!("окно согласия не открылось: {e}");
+        return confirm_native("PC Agent — доступ", &text_for_fallback);
+    }
     accepted.load(Ordering::Relaxed)
+}
+
+/// Окно ошибки без egui: используется как раз тогда, когда egui и не завёлся.
+pub fn error_dialog(text: &str) {
+    #[cfg(windows)]
+    message_box(
+        "PC Agent",
+        text,
+        windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+    );
+    #[cfg(not(windows))]
+    eprintln!("{text}");
+}
+
+/// Да/нет нативным окном.
+fn confirm_native(title: &str, text: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONQUESTION, MB_OKCANCEL};
+        message_box(title, text, MB_OKCANCEL | MB_ICONQUESTION) == IDOK
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title, text);
+        false
+    }
+}
+
+#[cfg(windows)]
+fn message_box(title: &str, text: &str, flags: u32) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW;
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let (t, b) = (wide(title), wide(text));
+    // SAFETY: обе строки живут до конца вызова и завершены нулём.
+    unsafe { MessageBoxW(std::ptr::null_mut(), b.as_ptr(), t.as_ptr(), flags) }
 }
