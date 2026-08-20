@@ -273,194 +273,142 @@ function dashboard(dep, x0, y, z0) {
 /* Объекты, которым нужен кадр: дерево света, чешуя и эквалайзер пульта. */
 const animated = [];
 
-/** Дерево света в центре чилаут-зоны: ствол, ветви и светящаяся крона.
-    Вокруг него можно обойти 360°, ветви подсвечены снизу двумя лампами. */
-function lightTree(x0, y, z0, hue) {
-  const bark = new THREE.MeshStandardMaterial({ color: 0x0e1a16, roughness: 0.75, metalness: 0.3,
-                                                emissive: new THREE.Color(hue), emissiveIntensity: 0.12 });
-  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.4, 3.2, 12), bark);
-  trunk.position.set(x0, y + 1.6, z0);
-  scene.add(trunk);
-  colliders.push(new THREE.Box3().setFromObject(trunk));
+/* Фотография вместо геометрии: дерево и чешуя — настоящие снимки, а вид
+   «точечной матрицы» даёт шейдер, как на баннере Prime Intellect. */
+const texLoader = new THREE.TextureLoader();
+const TEX = { tree: texLoader.load('tex/tree.jpg'), scales: texLoader.load('tex/scales.jpg') };
+TEX.tree.colorSpace = TEX.scales.colorSpace = THREE.SRGBColorSpace;
+TEX.scales.wrapS = TEX.scales.wrapT = THREE.RepeatWrapping;
+TEX.scales.repeat.set(2, 1);
 
-  // Ветви двумя ярусами по кругу — крона читается с любой стороны.
-  for (const [tier, count, len, tilt] of [[3.0, 7, 1.9, 0.85], [4.0, 5, 1.4, 0.6]]) {
-    for (let i = 0; i < count; i++) {
-      const a = (i / count) * Math.PI * 2 + tier;
-      const br = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.12, len, 8), bark);
-      br.position.set(x0 + Math.cos(a) * len * 0.35, y + tier + len * 0.3, z0 + Math.sin(a) * len * 0.35);
-      br.rotation.set(Math.sin(a) * tilt, 0, -Math.cos(a) * tilt);
-      scene.add(br);
-    }
-  }
+const DOT_VERT = `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }`;
 
-  /* Крона — пиксельная матрица: точки посажены на решётку с шагом DOT,
-     поэтому вблизи это россыпь квадратных «символов», а издалека —
-     дитерированный силуэт дерева. Куб вместо спрайта: объём сохраняется
-     при обходе вокруг, и рендер не зависит от поддержки gl_PointSize. */
-  const DOT = 0.26;
-  const cells = [];
-  const RX = 2.7, RY = 1.8, CY = 5.0;
-  for (let ix = -RX / DOT; ix <= RX / DOT; ix++) {
-    for (let iz = -RX / DOT; iz <= RX / DOT; iz++) {
-      for (let iy = (CY - RY) / DOT; iy <= (CY + RY) / DOT; iy++) {
-        const px = ix * DOT, pz = iz * DOT, py = iy * DOT;
-        const rr = (px * px + pz * pz) / (RX * RX) + ((py - CY) / RY) ** 2;
-        if (rr > 1) continue;
-        // Внутренность прореживаем сильнее оболочки: силуэт остаётся плотным,
-        // а сквозь крону просвечивают отдельные точки, как в dot-matrix.
-        if (Math.random() > 0.05 + 0.42 * rr * rr) continue;
-        cells.push([px, py, pz, Math.hypot(px, pz) + (py - CY) * 0.6, Math.random() * 6.283]);
-      }
-    }
-  }
-  const crown = new THREE.Group();
-  crown.position.set(x0, y, z0);
-  const leaf = new THREE.InstancedMesh(
-    new THREE.BoxGeometry(DOT * 0.42, DOT * 0.42, DOT * 0.42),
-    new THREE.MeshBasicMaterial({ toneMapped: false }),
-    cells.length);
-  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
-  const one = new THREE.Vector3(1, 1, 1), v = new THREE.Vector3();
-  cells.forEach(([px, py, pz], i) => {
-    m4.compose(v.set(px, py, pz), q, one);
-    leaf.setMatrixAt(i, m4);
+/* Кадр делится на клетки, в каждой берётся яркость фото и рисуется точка:
+   размер и цвет точки идут ступенями, по картинке бежит волна, а близость
+   камеры поднимает усиление — поэтому мозаика «играет» при движении. */
+const DOT_FRAG = `
+  uniform sampler2D uMap;
+  uniform vec3 uTint;
+  uniform float uTime, uCell, uGain, uWave, uProx, uCut;
+  uniform int uSquare;
+  varying vec2 vUv;
+  float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+  void main() {
+    vec2 grid = vec2(uCell, uCell);
+    vec2 cuv = (floor(vUv * grid) + 0.5) / grid;
+    vec3 src = texture2D(uMap, cuv).rgb;
+    float wave = 0.5 + 0.5 * sin(uTime * uWave - cuv.x * 7.0 + cuv.y * 2.5);
+    float lvl = clamp(lum(src) * uGain * (0.55 + 0.85 * wave) * (0.7 + 0.7 * uProx), 0.0, 1.4);
+    lvl = floor(lvl * 5.0) / 5.0;
+    if (lvl < uCut) discard;
+    vec2 f = fract(vUv * grid) - 0.5;
+    float d = uSquare == 1 ? max(abs(f.x), abs(f.y)) : length(f);
+    float r = 0.46 * sqrt(min(lvl, 1.0));
+    float mask = smoothstep(r, r - 0.12, d);
+    if (mask < 0.03) discard;
+    gl_FragColor = vec4(mix(src, uTint, 0.4) * (0.45 + 1.5 * lvl), mask * min(1.0, 0.35 + lvl));
+  }`;
+
+function dotMat(tex, o = {}) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uMap: { value: tex }, uTime: { value: 0 },
+      uCell: { value: o.cell ?? 140 }, uGain: { value: o.gain ?? 1.6 },
+      uWave: { value: o.wave ?? 0.9 }, uProx: { value: 0.5 },
+      uCut: { value: o.cut ?? 0.12 }, uSquare: { value: o.square ?? 0 },
+      uTint: { value: new THREE.Color(o.tint ?? 0x2affc0) }
+    },
+    vertexShader: DOT_VERT, fragmentShader: DOT_FRAG,
+    transparent: true, depthWrite: false, side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending, toneMapped: false
   });
-  crown.add(leaf);
-  scene.add(crown);
+}
 
-  /* Свет бежит по кроне волной и квантуется по ступеням яркости —
-     тот же приём, что даёт «печатный» вид пиксельной графики. */
-  const dark = new THREE.Color(hue).multiplyScalar(0.16);
-  const lit = new THREE.Color(hue).lerp(new THREE.Color(0xffffff), 0.35);
-  const c = new THREE.Color();
-  animated.push(t => {
-    crown.rotation.y = t * 0.05;
-    for (let i = 0; i < cells.length; i++) {
-      const w = 0.5 + 0.5 * Math.sin(t * 1.1 - cells[i][3] * 0.9)
-              + 0.18 * Math.sin(t * 2.7 + cells[i][4]);   // шум по точкам: матрица дышит
-      const step = Math.min(1, Math.max(0, Math.round(w * 4) / 4));
-      leaf.setColorAt(i, c.copy(dark).lerp(lit, step));
-    }
-    leaf.instanceColor.needsUpdate = true;
-  });
+/** Фото под точками: снимок виден настоящим деревом, матрица лежит сверху. */
+function softCard(tex, w, h, opacity) {
+  return new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity,
+                                  blending: THREE.AdditiveBlending,
+                                  depthWrite: false, toneMapped: false }));
+}
 
-  // Подсветка снизу + светящееся кольцо на полу.
-  const up = new THREE.PointLight(hue, 18, 13, 2);
+/** Дерево в центре зоны: фотография дерева с подсветкой, разложенная
+    шейдером в точечную матрицу. Билборд доворачивается к наблюдателю,
+    поэтому дерево читается настоящим при обходе на 360°. */
+function photoTree(x0, y, z0, hue, w = 8.4, h = 8.4) {
+  const mat = dotMat(TEX.tree, { cell: 170, gain: 1.75, wave: 0.8, tint: hue, cut: 0.11 });
+  const card = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  card.position.set(x0, y + h / 2 - 0.35, z0);
+  const soft = softCard(TEX.tree, w, h, 0.32);
+  soft.position.copy(card.position);
+  scene.add(soft, card);
+
+  // Ствол — невидимый коллайдер: сквозь дерево пройти нельзя.
+  colliders.push(new THREE.Box3().setFromCenterAndSize(
+    new THREE.Vector3(x0, y + 1.5, z0), new THREE.Vector3(1.1, 3, 1.1)));
+
+  const up = new THREE.PointLight(hue, 16, 13, 2);
   up.position.set(x0, y + 0.7, z0);
   scene.add(up);
-  const ring = new THREE.Mesh(new THREE.RingGeometry(1.6, 2.4, 48),
-    new THREE.MeshBasicMaterial({ color: hue, transparent: true, opacity: 0.22,
+  const ring = new THREE.Mesh(new THREE.RingGeometry(1.6, 2.6, 48),
+    new THREE.MeshBasicMaterial({ color: hue, transparent: true, opacity: 0.2,
                                   side: THREE.DoubleSide }));
   ring.rotation.x = -Math.PI / 2;
   ring.position.set(x0, y + 0.06, z0);
   scene.add(ring);
-  animated.push(t => { ring.material.opacity = 0.14 + 0.12 * Math.abs(Math.sin(t * 0.9)); });
-}
 
-/** Зелёная чешуя: сетка блестящих пластин-пикселей. По стене бежит
-    диагональная волна, пластины отгибаются, а яркость идёт ступенями —
-    получается пиксельный блеск, а не гладкий градиент. */
-function scaleWall(x, y, z0, hue) {
-  const COLS = 34, ROWS = 16, STEP = 0.42;
-  const geom = new THREE.PlaneGeometry(STEP * 0.72, STEP * 0.72);
-  const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, toneMapped: false });
-  const mesh = new THREE.InstancedMesh(geom, mat, COLS * ROWS);
-  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
-  const one = new THREE.Vector3(1, 1, 1);
-  const v = new THREE.Vector3(), c = new THREE.Color();
-  const dark = new THREE.Color(hue).multiplyScalar(0.14);
-  const lit = new THREE.Color(hue).lerp(new THREE.Color(0xffffff), 0.4);
-  const phase = [];
-  let i = 0;
-  for (let r = 0; r < ROWS; r++) {
-    for (let col = 0; col < COLS; col++) {
-      v.set(x, y + 1.1 + r * STEP, z0 - (COLS - 1) * STEP / 2 + col * STEP + (r % 2) * STEP / 2);
-      e.set(0, Math.PI / 2, 0);
-      m4.compose(v, q.setFromEuler(e), one);
-      mesh.setMatrixAt(i, m4);
-      phase.push([v.clone(), r * 0.42 + col * 0.3]);
-      i++;
-    }
-  }
-  scene.add(mesh);
   animated.push(t => {
-    for (let k = 0; k < phase.length; k++) {
-      const [p, ph] = phase[k];
-      const w = Math.sin(t * 1.6 - ph);
-      e.set(w * 0.3, Math.PI / 2, 0);
-      m4.compose(p, q.setFromEuler(e), one.set(1, 1, 1));
-      mesh.setMatrixAt(k, m4);
-      const step = Math.round((0.5 + 0.5 * w) * 4) / 4;
-      mesh.setColorAt(k, c.copy(dark).lerp(lit, step));
-    }
-    mesh.instanceMatrix.needsUpdate = true;
-    mesh.instanceColor.needsUpdate = true;
+    mat.uniforms.uTime.value = t;
+    const a = Math.atan2(camera.position.x - x0, camera.position.z - z0);
+    card.rotation.y = soft.rotation.y = a;
+    const d = camera.position.distanceTo(card.position);
+    const prox = THREE.MathUtils.clamp(1.7 - d / 11, 0.15, 1.2);
+    mat.uniforms.uProx.value = prox;
+    soft.material.opacity = 0.2 + 0.22 * prox;
+    ring.material.opacity = 0.12 + 0.12 * Math.abs(Math.sin(t * 0.9));
   });
 }
 
-/** Дальнее полотно: дерево, набранное символами на canvas, с бегущим
-    зелёным свечением. Стоит в глубине зоны и даёт ту самую картинку
-    «дерево далеко в темноте», которую видно из любой точки комнаты. */
-function asciiPanel(x0, y, z0, hue, w, h) {
-  const CW = 72, CH = 32, CELL = 16;
-  const cv = document.createElement('canvas');
-  cv.width = CW * CELL; cv.height = CH * CELL;
-  const g = cv.getContext('2d');
-  const glyphs = '·:+*#%@';
-  const col = new THREE.Color(hue);
-
-  // Плотность символа в клетке считаем один раз: ствол, крона и подлеска.
-  const mass = new Float32Array(CW * CH);
-  for (let cy = 0; cy < CH; cy++) {
-    for (let cx = 0; cx < CW; cx++) {
-      const nx = (cx - CW / 2) / (CW / 2), ny = cy / CH;
-      let m = 0;
-      // Крона шире и ниже центра, ствол узкий, внизу — полоса подлеска.
-      const crown = 1 - (nx * nx) / 0.5 - ((ny - 0.38) / 0.36) ** 2;
-      if (crown > 0) m = 0.45 + crown * 0.8;
-      if (Math.abs(nx) < 0.03 + ny * 0.03 && ny > 0.6 && ny < 0.92) m = Math.max(m, 1);
-      if (ny > 0.88) m = Math.max(m, 0.6 - (ny - 0.88) * 1.4);
-      mass[cy * CW + cx] = Math.max(0, m * (0.6 + Math.random() * 0.6));
-    }
-  }
-
-  const tex = new THREE.CanvasTexture(cv);
-  tex.minFilter = THREE.LinearFilter;
-  const panel = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
-    new THREE.MeshBasicMaterial({ map: tex, transparent: true, toneMapped: false,
-                                  side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
-                                  depthWrite: false }));
+/** Дальний план: то же дерево в глубине зоны — крупнее, тусклее и
+    крупной клеткой, поэтому в темноте оно читается как силуэт вдали. */
+function deepTree(x0, y, z0, hue, w, h) {
+  const mat = dotMat(TEX.tree, { cell: 96, gain: 1.25, wave: 0.55, tint: hue, cut: 0.16 });
+  const panel = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
   panel.position.set(x0, y + h / 2, z0);
-  scene.add(panel);
+  const soft = softCard(TEX.tree, w, h, 0.14);
+  soft.position.copy(panel.position);
+  scene.add(soft, panel);
+  animated.push(t => { mat.uniforms.uTime.value = t; });
+}
 
-  let last = -1;
+/** Зелёная чешуя: настоящий снимок блестящих пластин, разложенный той же
+    матрицей квадратными клетками. Чем ближе подходишь, тем ярче мозаика
+    и тем сильнее проступает само фото — стена играет на движение. */
+function scaleWall(x, y, z0, hue) {
+  const w = ROOM - 1.2, h = 6.4;
+  const mat = dotMat(TEX.scales, { cell: 58, gain: 1.5, wave: 1.4, tint: hue, square: 1, cut: 0.1 });
+  const grid = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  const base = softCard(TEX.scales, w, h, 0.3);
+  grid.position.set(x, y + 1.2 + h / 2, z0);
+  base.position.copy(grid.position);
+  grid.rotation.y = base.rotation.y = Math.PI / 2;
+  scene.add(base, grid);
   animated.push(t => {
-    if (t - last < 1 / 18) return;                 // 18 кадров в секунду — как у печатной матрицы
-    last = t;
-    g.clearRect(0, 0, cv.width, cv.height);
-    g.font = `${CELL}px monospace`;
-    g.textBaseline = 'top';
-    for (let cy = 0; cy < CH; cy++) {
-      for (let cx = 0; cx < CW; cx++) {
-        const m = mass[cy * CW + cx];
-        if (m < 0.12) continue;
-        // Диагональная волна света: слева тускло, справа вспышка.
-        const wave = 0.5 + 0.5 * Math.sin(t * 0.9 - cx * 0.12 + cy * 0.05);
-        const lvl = m * (0.45 + 1.15 * wave);
-        if (lvl < 0.16) continue;
-        const gi = Math.min(glyphs.length - 1, Math.floor(lvl * glyphs.length));
-        const a = Math.min(1, lvl * 2.2);
-        g.fillStyle = `rgba(${(col.r * 255) | 0},${(col.g * 255) | 0},${(col.b * 255) | 0},${a})`;
-        g.fillText(glyphs[gi], cx * CELL, cy * CELL);
-      }
-    }
-    tex.needsUpdate = true;
+    mat.uniforms.uTime.value = t;
+    const d = camera.position.distanceTo(grid.position);
+    const prox = THREE.MathUtils.clamp(1.6 - d / 10, 0.2, 1.3);
+    mat.uniforms.uProx.value = prox;
+    base.material.opacity = 0.16 + 0.3 * prox;
   });
 }
 
 /* Пульт с музыкой: короткий лоу-фай пэд на WebAudio, включается ЛКМ.
-   Файлов нет специально — страница остаётся статикой без ассетов. */
+   Файлов нет специально — звук синтезируется в браузере. */
 let audioCtx = null, musicGain = null, musicOn = false;
 function toggleMusic() {
   if (!audioCtx) {
@@ -529,6 +477,9 @@ function deck(dep, x0, y, z0) {
   sign.rotation.y = Math.PI / 4;
   scene.add(sign);
   animated.push(() => {
+    // Подпись развёрнута к наблюдателю: с обратной стороны она не висит пустой рамкой.
+    sign.rotation.y = Math.atan2(camera.position.x - sign.position.x,
+                                 camera.position.z - sign.position.z);
     if (sign.userData.on === musicOn) return;
     sign.userData.on = musicOn;
     sign.material.map.dispose();
@@ -585,8 +536,8 @@ function kitchen(x0, y, z0, hue) {
 
 function lounge(dep, x0, y, z0) {
   // Зелёный только у дерева и чешуи: стены остаются в общей мятно-циановой гамме.
-  lightTree(x0, y, z0, dep.green);
-  asciiPanel(x0, y + 0.7, z0 + HALF - WALL * 1.5, dep.green, 15, 6.6);
+  photoTree(x0, y, z0, dep.green);
+  deepTree(x0, y + 0.6, z0 + HALF - WALL * 1.5, dep.green, 15, 7.4);
   kitchen(x0 + HALF - 1.4, y, z0 - 0.5, dep.hue);
   scaleWall(x0 - HALF + WALL, y, z0, dep.green);
   deck(dep, x0 - 4.6, y, z0 - 4.6);
