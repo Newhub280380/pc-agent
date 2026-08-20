@@ -102,6 +102,10 @@
 <script type="module">
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { moduleByRoom, ROOT } from '../shared/modules.js';
 import { STATS, PRODUCTS, money } from '../shared/data.js';
 
@@ -173,27 +177,92 @@ for (const dep of DEPARTMENTS) dep.mod = moduleByRoom(dep.id);
 
 /* ---------- Сцена ---------- */
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x05070a);
-scene.fog = new THREE.Fog(0x05070a, 34, 130);
+scene.fog = new THREE.FogExp2(0x05080b, 0.011);
 
 const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.1, 400);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
+/* Фотореалистичный кадр: киношный тонмаппинг вместо линейного клиппинга,
+   мягкие тени и HDRI-окружение — свет и отражения берутся из панорамы,
+   поэтому металл, стекло и мокрый бетон выглядят снятыми, а не залитыми. */
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
+
+/* Материалы — фотосканы, а не цвета: бетон, глазурованная чешуя и вырезанные
+   по альфе снимки живой зелени. */
+const texLoader = new THREE.TextureLoader();
+const TEX = {
+  floor: texLoader.load('tex/floor.jpg', () => linkClones(TEX.floor)),
+  scales: texLoader.load('tex/scales.jpg', () => linkClones(TEX.scales)),
+  tree: texLoader.load('tex/tree.png'),
+  plant: texLoader.load('tex/plant.png')
+};
+for (const k of ['floor', 'scales', 'tree', 'plant']) TEX[k].colorSpace = THREE.SRGBColorSpace;
+for (const k of ['floor', 'scales']) {
+  TEX[k].wrapS = TEX[k].wrapT = THREE.RepeatWrapping;
+  TEX[k].anisotropy = 4;
+}
+
+/* Клон текстуры делается до окончания загрузки, поэтому картинку в клоны
+   надо перенести вручную — иначе материал остаётся без текстуры. */
+const texClones = new Map();
+function tiled(base, rx, ry) {
+  const t = base.clone();
+  t.repeat.set(rx, ry);
+  t.needsUpdate = true;
+  const list = texClones.get(base) ?? [];
+  list.push(t);
+  texClones.set(base, list);
+  if (base.image) linkClones(base);
+  return t;
+}
+function linkClones(base) {
+  for (const t of texClones.get(base) ?? []) {
+    t.image = base.image;
+    t.needsUpdate = true;
+  }
+}
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+texLoader.load('tex/env.jpg', tx => {
+  tx.mapping = THREE.EquirectangularReflectionMapping;
+  tx.colorSpace = THREE.SRGBColorSpace;
+  scene.environment = pmrem.fromEquirectangular(tx).texture;
+  scene.background = tx;
+  scene.backgroundIntensity = 0.5;
+  scene.environmentIntensity = 0.9;
+});
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+// Bloom только по ярким источникам: неон и подсветка растекаются как в кино.
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.38, 0.7, 0.85);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  bloom.setSize(innerWidth, innerHeight);
 });
 
-scene.add(new THREE.HemisphereLight(0x22323c, 0x06090c, 0.6));
+scene.add(new THREE.HemisphereLight(0x22323c, 0x06090c, 0.35));
 
 /* Плита этажа. Верхняя короче нижней: справа остаётся проём под лестницу. */
 function slab(y, x0, x1) {
   const w = x1 - x0, d = PLAN_Z * 2;
+  const map = tiled(TEX.floor, w / 3, d / 3);
   const m = new THREE.Mesh(new THREE.PlaneGeometry(w, d),
-    new THREE.MeshStandardMaterial({ color: 0x0b0f12, roughness: 0.85, metalness: 0.1 }));
+    new THREE.MeshStandardMaterial({ map, roughnessMap: map, bumpMap: map, bumpScale: 0.12,
+                                     color: 0x4c565c, roughness: 0.42,
+                                     metalness: 0.35, envMapIntensity: 0.9 }));
   m.rotation.x = -Math.PI / 2;
   m.position.set((x0 + x1) / 2, y, 0);
   scene.add(m);
@@ -233,8 +302,12 @@ const reactive = [];
 const REACT_FAR = 15, REACT_NEAR = 4;
 
 function wall(cx, y, cz, w, d, hue) {
+  // Бетон — фотоскан: у стены видны зерно и микротрещины, а свет отдела
+  // проступает через emissive, когда игрок подходит ближе.
+  const map = tiled(TEX.floor, Math.max(w, d) / 2.2, H / 2.2);
   const mat = new THREE.MeshStandardMaterial({
-    color: 0x0b1014, roughness: 0.85, metalness: 0.12,
+    map, roughnessMap: map, bumpMap: map, bumpScale: 0.5,
+    color: 0x20262b, roughness: 0.9, metalness: 0.1, envMapIntensity: 0.6,
     emissive: new THREE.Color(hue ?? 0x000000), emissiveIntensity: 0,
   });
   const m = new THREE.Mesh(new THREE.BoxGeometry(w, H, d), mat);
@@ -273,137 +346,134 @@ function dashboard(dep, x0, y, z0) {
 /* Объекты, которым нужен кадр: дерево света, чешуя и эквалайзер пульта. */
 const animated = [];
 
-/* Фотография вместо геометрии: дерево и чешуя — настоящие снимки, а вид
-   «точечной матрицы» даёт шейдер, как на баннере Prime Intellect. */
-const texLoader = new THREE.TextureLoader();
-const TEX = { tree: texLoader.load('tex/tree.jpg'), scales: texLoader.load('tex/scales.jpg') };
-TEX.tree.colorSpace = TEX.scales.colorSpace = THREE.SRGBColorSpace;
-TEX.scales.wrapS = TEX.scales.wrapT = THREE.RepeatWrapping;
-TEX.scales.repeat.set(2, 1);
+/* Мягкое пятно для тумана: радиальный градиент без краёв, поэтому дымка у
+   корней не читается прямоугольником. */
+const MIST_TEX = (() => {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const rad = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  rad.addColorStop(0, 'rgba(255,255,255,1)');
+  rad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = rad;
+  g.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
+})();
 
-const DOT_VERT = `
-  varying vec2 vUv;
-  void main() {
-    vUv = uv;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-  }`;
-
-/* Кадр делится на клетки, в каждой берётся яркость фото и рисуется точка:
-   размер и цвет точки идут ступенями, по картинке бежит волна, а близость
-   камеры поднимает усиление — поэтому мозаика «играет» при движении. */
-const DOT_FRAG = `
-  uniform sampler2D uMap;
-  uniform vec3 uTint;
-  uniform float uTime, uCell, uGain, uWave, uProx, uCut;
-  uniform int uSquare;
-  varying vec2 vUv;
-  float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
-  void main() {
-    vec2 grid = vec2(uCell, uCell);
-    vec2 cuv = (floor(vUv * grid) + 0.5) / grid;
-    vec3 src = texture2D(uMap, cuv).rgb;
-    float wave = 0.5 + 0.5 * sin(uTime * uWave - cuv.x * 7.0 + cuv.y * 2.5);
-    float lvl = clamp(lum(src) * uGain * (0.55 + 0.85 * wave) * (0.7 + 0.7 * uProx), 0.0, 1.4);
-    lvl = floor(lvl * 5.0) / 5.0;
-    if (lvl < uCut) discard;
-    vec2 f = fract(vUv * grid) - 0.5;
-    float d = uSquare == 1 ? max(abs(f.x), abs(f.y)) : length(f);
-    float r = 0.46 * sqrt(min(lvl, 1.0));
-    float mask = smoothstep(r, r - 0.12, d);
-    if (mask < 0.03) discard;
-    gl_FragColor = vec4(mix(src, uTint, 0.4) * (0.45 + 1.5 * lvl), mask * min(1.0, 0.35 + lvl));
-  }`;
-
-function dotMat(tex, o = {}) {
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      uMap: { value: tex }, uTime: { value: 0 },
-      uCell: { value: o.cell ?? 140 }, uGain: { value: o.gain ?? 1.6 },
-      uWave: { value: o.wave ?? 0.9 }, uProx: { value: 0.5 },
-      uCut: { value: o.cut ?? 0.12 }, uSquare: { value: o.square ?? 0 },
-      uTint: { value: new THREE.Color(o.tint ?? 0x2affc0) }
-    },
-    vertexShader: DOT_VERT, fragmentShader: DOT_FRAG,
-    transparent: true, depthWrite: false, side: THREE.DoubleSide,
-    blending: THREE.AdditiveBlending, toneMapped: false
+/** Живая зелень: снимок растения, вырезанный по альфе, стоит билбордом и
+    доворачивается к наблюдателю — на 360° куст читается настоящим, потому что
+    это фотография с настоящими листьями, а не набор плоскостей. */
+function foliage(tex, x0, y, z0, w, h, o = {}) {
+  const mat = new THREE.MeshStandardMaterial({
+    map: tex, transparent: true, alphaTest: 0.4,
+    roughness: 0.55, metalness: 0.0, envMapIntensity: 1.4,
+    emissive: new THREE.Color(o.glow ?? 0x000000),
+    emissiveMap: o.glow ? tex : null,
+    emissiveIntensity: o.glowPower ?? 0,
+    color: new THREE.Color(o.tint ?? 0xffffff),
+    side: THREE.DoubleSide, depthWrite: true
   });
-}
-
-/** Фото под точками: снимок виден настоящим деревом, матрица лежит сверху. */
-function softCard(tex, w, h, opacity) {
-  return new THREE.Mesh(new THREE.PlaneGeometry(w, h),
-    new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity,
-                                  blending: THREE.AdditiveBlending,
-                                  depthWrite: false, toneMapped: false }));
-}
-
-/** Дерево в центре зоны: фотография дерева с подсветкой, разложенная
-    шейдером в точечную матрицу. Билборд доворачивается к наблюдателю,
-    поэтому дерево читается настоящим при обходе на 360°. */
-function photoTree(x0, y, z0, hue, w = 8.4, h = 8.4) {
-  const mat = dotMat(TEX.tree, { cell: 170, gain: 1.75, wave: 0.8, tint: hue, cut: 0.11 });
   const card = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
-  card.position.set(x0, y + h / 2 - 0.35, z0);
-  const soft = softCard(TEX.tree, w, h, 0.32);
-  soft.position.copy(card.position);
-  scene.add(soft, card);
+  card.position.set(x0, y + h / 2 - (o.sink ?? 0), z0);
+  card.castShadow = false;
+  scene.add(card);
+  if (o.billboard !== false) {
+    animated.push(() => {
+      card.rotation.y = Math.atan2(camera.position.x - x0, camera.position.z - z0);
+    });
+  }
+  return { card, mat };
+}
+
+/** Дерево с подсветкой: фотография кроны и коры, снизу два прожектора и
+    туман по корням, вокруг — живые кусты. Свет от прожекторов уходит в HDRI
+    и отражается в мокром полу, поэтому дерево стоит в сцене, а не наклеено. */
+function realTree(x0, y, z0, hue, w = 13, h = 13) {
+  const { card, mat } = foliage(TEX.tree, x0, y, z0, w, h, {
+    glow: hue, glowPower: 0.18, sink: 0.4
+  });
 
   // Ствол — невидимый коллайдер: сквозь дерево пройти нельзя.
   colliders.push(new THREE.Box3().setFromCenterAndSize(
-    new THREE.Vector3(x0, y + 1.5, z0), new THREE.Vector3(1.1, 3, 1.1)));
+    new THREE.Vector3(x0, y + 1.5, z0), new THREE.Vector3(1.6, 3, 1.6)));
 
-  const up = new THREE.PointLight(hue, 16, 13, 2);
-  up.position.set(x0, y + 0.7, z0);
-  scene.add(up);
-  const ring = new THREE.Mesh(new THREE.RingGeometry(1.6, 2.6, 48),
-    new THREE.MeshBasicMaterial({ color: hue, transparent: true, opacity: 0.2,
-                                  side: THREE.DoubleSide }));
-  ring.rotation.x = -Math.PI / 2;
-  ring.position.set(x0, y + 0.06, z0);
-  scene.add(ring);
+  for (const dx of [-1.5, 1.5]) {
+    const sp = new THREE.SpotLight(0xbfffe6, 26, 20, 0.7, 0.6, 1.8);
+    sp.position.set(x0 + dx, y + 0.25, z0 + 0.6);
+    sp.target.position.set(x0, y + 7, z0);
+    scene.add(sp, sp.target);
+    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.11, 12, 12),
+      new THREE.MeshBasicMaterial({ color: 0xd8fff0 }));
+    bulb.position.copy(sp.position);
+    scene.add(bulb);
+  }
+
+  // Туман по корням: мягкие полупрозрачные карточки, подхватывают свет снизу.
+  const mist = [];
+  for (let i = 0; i < 5; i++) {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(7 - i * 0.6, 1.5),
+      new THREE.MeshBasicMaterial({ map: MIST_TEX, color: hue, transparent: true,
+                                    opacity: 0.05, depthWrite: false,
+                                    blending: THREE.AdditiveBlending }));
+    m.position.set(x0, y + 0.4 + i * 0.32, z0 + (i - 2) * 0.35);
+    scene.add(m);
+    mist.push(m);
+  }
+
+  // Подлесок вокруг ствола: настоящая трава и папоротник вместо декора.
+  const R = 3.4;
+  for (let i = 0; i < 7; i++) {
+    const a = i / 7 * Math.PI * 2 + 0.4;
+    foliage(TEX.plant, x0 + Math.cos(a) * R, y, z0 + Math.sin(a) * R,
+            3.4, 2.6, { glow: hue, glowPower: 0.05, sink: 0.3 });
+  }
 
   animated.push(t => {
-    mat.uniforms.uTime.value = t;
-    const a = Math.atan2(camera.position.x - x0, camera.position.z - z0);
-    card.rotation.y = soft.rotation.y = a;
     const d = camera.position.distanceTo(card.position);
-    const prox = THREE.MathUtils.clamp(1.7 - d / 11, 0.15, 1.2);
-    mat.uniforms.uProx.value = prox;
-    soft.material.opacity = 0.2 + 0.22 * prox;
-    ring.material.opacity = 0.12 + 0.12 * Math.abs(Math.sin(t * 0.9));
+    const prox = THREE.MathUtils.clamp(1.6 - d / 13, 0.2, 1.2);
+    mat.emissiveIntensity = 0.06 + 0.14 * prox;
+    mist.forEach((m, i) => {
+      m.rotation.y = Math.atan2(camera.position.x - x0, camera.position.z - z0);
+      m.material.opacity = 0.035 + 0.03 * Math.abs(Math.sin(t * 0.5 + i));
+    });
   });
 }
 
-/** Дальний план: то же дерево в глубине зоны — крупнее, тусклее и
-    крупной клеткой, поэтому в темноте оно читается как силуэт вдали. */
-function deepTree(x0, y, z0, hue, w, h) {
-  const mat = dotMat(TEX.tree, { cell: 96, gain: 1.25, wave: 0.55, tint: hue, cut: 0.16 });
-  const panel = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
-  panel.position.set(x0, y + h / 2, z0);
-  const soft = softCard(TEX.tree, w, h, 0.14);
-  soft.position.copy(panel.position);
-  scene.add(soft, panel);
-  animated.push(t => { mat.uniforms.uTime.value = t; });
+/** Дальний план: зелень в глубине зоны, тусклее и без реакции — глаз
+    достраивает по ней объём помещения. */
+function deepGreen(x0, y, z0, hue, w, h) {
+  foliage(TEX.plant, x0, y, z0, w, h,
+          { billboard: false, glow: hue, glowPower: 0.05, sink: 0.25 });
 }
 
-/** Зелёная чешуя: настоящий снимок блестящих пластин, разложенный той же
-    матрицей квадратными клетками. Чем ближе подходишь, тем ярче мозаика
-    и тем сильнее проступает само фото — стена играет на движение. */
+/** Зелёная чешуя: фотоскан глазурованных пластин как PBR-материал —
+    отражения берутся из HDRI, поэтому блики бегут по плиткам при каждом шаге,
+    а на подходе стена дополнительно разгорается изнутри. */
 function scaleWall(x, y, z0, hue) {
   const w = ROOM - 1.2, h = 6.4;
-  const mat = dotMat(TEX.scales, { cell: 58, gain: 1.5, wave: 1.4, tint: hue, square: 1, cut: 0.1 });
-  const grid = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
-  const base = softCard(TEX.scales, w, h, 0.3);
-  grid.position.set(x, y + 1.2 + h / 2, z0);
-  base.position.copy(grid.position);
-  grid.rotation.y = base.rotation.y = Math.PI / 2;
-  scene.add(base, grid);
+  const map = tiled(TEX.scales, 3, 2);
+  const mat = new THREE.MeshStandardMaterial({
+    map, bumpMap: map, bumpScale: 0.55,
+    roughness: 0.12, metalness: 0.35, envMapIntensity: 2.2,
+    emissive: new THREE.Color(hue), emissiveMap: map, emissiveIntensity: 0.08
+  });
+  const panel = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  panel.position.set(x, y + 1.2 + h / 2, z0);
+  panel.rotation.y = Math.PI / 2;
+  scene.add(panel);
+
+  // Скользящий световой блик: точечный свет ходит вдоль стены, поэтому
+  // мозаика «играет» настоящими отражениями, а не нарисованной волной.
+  const glint = new THREE.PointLight(0xd9fff0, 9, 11, 2);
+  scene.add(glint);
+
   animated.push(t => {
-    mat.uniforms.uTime.value = t;
-    const d = camera.position.distanceTo(grid.position);
-    const prox = THREE.MathUtils.clamp(1.6 - d / 10, 0.2, 1.3);
-    mat.uniforms.uProx.value = prox;
-    base.material.opacity = 0.16 + 0.3 * prox;
+    const d = camera.position.distanceTo(panel.position);
+    const prox = THREE.MathUtils.clamp(1.5 - d / 11, 0.15, 1.2);
+    mat.emissiveIntensity = 0.04 + 0.2 * prox;
+    glint.position.set(x + 1.4, y + 2.5 + 2.6 * (0.5 + 0.5 * Math.sin(t * 0.55)),
+                       z0 + Math.sin(t * 0.32) * (ROOM / 2 - 1.5));
+    glint.intensity = 8 + 10 * prox;
   });
 }
 
@@ -445,8 +515,9 @@ function deck(dep, x0, y, z0) {
     new THREE.MeshStandardMaterial({ color: 0x0b1216, roughness: 0.45, metalness: 0.7 }));
   body.position.set(x0, y + 0.5, z0);
   const top = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.08, 1.2),
-    new THREE.MeshStandardMaterial({ color: 0x0f1a1e, metalness: 0.9, roughness: 0.25,
-                                     emissive: new THREE.Color(hue), emissiveIntensity: 0.25 }));
+    new THREE.MeshStandardMaterial({ color: 0x0f1a1e, metalness: 0.9, roughness: 0.18,
+                                     envMapIntensity: 1.6,
+                                     emissive: new THREE.Color(hue), emissiveIntensity: 0.07 }));
   top.position.set(x0, y + 1.02, z0);
   scene.add(body, top);
   colliders.push(new THREE.Box3().setFromObject(body));
@@ -454,7 +525,8 @@ function deck(dep, x0, y, z0) {
   const bars = [];
   for (let i = 0; i < 9; i++) {
     const bar = new THREE.Mesh(new THREE.BoxGeometry(0.14, 1, 0.14),
-      new THREE.MeshBasicMaterial({ color: hue }));
+      new THREE.MeshStandardMaterial({ color: 0x08120f, roughness: 0.3, metalness: 0.6,
+                                       emissive: new THREE.Color(hue), emissiveIntensity: 1.1 }));
     bar.position.set(x0 - 1.0 + i * 0.25, y + 1.3, z0 - 0.2);
     scene.add(bar);
     bars.push(bar);
@@ -472,7 +544,7 @@ function deck(dep, x0, y, z0) {
   });
 
   const sign = label(musicLabel(), hue);
-  sign.scale.set(0.5, 0.5, 1);
+  sign.scale.set(0.34, 0.34, 1);
   sign.position.set(x0 + 0.2, y + 2.4, z0 + 0.2);
   sign.rotation.y = Math.PI / 4;
   scene.add(sign);
@@ -536,8 +608,11 @@ function kitchen(x0, y, z0, hue) {
 
 function lounge(dep, x0, y, z0) {
   // Зелёный только у дерева и чешуи: стены остаются в общей мятно-циановой гамме.
-  photoTree(x0, y, z0, dep.green);
-  deepTree(x0, y + 0.6, z0 + HALF - WALL * 1.5, dep.green, 15, 7.4);
+  realTree(x0, y, z0, dep.green);
+  // Зелень вдоль дальней стены: глубина зоны читается живыми кустами.
+  for (const dx of [-5.6, -1.9, 1.9, 5.6]) {
+    deepGreen(x0 + dx, y, z0 + HALF - WALL * 2, dep.green, 4.6, 3.4);
+  }
   kitchen(x0 + HALF - 1.4, y, z0 - 0.5, dep.hue);
   scaleWall(x0 - HALF + WALL, y, z0, dep.green);
   deck(dep, x0 - 4.6, y, z0 - 4.6);
@@ -558,16 +633,23 @@ function room(dep) {
 
   // Пол-подсветка отдела: видно, где стоишь, и куда идти дальше.
   const pad = new THREE.Mesh(new THREE.PlaneGeometry(ROOM - 1, ROOM - 1),
-    new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.07 }));
+    new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.04 }));
   pad.rotation.x = -Math.PI / 2;
   pad.position.set(x0, y + 0.05, z0);
   scene.add(pad);
 
   // В чилауте свет нейтральный: зелёный остаётся только у дерева и чешуи.
-  const lamp = new THREE.PointLight(dep.lounge ? 0xcfeee6 : dep.hue,
-                                    dep.lounge ? 26 : 46, ROOM * 1.6, 2);
+  const lamp = new THREE.PointLight(dep.lounge ? 0xf0efe9 : dep.hue,
+                                    dep.lounge ? 18 : 46, ROOM * 1.6, 2);
   lamp.position.set(x0, y + H - 1.2, z0);
   scene.add(lamp);
+  if (dep.lounge) {
+    // Тёплый контровой свет от кухни: стены получают перепад тона,
+    // иначе бетон читается ровной заливкой.
+    const warm = new THREE.PointLight(0xffd9a8, 16, ROOM, 2);
+    warm.position.set(x0 - HALF + 2.4, y + 2.6, z0 - 2.4);
+    scene.add(warm);
+  }
 
   // Терминал отдела — цель для клика. В чилауте центр занят деревом.
   const kx = dep.lounge ? x0 + 4.6 : x0, kz = dep.lounge ? z0 + 4.6 : z0;
@@ -577,9 +659,12 @@ function room(dep) {
   const legs = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.1, 1.4),
     new THREE.MeshStandardMaterial({ color: 0x090d10 }));
   legs.position.set(kx, y + 0.55, kz);
+  // Экран терминала — тёмное стекло с подсветкой, а не плоская заливка.
   const screen = new THREE.Mesh(new THREE.PlaneGeometry(3, 1.7),
-    new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.5,
-                                 side: THREE.DoubleSide }));
+    new THREE.MeshStandardMaterial({ color: 0x0a1418, roughness: 0.12, metalness: 0.8,
+                                     envMapIntensity: 1.4, side: THREE.DoubleSide,
+                                     emissive: new THREE.Color(dep.hue),
+                                     emissiveIntensity: 0.14 }));
   screen.position.set(kx, y + 2.1, kz);
   screen.rotation.x = -0.35;
   scene.add(kiosk, legs, screen);
@@ -742,8 +827,10 @@ function react() {
   for (const m of reactive) {
     const d = m.position.distanceTo(p);
     const k = THREE.MathUtils.clamp((REACT_FAR - d) / (REACT_FAR - REACT_NEAR), 0, 1);
-    m.material.emissiveIntensity = 0.55 * k * k;
-    m.material.color.setHex(0x0b1014).lerp(m.material.emissive, 0.22 * k);
+    // Мягко, чтобы бетон оставался бетоном: подсветка добавляется в тон,
+    // а не заливает стену ровным цветом.
+    m.material.emissiveIntensity = 0.16 * k * k;
+    m.material.color.setHex(0x2a3238).lerp(m.material.emissive, 0.1 * k);
   }
 }
 
@@ -823,7 +910,7 @@ function animate() {
   const t = clock.elapsedTime;
   for (const fn of animated) fn(t);
   clockEl.textContent = new Date().toLocaleTimeString('ru-RU');
-  renderer.render(scene, camera);
+  composer.render();
 }
 animate();
 
