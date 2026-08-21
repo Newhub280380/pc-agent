@@ -213,7 +213,6 @@ const texClones = new Map();
 function tiled(base, rx, ry) {
   const t = base.clone();
   t.repeat.set(rx, ry);
-  t.needsUpdate = true;
   const list = texClones.get(base) ?? [];
   list.push(t);
   texClones.set(base, list);
@@ -701,7 +700,11 @@ function room(dep) {
   scene.add(kiosk, legs, screen);
   colliders.push(new THREE.Box3().setFromObject(legs));
 
+  // Плашка уже проёма (DOOR): иначе её края срезают боковые стены и
+  // длинные названия читаются обрезанными из коридора.
   const tag = label(dep.name, dep.hue);
+  const tagK = (DOOR - 0.6) / 8;
+  tag.scale.set(tagK, tagK, 1);
   tag.position.set(x0, y + 3.9, z0 + doorSide * (HALF - 0.35));
   tag.rotation.y = doorSide === 1 ? 0 : Math.PI;
   scene.add(tag);
