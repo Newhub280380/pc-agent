@@ -264,6 +264,7 @@ function slab(y, x0, x1) {
                                      metalness: 0.35, envMapIntensity: 0.9 }));
   m.rotation.x = -Math.PI / 2;
   m.position.set((x0 + x1) / 2, y, 0);
+  m.receiveShadow = true;
   scene.add(m);
   const grid = new THREE.GridHelper(Math.max(w, d), Math.max(w, d) / 2, 0x113033, 0x0a1a1c);
   grid.position.set((x0 + x1) / 2, y + 0.02, 0);
@@ -431,6 +432,13 @@ function realTree(x0, y, z0, hue) {
     const sp = new THREE.SpotLight(0xffeccd, 22, 20, 0.62, 0.7, 1.9);
     sp.position.set(x0 + dx, y + 0.25, z0 + 0.6);
     sp.target.position.set(x0, y + 7, z0);
+    // Без castShadow карта теней не считается вовсе, и подсветка выглядит
+    // наклейкой: дерево не отбрасывает тень на пол и на подлесок.
+    sp.castShadow = true;
+    sp.shadow.mapSize.set(1024, 1024);
+    sp.shadow.bias = -0.0015;
+    sp.shadow.camera.near = 0.5;
+    sp.shadow.camera.far = 22;
     scene.add(sp, sp.target);
     const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.11, 12, 12),
       new THREE.MeshBasicMaterial({ color: 0xffeedd }));
