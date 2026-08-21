@@ -23,7 +23,7 @@ export const MODULES = [
   { id: 'card',      room: 'reception',  path: 'card/',
     name: 'BUSINESS CARD',   short: 'Визитка и профиль',
     desc: 'цифровая визитка, шапка профиля Instagram и ссылки для bio' },
-  { id: 'fx',        room: null,         path: 'fx/',
+  { id: 'fx',        room: 'chill',      path: 'fx/',
     name: 'FX SERIES_01',    short: 'FX-визуал',
     desc: 'рекламный визуал продукта: неон, вращение, запись webm' },
 ];
