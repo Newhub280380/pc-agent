@@ -1,0 +1,21 @@
+{
+  "niche": "косметика",
+  "keywords": ["косметолог", "филлер", "beauty", "cosmetic", "инъекц"],
+  "markers": ["цена", "заказ", "доставка", "каспи", "kaspi", "курьер", "рассрочка", "прайс", "запись"],
+  "geo": {
+    "lat": 43.238949,
+    "lon": 76.889709,
+    "radius_m": 5000,
+    "city": "Алматы"
+  },
+  "sources": [
+    {
+      "kind": "overpass",
+      "tags": ["shop=beauty", "shop=cosmetics", "amenity=pharmacy", "healthcare=clinic"]
+    },
+    {
+      "kind": "two_gis"
+    }
+  ],
+  "hot_threshold": 2
+}

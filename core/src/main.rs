@@ -19,6 +19,7 @@ mod gui;
 mod llm;
 mod memory;
 mod platform;
+mod radar;
 mod retry;
 mod sandbox;
 mod supervisor;
@@ -55,6 +56,9 @@ fn main() -> Result<()> {
     }
     if let Some(path) = flag_value(&args, "--shot") {
         return shot(std::path::Path::new(&path));
+    }
+    if let Some(path) = flag_value(&args, "--radar") {
+        return radar_scan(std::path::Path::new(&path), &args);
     }
 
     let paths = config::Paths::resolve()?;
@@ -403,6 +407,33 @@ fn shot(path: &std::path::Path) -> Result<()> {
     }
     std::fs::write(path, &s.png)?;
     println!("{}x{} -> {}", s.width, s.height, path.display());
+    Ok(())
+}
+
+/// Разовый прогон RADAR без GUI: `pcagent.exe --radar radar.json [--out leads.json]`.
+/// Отдельный режим, а не действие агента, потому что это долгая пакетная
+/// работа с сетью — её гоняют по расписанию, а не в диалоге.
+fn radar_scan(cfg_path: &std::path::Path, args: &[String]) -> Result<()> {
+    let paths = config::Paths::resolve()?;
+    init_logging(&paths.logs);
+    let layers = config::Layers::load(&paths)?;
+    let cfg = radar::config::RadarConfig::load(cfg_path)?;
+    let db = paths.root.join("radar.db");
+    let out = flag_value(args, "--out").map(std::path::PathBuf::from);
+    let report = radar::run(&cfg, &db, layers.get("TWOGIS_API_KEY"), out.as_deref())?;
+    let text = format!(
+        "radar «{}» ({} м вокруг {:.5},{:.5}): {}\nбаза: {}{}",
+        cfg.niche,
+        cfg.geo.radius_m,
+        cfg.geo.lat,
+        cfg.geo.lon,
+        report.summary(),
+        db.display(),
+        out.map(|p| format!("\njson: {}", p.display()))
+            .unwrap_or_default()
+    );
+    log::info!("{text}");
+    println!("{text}");
     Ok(())
 }
 
