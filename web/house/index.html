@@ -283,9 +283,14 @@ function label(text, color) {
   g.strokeStyle = '#' + color.toString(16).padStart(6, '0');
   g.lineWidth = 6; g.strokeRect(3, 3, 506, 122);
   g.fillStyle = g.strokeStyle;
-  g.font = 'bold 52px "Segoe UI", sans-serif';
+  // Кегль подбираем под длину строки: длинные подписи иначе срезались рамкой.
+  let size = 52;
+  do {
+    g.font = `bold ${size}px "Segoe UI", sans-serif`;
+    size -= 2;
+  } while (size > 20 && g.measureText(text).width > 470);
   g.textAlign = 'center'; g.textBaseline = 'middle';
-  g.fillText(text, 256, 68);
+  g.fillText(text, 256, 68, 470);
   const tex = new THREE.CanvasTexture(c);
   tex.anisotropy = 4;
   return new THREE.Mesh(new THREE.PlaneGeometry(8, 2),
