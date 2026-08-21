@@ -106,6 +106,8 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { moduleByRoom, ROOT } from '../shared/modules.js';
 import { STATS, PRODUCTS, money } from '../shared/data.js';
 
@@ -197,11 +199,9 @@ document.body.appendChild(renderer.domElement);
 const texLoader = new THREE.TextureLoader();
 const TEX = {
   floor: texLoader.load('tex/floor.jpg', () => linkClones(TEX.floor)),
-  scales: texLoader.load('tex/scales.jpg', () => linkClones(TEX.scales)),
-  tree: texLoader.load('tex/tree.png'),
-  plant: texLoader.load('tex/plant.png')
+  scales: texLoader.load('tex/scales.jpg', () => linkClones(TEX.scales))
 };
-for (const k of ['floor', 'scales', 'tree', 'plant']) TEX[k].colorSpace = THREE.SRGBColorSpace;
+for (const k of ['floor', 'scales']) TEX[k].colorSpace = THREE.SRGBColorSpace;
 for (const k of ['floor', 'scales']) {
   TEX[k].wrapS = TEX[k].wrapT = THREE.RepeatWrapping;
   TEX[k].anisotropy = 4;
@@ -360,50 +360,76 @@ const MIST_TEX = (() => {
   return new THREE.CanvasTexture(c);
 })();
 
-/** Живая зелень: снимок растения, вырезанный по альфе, стоит билбордом и
-    доворачивается к наблюдателю — на 360° куст читается настоящим, потому что
-    это фотография с настоящими листьями, а не набор плоскостей. */
-function foliage(tex, x0, y, z0, w, h, o = {}) {
-  const mat = new THREE.MeshStandardMaterial({
-    map: tex, transparent: true, alphaTest: 0.4,
-    roughness: 0.55, metalness: 0.0, envMapIntensity: 1.4,
-    emissive: new THREE.Color(o.glow ?? 0x000000),
-    emissiveMap: o.glow ? tex : null,
-    emissiveIntensity: o.glowPower ?? 0,
-    color: new THREE.Color(o.tint ?? 0xffffff),
-    side: THREE.DoubleSide, depthWrite: true
-  });
-  const card = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
-  card.position.set(x0, y + h / 2 - (o.sink ?? 0), z0);
-  card.castShadow = false;
-  scene.add(card);
-  if (o.billboard !== false) {
-    animated.push(() => {
-      card.rotation.y = Math.atan2(camera.position.x - x0, camera.position.z - z0);
-    });
+/* Зелень — сканы настоящих растений (Poly Haven, CC0): объёмная геометрия
+   ствола и листьев вместо плоских карточек, поэтому крона перекрывает сама
+   себя и обходится на 360° без «доворота» к камере. Геометрия сжата Draco,
+   текстуры — webp, поэтому дерево весит мегабайты, а не десятки. */
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://unpkg.com/three@0.160.0/examples/jsm/libs/draco/gltf/');
+const gltfLoader = new GLTFLoader();
+gltfLoader.setDRACOLoader(dracoLoader);
+
+const modelCache = new Map();
+function loadModel(name) {
+  if (!modelCache.has(name)) {
+    modelCache.set(name, new Promise((res, rej) =>
+      gltfLoader.load(`models/${name}.glb`, g => res(g.scene), undefined, rej)));
   }
-  return { card, mat };
+  return modelCache.get(name);
 }
 
-/** Дерево с подсветкой: фотография кроны и коры, снизу два прожектора и
-    туман по корням, вокруг — живые кусты. Свет от прожекторов уходит в HDRI
-    и отражается в мокром полу, поэтому дерево стоит в сцене, а не наклеено. */
-function realTree(x0, y, z0, hue, w = 13, h = 13) {
-  const { card, mat } = foliage(TEX.tree, x0, y, z0, w, h, {
-    glow: hue, glowPower: 0.18, sink: 0.4
+/** Ставит скан в сцену: высота подгоняется под кадр по реальному боксу
+    модели, листва получает двусторонние материалы и отклик на HDRI. */
+function plant(name, x0, y, z0, height, o = {}) {
+  const holder = new THREE.Group();
+  holder.position.set(x0, y, z0);
+  holder.rotation.y = o.spin ?? Math.random() * Math.PI * 2;
+  scene.add(holder);
+
+  loadModel(name).then(src => {
+    const obj = src.clone(true);
+    const box = new THREE.Box3().setFromObject(obj);
+    const k = height / Math.max(box.max.y - box.min.y, 1e-3);
+    obj.scale.setScalar(k);
+    obj.position.y = -box.min.y * k - (o.sink ?? 0);
+    obj.traverse(m => {
+      if (!m.isMesh) return;
+      m.castShadow = m.receiveShadow = o.shadow !== false;
+      m.material = m.material.clone();
+      // Листья в сканах — тонкие полигоны: без DoubleSide половина кроны
+      // пропадает, стоит зайти за дерево.
+      m.material.side = THREE.DoubleSide;
+      m.material.envMapIntensity = 1.2;
+      if (o.glow) {
+        m.material.emissive = new THREE.Color(o.glow);
+        m.material.emissiveMap = m.material.map;
+        m.material.emissiveIntensity = o.glowPower ?? 0.05;
+        o.lit?.push(m.material);
+      }
+    });
+    holder.add(obj);
   });
+  return holder;
+}
+
+/** Дерево с подсветкой: скан настоящего дерева, снизу два прожектора,
+    туман по корням, мшистые камни и подлесок из папоротника и кустов.
+    Свет уходит в HDRI и отражается в полу — дерево стоит в сцене. */
+function realTree(x0, y, z0, hue) {
+  plant('island_tree_02', x0, y, z0, 7.4, { spin: 0.7 });
 
   // Ствол — невидимый коллайдер: сквозь дерево пройти нельзя.
   colliders.push(new THREE.Box3().setFromCenterAndSize(
     new THREE.Vector3(x0, y + 1.5, z0), new THREE.Vector3(1.6, 3, 1.6)));
 
+  // Свет тёплый и белый: зелень должна быть зелёной от листьев, а не от лампы.
   for (const dx of [-1.5, 1.5]) {
-    const sp = new THREE.SpotLight(0xbfffe6, 26, 20, 0.7, 0.6, 1.8);
+    const sp = new THREE.SpotLight(0xffeccd, 22, 20, 0.62, 0.7, 1.9);
     sp.position.set(x0 + dx, y + 0.25, z0 + 0.6);
     sp.target.position.set(x0, y + 7, z0);
     scene.add(sp, sp.target);
     const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.11, 12, 12),
-      new THREE.MeshBasicMaterial({ color: 0xd8fff0 }));
+      new THREE.MeshBasicMaterial({ color: 0xffeedd }));
     bulb.position.copy(sp.position);
     scene.add(bulb);
   }
@@ -420,18 +446,17 @@ function realTree(x0, y, z0, hue, w = 13, h = 13) {
     mist.push(m);
   }
 
-  // Подлесок вокруг ствола: настоящая трава и папоротник вместо декора.
-  const R = 3.4;
-  for (let i = 0; i < 7; i++) {
-    const a = i / 7 * Math.PI * 2 + 0.4;
-    foliage(TEX.plant, x0 + Math.cos(a) * R, y, z0 + Math.sin(a) * R,
-            3.4, 2.6, { glow: hue, glowPower: 0.05, sink: 0.3 });
+  // Подлесок и камни у корней: сканы папоротника, кустов и мшистых валунов.
+  for (let i = 0; i < 8; i++) {
+    const a = i / 8 * Math.PI * 2 + 0.4;
+    const r = 3.2 + (i % 3) * 0.5;
+    const px = x0 + Math.cos(a) * r, pz = z0 + Math.sin(a) * r;
+    plant(i % 2 ? 'fern_02' : 'shrub_04', px, y, pz, i % 2 ? 0.85 : 0.7,
+          { sink: 0.05 });
+    if (i % 3 === 0) plant('rock_moss_set_01', (px + x0) / 2, y, (pz + z0) / 2, 0.7);
   }
 
   animated.push(t => {
-    const d = camera.position.distanceTo(card.position);
-    const prox = THREE.MathUtils.clamp(1.6 - d / 13, 0.2, 1.2);
-    mat.emissiveIntensity = 0.06 + 0.14 * prox;
     mist.forEach((m, i) => {
       m.rotation.y = Math.atan2(camera.position.x - x0, camera.position.z - z0);
       m.material.opacity = 0.035 + 0.03 * Math.abs(Math.sin(t * 0.5 + i));
@@ -439,11 +464,10 @@ function realTree(x0, y, z0, hue, w = 13, h = 13) {
   });
 }
 
-/** Дальний план: зелень в глубине зоны, тусклее и без реакции — глаз
-    достраивает по ней объём помещения. */
-function deepGreen(x0, y, z0, hue, w, h) {
-  foliage(TEX.plant, x0, y, z0, w, h,
-          { billboard: false, glow: hue, glowPower: 0.05, sink: 0.25 });
+/** Дальний план: зелень в глубине зоны — комнатное дерево и кусты, тусклее
+    и без реакции, глаз достраивает по ним объём помещения. */
+function deepGreen(x0, y, z0, height) {
+  plant(height > 2 ? 'pachira_aquatica_01' : 'shrub_04', x0, y, z0, height);
 }
 
 /** Зелёная чешуя: фотоскан глазурованных пластин как PBR-материал —
@@ -470,7 +494,7 @@ function scaleWall(x, y, z0, hue) {
   animated.push(t => {
     const d = camera.position.distanceTo(panel.position);
     const prox = THREE.MathUtils.clamp(1.5 - d / 11, 0.15, 1.2);
-    mat.emissiveIntensity = 0.04 + 0.2 * prox;
+    mat.emissiveIntensity = 0.02 + 0.08 * prox;
     glint.position.set(x + 1.4, y + 2.5 + 2.6 * (0.5 + 0.5 * Math.sin(t * 0.55)),
                        z0 + Math.sin(t * 0.32) * (ROOM / 2 - 1.5));
     glint.intensity = 8 + 10 * prox;
@@ -544,8 +568,8 @@ function deck(dep, x0, y, z0) {
   });
 
   const sign = label(musicLabel(), hue);
-  sign.scale.set(0.34, 0.34, 1);
-  sign.position.set(x0 + 0.2, y + 2.4, z0 + 0.2);
+  sign.scale.set(0.16, 0.16, 1);
+  sign.position.set(x0 + 0.2, y + 1.6, z0 + 0.2);
   sign.rotation.y = Math.PI / 4;
   scene.add(sign);
   animated.push(() => {
@@ -610,8 +634,8 @@ function lounge(dep, x0, y, z0) {
   // Зелёный только у дерева и чешуи: стены остаются в общей мятно-циановой гамме.
   realTree(x0, y, z0, dep.green);
   // Зелень вдоль дальней стены: глубина зоны читается живыми кустами.
-  for (const dx of [-5.6, -1.9, 1.9, 5.6]) {
-    deepGreen(x0 + dx, y, z0 + HALF - WALL * 2, dep.green, 4.6, 3.4);
+  for (const [dx, h] of [[-5.9, 3.1], [-2.4, 1.2], [2.2, 1.4], [5.7, 2.9]]) {
+    deepGreen(x0 + dx, y, z0 + HALF - WALL * 2.2, h);
   }
   kitchen(x0 + HALF - 1.4, y, z0 - 0.5, dep.hue);
   scaleWall(x0 - HALF + WALL, y, z0, dep.green);
@@ -632,8 +656,10 @@ function room(dep) {
   wall(x0 + (DOOR / 2 + side / 2), y, z0 + doorSide * HALF, side, WALL, dep.hue);
 
   // Пол-подсветка отдела: видно, где стоишь, и куда идти дальше.
+  // В чилауте её нет — иначе пол под зеленью уходит в цветную заливку.
   const pad = new THREE.Mesh(new THREE.PlaneGeometry(ROOM - 1, ROOM - 1),
-    new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true, opacity: 0.04 }));
+    new THREE.MeshBasicMaterial({ color: dep.hue, transparent: true,
+                                  opacity: dep.lounge ? 0 : 0.04 }));
   pad.rotation.x = -Math.PI / 2;
   pad.position.set(x0, y + 0.05, z0);
   scene.add(pad);
