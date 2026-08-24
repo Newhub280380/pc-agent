@@ -331,7 +331,11 @@ impl Layers {
                 None => continue,
             };
             let base = self.get(spec.2).unwrap_or_else(|| spec.3.to_string());
-            let explicit = named.as_deref() == Some(name) || priority.iter().any(|p| p == name);
+            // Роутер считает шлюз выбранным и по своему BASE_URL, поэтому
+            // диагностика обязана называть того же провайдера.
+            let explicit = named.as_deref() == Some(name)
+                || priority.iter().any(|p| p == name)
+                || self.get(spec.2).is_some();
             // У названного провайдера ключ можно задать и общим "api_key" из
             // config.json — роутер понимает оба варианта, диагностика тоже.
             let key = self.get_with_source(spec.1).or_else(|| {
@@ -673,6 +677,17 @@ mod tests {
         .unwrap();
         let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
         assert_eq!(s.model, "stepfun/step-3.7-flash:free");
+
+        // Один KILO_BASE_URL роутер тоже считает выбором шлюза.
+        let dir = tmp("kilobase");
+        std::fs::write(
+            dir.join(".env"),
+            "KILO_BASE_URL=https://api.kilo.ai/api/gateway\n",
+        )
+        .unwrap();
+        let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
+        assert_eq!(s.provider, "kilo");
+        assert_eq!(s.model, "kilo-auto/free");
     }
 
     #[test]
