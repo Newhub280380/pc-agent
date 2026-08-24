@@ -82,6 +82,70 @@ func TestYoutoriaProviderFromKeyAlone(t *testing.T) {
 	}
 }
 
+func TestKiloGatewayWithoutKeyNeedsExplicitRequest(t *testing.T) {
+	// Без просьбы бесплатный шлюз не подключается: чужие запросы не должны
+	// молча уходить на сторонний сервис.
+	cfg, err := Load(writeEnv(t, "OPENAI_API_KEY=sk-o\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range cfg.Providers {
+		if p.Name == "kilo" {
+			t.Fatalf("kilo подключился без просьбы: %+v", cfg.Providers)
+		}
+	}
+
+	cfg, err = Load(writeEnv(t, "LLM_PROVIDER=kilo\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Providers) != 1 {
+		t.Fatalf("ожидался только kilo: %+v", cfg.Providers)
+	}
+	p := cfg.Providers[0]
+	if p.BaseURL != "https://api.kilo.ai/api/gateway" || p.APIKey != "" {
+		t.Fatalf("kilo настроен неверно: %+v", p)
+	}
+	if p.Model != "kilo-auto/free" {
+		t.Fatalf("без ключа нужна бесплатная модель, получено %q", p.Model)
+	}
+	// Бесплатный уровень отвергает картинки, поэтому шаги со скриншотом
+	// должны обходить его стороной, а не падать на 400.
+	if p.Vision {
+		t.Fatalf("бесплатный уровень не умеет vision: %+v", p)
+	}
+
+	cfg, err = Load(writeEnv(t, "KILO_API_KEY=sk-k\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers[0].Model != "kilo-auto/frontier" || !cfg.Providers[0].Vision {
+		t.Fatalf("с ключом ожидался frontier с vision: %+v", cfg.Providers[0])
+	}
+
+	// Явная модель важнее подстановок в обе стороны.
+	cfg, err = Load(writeEnv(t, "LLM_PROVIDER=kilo\nKILO_MODEL=stepfun/step-3.7-flash:free\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers[0].Model != "stepfun/step-3.7-flash:free" {
+		t.Fatalf("KILO_MODEL проигнорирован: %+v", cfg.Providers[0])
+	}
+}
+
+func TestKiloThroughGenericLLMBlockKeepsGatewayModel(t *testing.T) {
+	// Тот же шлюз, заданный общими LLM_*: подставлять gpt-4o нельзя —
+	// у шлюза такой модели нет, запрос вернул бы ошибку модели.
+	cfg, err := Load(writeEnv(t, "LLM_PROVIDER=kilo\nLLM_BASE_URL=https://api.kilo.ai/api/gateway\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := cfg.Providers[0]
+	if p.Name != "kilo" || p.Model != "kilo-auto/free" || p.Vision {
+		t.Fatalf("kilo через LLM_* настроен неверно: %+v", p)
+	}
+}
+
 func TestGenericLLMBlockConfiguresAnyProvider(t *testing.T) {
 	// Главный сценарий бага: провайдера нет в таблице, задан только LLM_*.
 	cfg, err := Load(writeEnv(t, `

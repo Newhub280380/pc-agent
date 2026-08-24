@@ -117,10 +117,12 @@ impl RadarConfig {
 mod tests {
     use super::*;
 
-    fn write(body: &str) -> std::path::PathBuf {
+    // name делает файл своим у каждого теста: общий radar.json тесты
+    // перезаписывали друг у друга и падали при параллельном запуске.
+    fn write(name: &str, body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("radar-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("radar.json");
+        let p = dir.join(format!("{name}.json"));
         std::fs::write(&p, body).unwrap();
         p
     }
@@ -128,6 +130,7 @@ mod tests {
     #[test]
     fn loads_and_applies_defaults() {
         let p = write(
+            "defaults",
             r#"{"niche":"косметика","keywords":["филлеры"],
                 "geo":{"lat":43.238949,"lon":76.889709,"radius_m":3000},
                 "sources":[{"kind":"overpass","tags":["shop=beauty"]}]}"#,
@@ -140,6 +143,7 @@ mod tests {
     #[test]
     fn empty_keywords_are_rejected() {
         let p = write(
+            "empty-keywords",
             r#"{"niche":"x","keywords":[],"geo":{"lat":0.0,"lon":0.0,"radius_m":100},
                 "sources":[{"kind":"overpass","tags":["shop=beauty"]}]}"#,
         );
@@ -150,6 +154,7 @@ mod tests {
     #[test]
     fn insane_radius_is_rejected() {
         let p = write(
+            "radius",
             r#"{"niche":"x","keywords":["a"],"geo":{"lat":0.0,"lon":0.0,"radius_m":900000},
                 "sources":[{"kind":"overpass","tags":["shop=beauty"]}]}"#,
         );
