@@ -64,9 +64,38 @@ var providerSpecs = []struct {
 	{"qwen", "openai", "QWEN_API_KEY", "QWEN_MODEL", "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "qwen-vl-max", true},
 	{"openrouter", "openai", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1", "qwen/qwen2.5-vl-72b-instruct", true},
 	{"youtoria", "openai", "YOUTORIA_API_KEY", "YOUTORIA_MODEL", "YOUTORIA_BASE_URL", "https://api.youtoria.ai/v1", "gpt-4o", true},
+	// kilo: OpenAI-совместимый шлюз Kilo. Бесплатные модели отвечают без ключа,
+	// платные требуют его, поэтому провайдер активен и с пустым KILO_API_KEY.
+	{"kilo", "openai", "KILO_API_KEY", "KILO_MODEL", "KILO_BASE_URL", "https://api.kilo.ai/api/gateway", "kilo-auto/frontier", true},
 	// local: llama.cpp / LM Studio / Ollama в OpenAI-совместимом режиме.
 	// Ключ не обязателен, поэтому активируется наличием LOCAL_BASE_URL.
 	{"local", "openai", "LOCAL_API_KEY", "LOCAL_MODEL", "LOCAL_BASE_URL", "", "qwen2.5-vl-7b", true},
+}
+
+// keyless — провайдеры, которые отвечают без API-ключа: локальные серверы и
+// бесплатный уровень Kilo. Остальных без ключа включать бессмысленно: первый
+// же запрос вернул бы 401.
+func keyless(name string) bool {
+	return name == "local" || name == "kilo"
+}
+
+// defaultModel: без ключа шлюз Kilo отдаёт только бесплатные модели — просить
+// у него платный frontier значит гарантированно получить 401.
+func defaultModel(name, key, def string) string {
+	if name == "kilo" && key == "" {
+		return "kilo-auto/free"
+	}
+	return def
+}
+
+// visionOK: бесплатный уровень Kilo картинки не принимает (проверка шлюза дала
+// 400 на image_url и 429 на лимитах), поэтому шаги со скриншотом должны уходить
+// другому провайдеру, а не падать на явной ошибке.
+func visionOK(name, key string, def bool) bool {
+	if name == "kilo" && key == "" {
+		return false
+	}
+	return def
 }
 
 // checkLoopback не даёт роутеру с чужими API-ключами уехать в локальную сеть.
@@ -124,6 +153,14 @@ func Load(envPath string) (*Config, error) {
 	for i, n := range splitList(get("LLM_PRIORITY")) {
 		prio[n] = i
 	}
+	// Кого человек назвал сам — по имени провайдера или через приоритет.
+	prioNames := map[string]bool{}
+	for n := range prio {
+		prioNames[n] = true
+	}
+	if n := strings.ToLower(get("LLM_PROVIDER")); n != "" {
+		prioNames[n] = true
+	}
 
 	// Любой OpenAI-совместимый сервис одним набором LLM_*: без этого
 	// провайдера, которого нет в таблице, подключить было невозможно —
@@ -136,11 +173,16 @@ func Load(envPath string) (*Config, error) {
 		case "anthropic", "gemini":
 			kind = name
 		}
-		if base == "" {
-			// Имя без адреса имеет смысл только для известного провайдера.
-			for _, s := range providerSpecs {
-				if s.name == name {
-					base, kind = s.defaultBase, s.kind
+		// Известное имя даёт адрес и модель по умолчанию: иначе
+		// LLM_PROVIDER=kilo просил бы у шлюза несуществующий gpt-4o.
+		defModel, vision := "gpt-4o", true
+		for _, s := range providerSpecs {
+			if s.name == name {
+				kind = s.kind
+				defModel = firstNonEmpty(get(s.envModel), defaultModel(s.name, key, s.defModel))
+				vision = visionOK(s.name, key, s.vision)
+				if base == "" {
+					base = s.defaultBase
 				}
 			}
 		}
@@ -152,9 +194,9 @@ func Load(envPath string) (*Config, error) {
 			Kind:     kind,
 			BaseURL:  strings.TrimRight(base, "/"),
 			APIKey:   key,
-			Model:    firstNonEmpty(get("LLM_MODEL"), "gpt-4o"),
+			Model:    firstNonEmpty(get("LLM_MODEL"), defModel),
 			Priority: -1,
-			Vision:   true,
+			Vision:   vision,
 		})
 	}
 
@@ -169,16 +211,26 @@ func Load(envPath string) (*Config, error) {
 		if key == "" && base == "" {
 			continue // провайдер не сконфигурирован — просто пропускаем
 		}
-		if key == "" && s.name != "local" {
+		// Публичный шлюз без ключа подключаем только по явной просьбе
+		// (LLM_PROVIDER/LLM_PRIORITY/KILO_BASE_URL): молча уводить чужие
+		// запросы на бесплатный сторонний сервис нельзя.
+		if key == "" && !(keyless(s.name) && (get(s.envBase) != "" || prioNames[s.name])) {
 			continue
+		}
+		// "model" из config.json приезжает как LLM_MODEL, поэтому у названного
+		// провайдера он тоже должен работать, а не только KILO_MODEL и т. п.
+		named := ""
+		if strings.EqualFold(get("LLM_PROVIDER"), s.name) {
+			named = get("LLM_MODEL")
 		}
 		p := Provider{
 			Name:    s.name,
 			Kind:    s.kind,
 			BaseURL: strings.TrimRight(base, "/"),
 			APIKey:  key,
-			Model:   firstNonEmpty(get(s.envModel), s.defModel),
-			Vision:  s.vision,
+			Model: firstNonEmpty(
+				get(s.envModel), named, defaultModel(s.name, key, s.defModel)),
+			Vision: visionOK(s.name, key, s.vision),
 		}
 		// Не дублируем того, кого уже добавили через LLM_*.
 		if added[s.name] {

@@ -249,6 +249,13 @@ const PROVIDERS: &[(&str, &str, &str, &str, &str)] = &[
         "OPENROUTER_MODEL",
     ),
     (
+        "kilo",
+        "KILO_API_KEY",
+        "KILO_BASE_URL",
+        "https://api.kilo.ai/api/gateway",
+        "KILO_MODEL",
+    ),
+    (
         "local",
         "LOCAL_API_KEY",
         "LOCAL_BASE_URL",
@@ -256,6 +263,28 @@ const PROVIDERS: &[(&str, &str, &str, &str, &str)] = &[
         "LOCAL_MODEL",
     ),
 ];
+
+/// Провайдеры, живущие без ключа: локальный сервер, произвольный OpenAI-
+/// совместимый адрес и бесплатный уровень шлюза Kilo. Шлюз выбирается
+/// только когда его назвали явно — совпадает с поведением роутера.
+fn keyless(name: &str, named_explicitly: bool) -> bool {
+    match name {
+        "local" | "custom" => true,
+        "kilo" => named_explicitly,
+        _ => false,
+    }
+}
+
+/// Модель по умолчанию для диагностики: роутер без ключа берёт у шлюза Kilo
+/// бесплатный уровень, а с ключом — frontier. Печатать пустоту нельзя:
+/// человек не поймёт, чем именно агент будет думать.
+fn default_model(name: &str, key_found: bool) -> String {
+    match (name, key_found) {
+        ("kilo", false) => "kilo-auto/free".into(),
+        ("kilo", true) => "kilo-auto/frontier".into(),
+        _ => String::new(),
+    }
+}
 
 impl Layers {
     /// Выбирает того же провайдера, которого возьмёт роутер: явно указанный
@@ -302,11 +331,22 @@ impl Layers {
                 Some(s) => s,
                 None => continue,
             };
-            let key = self.get_with_source(spec.1);
             let base = self.get(spec.2).unwrap_or_else(|| spec.3.to_string());
-            // Локальная модель и custom живут без ключа, остальным ключ обязателен.
-            let usable =
-                key.is_some() || (!base.is_empty() && (name == "local" || name == "custom"));
+            // Роутер считает шлюз выбранным и по своему BASE_URL, поэтому
+            // диагностика обязана называть того же провайдера.
+            let explicit = named.as_deref() == Some(name)
+                || priority.iter().any(|p| p == name)
+                || self.get(spec.2).is_some();
+            // У названного провайдера ключ можно задать и общим "api_key" из
+            // config.json — роутер понимает оба варианта, диагностика тоже.
+            let key = self.get_with_source(spec.1).or_else(|| {
+                if named.as_deref() == Some(name) {
+                    self.get_with_source("LLM_API_KEY")
+                } else {
+                    None
+                }
+            });
+            let usable = key.is_some() || (!base.is_empty() && keyless(name, explicit));
             if !usable {
                 continue;
             }
@@ -318,7 +358,10 @@ impl Layers {
             return LlmSummary {
                 provider: display_name,
                 base_url: base,
-                model: self.get(spec.4).unwrap_or_default(),
+                model: self
+                    .get(spec.4)
+                    .or_else(|| self.get("LLM_MODEL"))
+                    .unwrap_or_else(|| default_model(name, key.is_some())),
                 key_found: key.is_some(),
                 key_source: key.map(|(_, s)| s).unwrap_or(Source::Default),
             };
@@ -660,6 +703,47 @@ mod tests {
             .describe(&p.searched)
             .join("\n")
             .contains("Found key: false"));
+    }
+
+    #[test]
+    fn kilo_gateway_works_without_a_key() {
+        let dir = tmp("kilo");
+        std::fs::write(dir.join("config.json"), r#"{"llm_provider":"kilo"}"#).unwrap();
+        let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
+        assert_eq!(s.provider, "kilo");
+        assert_eq!(s.base_url, "https://api.kilo.ai/api/gateway");
+        assert!(!s.key_found);
+        // Диагностика должна называть ту модель, которую возьмёт роутер.
+        assert_eq!(s.model, "kilo-auto/free");
+
+        let dir = tmp("kilokey");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"llm_provider":"kilo","api_key":"sk-k"}"#,
+        )
+        .unwrap();
+        let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
+        assert_eq!(s.model, "kilo-auto/frontier");
+
+        let dir = tmp("kilomodel");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"llm_provider":"kilo","model":"stepfun/step-3.7-flash:free"}"#,
+        )
+        .unwrap();
+        let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
+        assert_eq!(s.model, "stepfun/step-3.7-flash:free");
+
+        // Один KILO_BASE_URL роутер тоже считает выбором шлюза.
+        let dir = tmp("kilobase");
+        std::fs::write(
+            dir.join(".env"),
+            "KILO_BASE_URL=https://api.kilo.ai/api/gateway\n",
+        )
+        .unwrap();
+        let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
+        assert_eq!(s.provider, "kilo");
+        assert_eq!(s.model, "kilo-auto/free");
     }
 
     #[test]
