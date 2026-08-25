@@ -249,6 +249,13 @@ const PROVIDERS: &[(&str, &str, &str, &str, &str)] = &[
         "OPENROUTER_MODEL",
     ),
     (
+        "nvidia",
+        "NVIDIA_API_KEY",
+        "NVIDIA_BASE_URL",
+        "https://integrate.api.nvidia.com/v1",
+        "NVIDIA_MODEL",
+    ),
+    (
         "kilo",
         "KILO_API_KEY",
         "KILO_BASE_URL",
@@ -282,6 +289,7 @@ fn default_model(name: &str, key_found: bool) -> String {
     match (name, key_found) {
         ("kilo", false) => "kilo-auto/free".into(),
         ("kilo", true) => "kilo-auto/frontier".into(),
+        ("nvidia", _) => "meta/llama-3.2-90b-vision-instruct".into(),
         _ => String::new(),
     }
 }
@@ -703,6 +711,26 @@ mod tests {
             .describe(&p.searched)
             .join("\n")
             .contains("Found key: false"));
+    }
+
+    #[test]
+    fn nvidia_nim_is_configured_by_key_alone() {
+        let dir = tmp("nvidia");
+        std::fs::write(dir.join(".env"), "NVIDIA_API_KEY=nvapi-x\n").unwrap();
+        let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
+        assert_eq!(s.provider, "nvidia");
+        assert_eq!(s.base_url, "https://integrate.api.nvidia.com/v1");
+        assert!(s.key_found);
+        assert_eq!(s.model, "meta/llama-3.2-90b-vision-instruct");
+
+        let dir = tmp("nvidiamodel");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"llm_provider":"nvidia","api_key":"nvapi-x","model":"nvidia/nemotron-nano-12b-v2-vl"}"#,
+        )
+        .unwrap();
+        let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
+        assert_eq!(s.model, "nvidia/nemotron-nano-12b-v2-vl");
     }
 
     #[test]

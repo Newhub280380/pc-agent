@@ -132,6 +132,32 @@ func TestYoutoriaProviderFromKeyAlone(t *testing.T) {
 	}
 }
 
+func TestNvidiaNimProviderFromKeyAlone(t *testing.T) {
+	cfg, err := Load(writeEnv(t, "NVIDIA_API_KEY=nvapi-x\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Providers) != 1 {
+		t.Fatalf("ожидался 1 провайдер: %+v", cfg.Providers)
+	}
+	p := cfg.Providers[0]
+	if p.Name != "nvidia" || p.Kind != "openai" ||
+		p.BaseURL != "https://integrate.api.nvidia.com/v1" {
+		t.Fatalf("nvidia настроена неверно: %+v", p)
+	}
+	if p.Model != "meta/llama-3.2-90b-vision-instruct" || !p.Vision {
+		t.Fatalf("нужна vision-модель по умолчанию: %+v", p)
+	}
+
+	cfg, err = Load(writeEnv(t, "NVIDIA_API_KEY=nvapi-x\nNVIDIA_MODEL=nvidia/nemotron-nano-12b-v2-vl\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers[0].Model != "nvidia/nemotron-nano-12b-v2-vl" {
+		t.Fatalf("NVIDIA_MODEL проигнорирован: %+v", cfg.Providers[0])
+	}
+}
+
 func TestKiloGatewayWithoutKeyNeedsExplicitRequest(t *testing.T) {
 	// Без просьбы бесплатный шлюз не подключается: чужие запросы не должны
 	// молча уходить на сторонний сервис.

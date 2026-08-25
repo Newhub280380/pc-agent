@@ -64,6 +64,9 @@ var providerSpecs = []struct {
 	{"qwen", "openai", "QWEN_API_KEY", "QWEN_MODEL", "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "qwen-vl-max", true},
 	{"openrouter", "openai", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1", "qwen/qwen2.5-vl-72b-instruct", true},
 	{"youtoria", "openai", "YOUTORIA_API_KEY", "YOUTORIA_MODEL", "YOUTORIA_BASE_URL", "https://api.youtoria.ai/v1", "gpt-4o", true},
+	// nvidia: NIM-каталог NVIDIA в OpenAI-совместимом режиме, vision-модель
+	// llama-3.2-90b проверена на скриншотах.
+	{"nvidia", "openai", "NVIDIA_API_KEY", "NVIDIA_MODEL", "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1", "meta/llama-3.2-90b-vision-instruct", true},
 	// kilo: OpenAI-совместимый шлюз Kilo. Бесплатные модели отвечают без ключа,
 	// платные требуют его, поэтому провайдер активен и с пустым KILO_API_KEY.
 	{"kilo", "openai", "KILO_API_KEY", "KILO_MODEL", "KILO_BASE_URL", "https://api.kilo.ai/api/gateway", "kilo-auto/frontier", true},

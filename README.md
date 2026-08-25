@@ -128,8 +128,17 @@ dist\pcagent.exe --shot screen.png                    # снимок экран�
 | Qwen | `QWEN_API_KEY` | да |
 | OpenRouter (любые OpenSource-модели) | `OPENROUTER_API_KEY` | зависит от модели |
 | Youtoria (OpenAI-совместимый) | `YOUTORIA_API_KEY` + `YOUTORIA_BASE_URL` | да |
+| NVIDIA NIM (`integrate.api.nvidia.com`) | `NVIDIA_API_KEY` | да |
 | Kilo Gateway (`api.kilo.ai`) | `KILO_API_KEY` или без ключа | только с ключом |
 | Локальная модель (LM Studio / Ollama / llama.cpp) | `LOCAL_BASE_URL` | зависит от модели |
+
+### NVIDIA NIM
+
+Достаточно ключа `nvapi-...` в `NVIDIA_API_KEY` (или `"llm_provider": "nvidia"` +
+`api_key` в `config.json`) — адрес и модель подставляются сами. По умолчанию
+берётся `meta/llama-3.2-90b-vision-instruct`: она читает скриншоты, то есть
+агент может управлять компьютером. Другая модель — `NVIDIA_MODEL`, список
+доступных: `GET https://integrate.api.nvidia.com/v1/models`.
 
 ### Kilo Gateway и бесплатный уровень
 
