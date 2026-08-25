@@ -57,6 +57,56 @@ func TestLocalProviderNeedsOnlyBaseURL(t *testing.T) {
 	}
 }
 
+func TestUTF16EnvFromNotepadIsParsed(t *testing.T) {
+	// Блокнот сохраняет "Unicode" как UTF-16LE с BOM: раньше весь .env
+	// выглядел пустым и агент шёл без ключа.
+	body := []byte{0xFF, 0xFE}
+	for _, r := range "OPENAI_API_KEY=sk-utf16\n" {
+		body = append(body, byte(r), 0x00)
+	}
+	p := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(p, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Providers) != 1 || cfg.Providers[0].APIKey != "sk-utf16" {
+		t.Fatalf("UTF-16 .env не прочитан: %+v", cfg.Providers)
+	}
+}
+
+func TestShortNamesAndTrailingComment(t *testing.T) {
+	cfg, err := Load(writeEnv(t, "\ufeffBASE_URL=https://api.openai.com/v1 # комментарий\nAPI_KEY=sk-short\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Providers) == 0 {
+		t.Fatal("короткие имена BASE_URL/API_KEY проигнорированы")
+	}
+	p := cfg.Providers[0]
+	if p.BaseURL != "https://api.openai.com/v1" || p.APIKey != "sk-short" {
+		t.Fatalf("значения разобраны неверно: %+v", p)
+	}
+}
+
+func TestKeylessLocalServerRanksBehindKeyedProvider(t *testing.T) {
+	// Без LLM_PRIORITY локальный сервер не должен перебивать ключ OpenAI —
+	// иначе запросы уходят на localhost.
+	cfg, err := Load(writeEnv(t, "OPENAI_API_KEY=sk-test\nLOCAL_BASE_URL=http://localhost:20128/v1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Provider{}
+	for _, pr := range cfg.Providers {
+		byName[pr.Name] = pr
+	}
+	if byName["openai"].Priority >= byName["local"].Priority {
+		t.Fatalf("local не должен опережать openai: %+v", cfg.Providers)
+	}
+}
+
 func TestMissingEnvFileIsNotAnError(t *testing.T) {
 	// Ключи могут быть заданы переменными процесса — отсутствие файла законно.
 	cfg, err := Load(filepath.Join(t.TempDir(), "нет.env"))

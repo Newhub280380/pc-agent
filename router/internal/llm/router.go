@@ -180,8 +180,10 @@ func (r *Router) Complete(ctx context.Context, req Request) (*Response, error) {
 // а не пинг.
 func reachable(ctx context.Context, baseURL string) error {
 	u, err := url.Parse(baseURL)
-	if err != nil || u.Host == "" {
-		return fmt.Errorf("неверный base_url %q", baseURL)
+	if err != nil || u.Host == "" || u.Scheme == "" {
+		// Чаще всего это лишние символы из .env: кавычки, пробел, BOM или
+		// адрес без схемы. Печатаем значение как есть — так видно мусор.
+		return fmt.Errorf("неверный base_url %q: нужен вид https://host/v1", baseURL)
 	}
 	port := u.Port()
 	if port == "" {
