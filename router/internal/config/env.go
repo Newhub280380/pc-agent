@@ -12,12 +12,15 @@ package config
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 )
 
 // Provider — описание одного LLM-бэкенда.
@@ -98,6 +101,10 @@ func Load(envPath string) (*Config, error) {
 		}
 		return strings.TrimSpace(fileVals[k])
 	}
+	if len(fileVals) == 0 && fileExists(envPath) {
+		// Файл есть, переменных нет: обычно Легаси-кодировка из Блокнота.
+		fmt.Fprintf(os.Stderr, "%s: переменные не найдены — сохрани файл как UTF-8 в виде КЛЮЧ=значение\n", envPath)
+	}
 
 	listen := firstNonEmpty(get("ROUTER_LISTEN"), "127.0.0.1:8713")
 	if err := checkLoopback(listen); err != nil {
@@ -177,9 +184,14 @@ func Load(envPath string) (*Config, error) {
 		if added[s.name] {
 			continue
 		}
-		if v, ok := prio[s.name]; ok {
+		switch v, ok := prio[s.name]; {
+		case ok:
 			p.Priority = v
-		} else {
+		case p.APIKey == "":
+			// Локальный сервер без ключа не должен опережать провайдера с ключом:
+			// иначе агент уходит на localhost, а в логе — «base_url localhost».
+			p.Priority = 200
+		default:
 			p.Priority = 100 // не указан в LLM_PRIORITY — уходит в конец очереди
 		}
 		cfg.Providers = append(cfg.Providers, p)
@@ -187,18 +199,62 @@ func Load(envPath string) (*Config, error) {
 	return cfg, nil
 }
 
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
+// dotenvKey приводит короткие имена из чужих инструкций к нашим:
+// `BASE_URL=`/`API_KEY=` раньше молча игнорировались.
+func dotenvKey(k string) string {
+	switch strings.ToUpper(strings.TrimSpace(k)) {
+	case "BASE_URL":
+		return "LLM_BASE_URL"
+	case "API_KEY":
+		return "LLM_API_KEY"
+	case "MODEL":
+		return "LLM_MODEL"
+	case "PROVIDER":
+		return "LLM_PROVIDER"
+	default:
+		return strings.TrimSpace(k)
+	}
+}
+
+// decodeText снимает BOM и разбирает UTF-16: Блокнот на Windows сохраняет
+// так по одному клику, и тогда весь .env выглядит как пустой.
+func decodeText(b []byte) []byte {
+	switch {
+	case bytes.HasPrefix(b, []byte{0xFF, 0xFE}):
+		return utf16ToUTF8(b[2:], binary.LittleEndian)
+	case bytes.HasPrefix(b, []byte{0xFE, 0xFF}):
+		return utf16ToUTF8(b[2:], binary.BigEndian)
+	case bytes.HasPrefix(b, []byte{0xEF, 0xBB, 0xBF}):
+		return b[3:]
+	default:
+		return b
+	}
+}
+
+func utf16ToUTF8(b []byte, order binary.ByteOrder) []byte {
+	units := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		units = append(units, order.Uint16(b[i:i+2]))
+	}
+	return []byte(string(utf16.Decode(units)))
+}
+
 func parseDotenv(path string) (map[string]string, error) {
 	out := map[string]string{}
-	f, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return out, nil // .env не обязателен: ключи могут быть в окружении
 		}
 		return nil, err
 	}
-	defer f.Close()
 
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(bytes.NewReader(decodeText(raw)))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -210,10 +266,12 @@ func parseDotenv(path string) (map[string]string, error) {
 		if i <= 0 {
 			continue
 		}
-		k := strings.TrimSpace(line[:i])
+		k := dotenvKey(line[:i])
 		v := strings.TrimSpace(line[i+1:])
-		v = strings.Trim(v, `"'`)
-		out[k] = v
+		if j := strings.Index(v, " #"); j >= 0 {
+			v = strings.TrimSpace(v[:j]) // хвостовой комментарий — не часть ключа
+		}
+		out[k] = strings.Trim(v, `"'`)
 	}
 	return out, sc.Err()
 }
