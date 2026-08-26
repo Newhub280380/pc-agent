@@ -44,11 +44,32 @@ const DENY: &[&str] = &[
     "takeown",
     "icacls",
     "shutdown",
+    // Linux-эквиваленты: агент работает и на Ubuntu, а там необратимое
+    // делается своими программами.
+    "mkfs",
+    "dd",
+    "fdisk",
+    "parted",
+    "shred",
+    "reboot",
+    "poweroff",
+    "systemctl",
+    "chown",
+    "chmod",
 ];
 
 /// Интерпретаторы: разрешены только без «скрытых» флагов, потому что
 /// `-EncodedCommand`/`-w hidden` — это ровно способ спрятать полезную нагрузку.
-const SHELLS: &[&str] = &["powershell", "pwsh", "cmd", "wscript", "cscript"];
+const SHELLS: &[&str] = &[
+    "powershell",
+    "pwsh",
+    "cmd",
+    "wscript",
+    "cscript",
+    "bash",
+    "sh",
+    "zsh",
+];
 
 const HIDDEN_FLAGS: &[&str] = &[
     "-enc",
@@ -64,6 +85,14 @@ const HIDDEN_FLAGS: &[&str] = &[
     "iex",
     "invoke-expression",
     "downloadstring",
+    // Linux: `bash -c 'curl … | sh'` и base64 — тот же способ спрятать
+    // полезную нагрузку от глаз человека, что и -EncodedCommand.
+    "base64 -d",
+    "base64 --decode",
+    "| sh",
+    "|sh",
+    "| bash",
+    "|bash",
 ];
 
 #[derive(Debug, Clone)]

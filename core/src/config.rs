@@ -70,7 +70,11 @@ impl Paths {
             searched: candidates,
             memory_db: root.join("memory.db"),
             logs: root.join("logs"),
-            router_exe: root.join("pcagent-router.exe"),
+            router_exe: root.join(if cfg!(windows) {
+                "pcagent-router.exe"
+            } else {
+                "pcagent-router"
+            }),
             consent: root.join("consent.json"),
             root,
         })
