@@ -1,5 +1,6 @@
-//! Платформенный слой: единый безопасный API поверх C++ (Windows) или
-//! заглушек (Linux/macOS — только для сборки и тестов логики).
+//! Платформенный слой: единый безопасный API поверх C++ (Windows),
+//! утилит рабочего стола (Linux) или заглушек (остальные ОС — только для
+//! сборки и тестов логики).
 //!
 //! Зачем прослойка: весь unsafe-код живёт в одном месте. Остальное ядро
 //! работает с обычными Rust-типами и не знает про HWND и CoTaskMemFree.
@@ -9,9 +10,14 @@ mod windows_impl;
 #[cfg(windows)]
 pub use windows_impl::*;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod linux_impl;
+#[cfg(target_os = "linux")]
+pub use linux_impl::*;
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod stub;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub use stub::*;
 
 use serde::{Deserialize, Serialize};

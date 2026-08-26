@@ -521,7 +521,35 @@ fn create_desktop_shortcut() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+/// На Linux ярлык — это .desktop-файл. Кладём и в меню приложений, и на
+/// рабочий стол: человек ищет иконку там, где привык.
+#[cfg(target_os = "linux")]
+fn create_desktop_shortcut() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe = std::env::current_exe()?;
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=PC Agent\nComment=Автономный агент за компьютером\nExec={}\nTerminal=false\nCategories=Utility;\n",
+        exe.display()
+    );
+    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(data) = dirs::data_dir() {
+        let apps = data.join("applications");
+        std::fs::create_dir_all(&apps)?;
+        targets.push(apps.join("pcagent.desktop"));
+    }
+    if let Some(desktop) = dirs::desktop_dir() {
+        targets.push(desktop.join("pcagent.desktop"));
+    }
+    for path in targets {
+        std::fs::write(&path, &entry)?;
+        // Без бита исполнения GNOME показывает ярлык как «недоверенный».
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn create_desktop_shortcut() -> Result<()> {
     Ok(())
 }

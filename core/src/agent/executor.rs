@@ -256,7 +256,8 @@ fn open_default(url: &str) -> Result<()> {
 
 #[cfg(not(windows))]
 fn open_default(url: &str) -> Result<()> {
-    // на Linux это только режим разработки
+    // xdg-open отдаёт ссылку браузеру по умолчанию без оболочки — то же
+    // свойство, ради которого под Windows выбран explorer.exe.
     std::process::Command::new("xdg-open").arg(url).spawn()?;
     Ok(())
 }

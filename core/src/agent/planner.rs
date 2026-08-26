@@ -18,7 +18,7 @@ use crate::llm::{extract_json, LlmClient, Message};
 use crate::retry::{retry, Backoff};
 use anyhow::{Context, Result};
 
-const PLANNER_SYSTEM: &str = r#"Ты — планировщик автономного агента, который управляет компьютером Windows и телефоном Android как человек.
+const PLANNER_SYSTEM: &str = r#"Ты — планировщик автономного агента, который управляет компьютером (Windows или Ubuntu) и телефоном Android как человек.
 Построй ГРАФ задач (DAG) из 3-8 узлов. Каждый узел — наблюдаемый результат на экране, а не абстракция.
 
 Требования к графу:
@@ -37,6 +37,43 @@ const PLANNER_SYSTEM: &str = r#"Ты — планировщик автономн
  "risks":["может не хватить места","установщик может требовать права администратора"]}
 
 Отвечай СТРОГО JSON того же формата."#;
+
+const TRIAGE_SYSTEM: &str = r#"Ты — приёмщик заданий автономного агента, который управляет компьютером.
+Реши, что тебе написали: задание на действия с компьютером или просто разговор (приветствие, вопрос о тебе, благодарность, уточнение).
+Разговор не превращай в задание и ничего не выдумывай: если человек написал «привет, работаешь?», ответь ему словами.
+Отвечай СТРОГО JSON: {"kind":"chat","reply":"короткий ответ человеку"} или {"kind":"task"} (reply не нужен)."#;
+
+/// Ответ человеку, если он не давал задания. `None` — это задание, строим граф.
+///
+/// Без этого шага модель принимает «привет, работаешь?» за цель и планирует
+/// случайные действия на чужом компьютере.
+pub fn chat_reply(llm: &LlmClient, task: &str) -> Option<String> {
+    let resp = llm
+        .complete(
+            &[
+                Message::system(TRIAGE_SYSTEM),
+                Message::user(format!("СООБЩЕНИЕ: {task}")),
+            ],
+            "triage",
+            true,
+            0.0,
+        )
+        .ok()?;
+    parse_triage(&resp.text)
+}
+
+fn parse_triage(raw: &str) -> Option<String> {
+    let v = extract_json(raw).ok()?;
+    if v.get("kind")?.as_str()? != "chat" {
+        return None;
+    }
+    let reply = v.get("reply").and_then(|r| r.as_str()).unwrap_or("").trim();
+    Some(if reply.is_empty() {
+        "Я на связи. Напиши, что сделать на компьютере.".to_string()
+    } else {
+        reply.to_string()
+    })
+}
 
 /// Построение графа. Ошибка формата не должна ронять задачу: повторяем запрос,
 /// добавляя в промпт причину отказа. Если валидный граф так и не получен —
@@ -144,6 +181,17 @@ pub fn merge(old: &TaskGraph, mut fresh: TaskGraph) -> TaskGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_talk_gets_answer_and_task_goes_to_planner() {
+        assert_eq!(
+            parse_triage(r#"{"kind":"chat","reply":"Да, работаю"}"#).as_deref(),
+            Some("Да, работаю")
+        );
+        assert!(parse_triage(r#"{"kind":"chat","reply":"  "}"#).is_some());
+        assert!(parse_triage(r#"{"kind":"task"}"#).is_none());
+        assert!(parse_triage("не json").is_none());
+    }
 
     #[test]
     fn parses_graph_with_fences_and_text() {

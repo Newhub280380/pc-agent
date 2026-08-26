@@ -74,8 +74,54 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
-      - run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev
-      - working-directory: router
-        run: go vet ./... && go test ./...
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev \
+            xdotool scrot tesseract-ocr tesseract-ocr-rus xclip xprintidle \
+            xvfb openbox
+      - name: Go router (Linux)
+        working-directory: router
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go test ./...
+          go build -ldflags "-s -w -X main.Version=${{ github.sha }}" -o pcagent-router .
       - working-directory: core
         run: cargo fmt --check && cargo test
+      - name: Сборка агента под Linux
+        working-directory: core
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcagent-linux-x64
+          path: core/target/release/pcagent
+      # Дым-проверка на живом X-сервере (Xvfb): агент должен реально снять
+      # экран и увидеть окно, иначе «работает на Linux» — только слова.
+      - name: Smoke на Linux (selfcheck под Xvfb)
+        working-directory: core
+        run: |
+          mkdir -p ~/.local/share/PCAgent ../ci-evidence
+          echo ci > ~/.local/share/PCAgent/consent.json
+          cat > smoke.sh <<'SH'
+          # openbox нужен ради _NET_ACTIVE_WINDOW: без оконного менеджера X не
+          # знает, какое окно активно, и проверка была бы нечестной.
+          openbox &
+          sleep 2
+          # Окно агента поднимаем первым: заодно проверяется, что GUI рисуется.
+          ./target/release/pcagent &
+          gui=$!
+          sleep 20
+          code=0
+          ./target/release/pcagent --selfcheck --report ../ci-evidence/selfcheck-linux.txt || code=$?
+          ./target/release/pcagent --shot ../ci-evidence/gui-linux.png || true
+          kill $gui 2>/dev/null || true
+          cp ~/.local/share/PCAgent/logs/*.log ../ci-evidence/ 2>/dev/null || true
+          exit $code
+          SH
+          xvfb-run -a --server-args="-screen 0 1280x800x24" bash smoke.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pcagent-linux-smoke
+          path: ci-evidence

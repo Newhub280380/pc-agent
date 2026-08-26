@@ -1,6 +1,6 @@
-# PC Agent — автономный цифровой сотрудник для Windows
+# PC Agent — автономный цифровой сотрудник для Windows и Ubuntu
 
-Нативное десктоп-приложение: один `.exe`, без Python, без рантаймов, без установщика.
+Нативное десктоп-приложение: один файл, без Python, без рантаймов, без установщика.
 Агент видит экран, работает вашей мышью и клавиатурой в вашем браузере, помнит,
 что делал вчера, учится на своих ошибках и умеет управлять Android-телефоном по ADB.
 
@@ -9,6 +9,10 @@ Rust (ядро)        цикл Восприятие → Мышление → Д
 C++ (руки и глаза) WinAPI: захват экрана, UI Automation, OCR, поиск по картинке, SendInput, буфер обмена
 Go  (сеть)         LLM Router: 8 провайдеров, retry / fallback / circuit breaker, автообновление
 ```
+
+На Linux роль C++-слоя берут утилиты X11 (`xdotool`, `scrot`, `tesseract`, `xclip`):
+экран, мышь, клавиатура, окна, буфер обмена и OCR работают, дерево UI Automation и
+поиск по картинке — нет, агент опирается на скриншот и vision-модель.
 
 Go-роутер вшивается внутрь `.exe` ядра (`include_bytes!`) и поднимается на
 `127.0.0.1` как дочерний процесс. Наружу приложение слушает **ничего**.
@@ -82,11 +86,50 @@ dist\pcagent.exe --shot screen.png                    # снимок экран�
 этим же пользуется windows-джоб CI и складывает отчёт со скриншотом в артефакт
 `pcagent-windows-smoke`.
 
-### Сборка ядра на Linux/macOS
+## Ubuntu / Linux
 
-`cargo check` / `cargo test` работают везде: платформенный слой подменяется
-заглушкой (`src/platform/stub.rs`), C++ не компилируется. Это для CI и разработки
-логики — реальные действия существуют только под Windows.
+Установка одной командой (ставит зависимости, качает агента, спрашивает ключ,
+делает ярлык в меню и на рабочем столе):
+
+```bash
+curl -fsSL https://pcagent-dl.vercel.app/install.sh | bash
+```
+
+То же самое из файла, если агент лежит рядом (`pcagent-linux-x64`):
+
+```bash
+bash install-linux.sh
+```
+
+Windows-аналоги: `irm https://pcagent-dl.vercel.app/win.ps1 | iex` в PowerShell
+или `install-windows.cmd` рядом с `pcagent.exe`.
+
+Сборка из исходников:
+
+```bash
+sudo apt install -y libgtk-3-dev libxkbcommon-dev xdotool scrot tesseract-ocr tesseract-ocr-rus xclip xprintidle
+cd router && CGO_ENABLED=0 go build -o pcagent-router . && cd ../core && cargo build --release
+./target/release/pcagent --selfcheck --report /tmp/sc.txt
+```
+
+Файлы приложения: `~/.local/share/PCAgent/`. Что поддержано:
+
+| Возможность | X11 | Wayland |
+|---|---|---|
+| скриншот, размер экрана | да (`scrot`/`maim`/`import`) | да (`grim`/`spectacle`) |
+| мышь, клавиатура, окна | да (`xdotool`) | нет, нужен `ydotool` или сессия «Xorg» |
+| буфер обмена | да (`xclip`) | да (`wl-clipboard`) |
+| OCR | да (`tesseract`) | да |
+| уступать человеку за клавиатурой | да (`xprintidle`) | нет |
+| дерево UI Automation, поиск по картинке | нет | нет |
+
+Если утилиты нет, агент не молчит, а пишет точную команду `sudo apt install ...`.
+
+### Сборка ядра на macOS
+
+`cargo check` / `cargo test` работают везде: на остальных ОС платформенный слой
+подменяется заглушкой (`src/platform/stub.rs`). Это для разработки логики —
+реальные действия есть под Windows и Linux.
 
 ---
 
