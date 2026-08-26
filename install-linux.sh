@@ -15,7 +15,7 @@ die() { printf '\nОШИБКА: %s\n' "$1" >&2; read -r -p "Enter для вых�
 
 say "Проверяю зависимости"
 need=()
-for t in curl xdotool scrot tesseract xclip; do
+for t in curl xdotool scrot tesseract xclip xprintidle; do
   command -v "$t" >/dev/null 2>&1 || need+=("$t")
 done
 if [ "${#need[@]}" -gt 0 ]; then
@@ -47,6 +47,21 @@ else
   url="https://github.com/$REPO/releases/latest/download/pcagent-linux-x64"
   curl -fL --retry 3 -o "$BIN.tmp" "$url" \
     || die "не удалось скачать агента ($url). Положите файл pcagent-linux-x64 рядом с этим скриптом и запустите снова"
+fi
+# Рядом с бинарником может лежать pcagent-linux-x64.sha256 — если он есть,
+# скачанный файл проверяется, иначе подмену на хостинге никто не заметит.
+sums=""
+if [ -n "$local_bin" ] && [ -f "$local_bin.sha256" ]; then
+  sums=$(cat "$local_bin.sha256")
+else
+  sums=$(curl -fsSL "https://github.com/$REPO/releases/latest/download/pcagent-linux-x64.sha256" 2>/dev/null || true)
+fi
+if [ -n "$sums" ]; then
+  got=$(sha256sum "$BIN.tmp" | cut -d' ' -f1)
+  case "$sums" in
+    *"$got"*) ;;
+    *) rm -f "$BIN.tmp"; die "контрольная сумма не совпала — файл повреждён или подменён" ;;
+  esac
 fi
 mv "$BIN.tmp" "$BIN"
 chmod +x "$BIN"

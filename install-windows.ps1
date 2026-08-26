@@ -11,7 +11,18 @@ $cfg  = Join-Path $dir 'config.json'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
 Write-Host "`n== Качаю агента (20 МБ)"
-Invoke-WebRequest -Uri "$base/pcagent.exe" -OutFile $exe
+$tmp = "$exe.tmp"
+Invoke-WebRequest -Uri "$base/pcagent.exe" -OutFile $tmp
+
+# Сверка с опубликованной суммой: без неё подмену файла на хостинге
+# не видно, а запускается он с правами пользователя.
+$want = (Invoke-WebRequest -Uri "$base/pcagent.exe.sha256" -UseBasicParsing).Content.Trim().Split(' ')[0]
+$got  = (Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLower()
+if ($want -ne $got) {
+  Remove-Item $tmp -Force
+  throw "контрольная сумма не совпала — файл повреждён или подменён"
+}
+Move-Item -Force $tmp $exe
 
 if (-not (Test-Path $cfg)) {
   Write-Host "`n== Ключ NVIDIA (nvapi-...), Enter чтобы пропустить"

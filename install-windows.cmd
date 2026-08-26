@@ -17,9 +17,9 @@ if exist "%~dp0pcagent.exe" (
   echo   [1/3] Беру pcagent.exe из этой же папки...
   copy /y "%~dp0pcagent.exe" "%EXE%" >nul
 ) else (
-  echo   [1/3] Скачиваю агента (около 20 МБ)...
+  echo   [1/3] Скачиваю агента (около 20 МБ) и сверяю контрольную сумму...
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%URL%' -OutFile '%EXE%'"
+    "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%URL%' -OutFile '%EXE%.tmp'; $w=(Invoke-WebRequest -Uri '%URL%.sha256' -UseBasicParsing).Content.Trim().Split(' ')[0]; $g=(Get-FileHash -Algorithm SHA256 '%EXE%.tmp').Hash.ToLower(); if ($w -ne $g) { Remove-Item '%EXE%.tmp' -Force; throw 'контрольная сумма не совпала' }; Move-Item -Force '%EXE%.tmp' '%EXE%'"
 )
 if not exist "%EXE%" goto fail
 

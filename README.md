@@ -107,7 +107,7 @@ Windows-аналоги: `irm https://pcagent-dl.vercel.app/win.ps1 | iex` в Pow
 Сборка из исходников:
 
 ```bash
-sudo apt install -y libgtk-3-dev libxkbcommon-dev xdotool scrot tesseract-ocr tesseract-ocr-rus xclip
+sudo apt install -y libgtk-3-dev libxkbcommon-dev xdotool scrot tesseract-ocr tesseract-ocr-rus xclip xprintidle
 cd router && CGO_ENABLED=0 go build -o pcagent-router . && cd ../core && cargo build --release
 ./target/release/pcagent --selfcheck --report /tmp/sc.txt
 ```
@@ -120,6 +120,7 @@ cd router && CGO_ENABLED=0 go build -o pcagent-router . && cd ../core && cargo b
 | мышь, клавиатура, окна | да (`xdotool`) | нет, нужен `ydotool` или сессия «Xorg» |
 | буфер обмена | да (`xclip`) | да (`wl-clipboard`) |
 | OCR | да (`tesseract`) | да |
+| уступать человеку за клавиатурой | да (`xprintidle`) | нет |
 | дерево UI Automation, поиск по картинке | нет | нет |
 
 Если утилиты нет, агент не молчит, а пишет точную команду `sudo apt install ...`.
