@@ -88,12 +88,21 @@ dist\pcagent.exe --shot screen.png                    # снимок экран�
 
 ## Ubuntu / Linux
 
-Установка одним файлом (ставит зависимости, качает агента, спрашивает ключ,
+Установка одной командой (ставит зависимости, качает агента, спрашивает ключ,
 делает ярлык в меню и на рабочем столе):
+
+```bash
+curl -fsSL https://pcagent-dl.vercel.app/install.sh | bash
+```
+
+То же самое из файла, если агент лежит рядом (`pcagent-linux-x64`):
 
 ```bash
 bash install-linux.sh
 ```
+
+Windows-аналоги: `irm https://pcagent-dl.vercel.app/win.ps1 | iex` в PowerShell
+или `install-windows.cmd` рядом с `pcagent.exe`.
 
 Сборка из исходников:
 
