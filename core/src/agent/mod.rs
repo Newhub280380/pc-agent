@@ -221,6 +221,13 @@ impl Agent {
         let started = Instant::now();
         self.log(format!("Задача: {task}"));
 
+        // 0. Человек мог просто поздороваться или спросить — тогда отвечаем
+        // словами, а не двигаем мышью по случайному плану.
+        if let Some(reply) = planner::chat_reply(&self.llm, task) {
+            self.log(reply.clone());
+            return Ok(reply);
+        }
+
         // 1. Поднимаем прошлый опыт ДО планирования.
         let hints = {
             let m = self.mem_lock();
