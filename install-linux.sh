@@ -32,12 +32,22 @@ if [ "${#need[@]}" -gt 0 ]; then
   sudo apt-get install -y $pkgs || die "не удалось установить:$pkgs"
 fi
 
-say "Качаю агента"
+say "Ставлю агента"
 mkdir -p "$DIR" || die "не могу создать $DIR"
-url=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-  | grep -o 'https://[^"]*pcagent-linux-x64[^"]*' | head -1)
-[ -n "$url" ] || url="https://github.com/$REPO/releases/latest/download/pcagent-linux-x64"
-curl -fL --retry 3 -o "$BIN.tmp" "$url" || die "не удалось скачать агента ($url)"
+here="$(cd "$(dirname "$0")" && pwd)"
+local_bin=""
+for f in "$here/pcagent-linux-x64" "$here/pcagent"; do
+  [ -f "$f" ] && local_bin="$f" && break
+done
+if [ -n "$local_bin" ]; then
+  # Файл рядом со скриптом: так работает и с приватным репозиторием, где
+  # релизы без авторизации не скачиваются.
+  cp "$local_bin" "$BIN.tmp" || die "не могу скопировать $local_bin"
+else
+  url="https://github.com/$REPO/releases/latest/download/pcagent-linux-x64"
+  curl -fL --retry 3 -o "$BIN.tmp" "$url" \
+    || die "не удалось скачать агента ($url). Положите файл pcagent-linux-x64 рядом с этим скриптом и запустите снова"
+fi
 mv "$BIN.tmp" "$BIN"
 chmod +x "$BIN"
 
