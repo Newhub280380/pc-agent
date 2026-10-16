@@ -216,8 +216,30 @@ impl Agent {
     }
 
     /// Главный цикл. Возвращает отчёт для пользователя.
+    /// Обёртка watchdog: любой выход из задачи (успех, ошибка, паника) помечает
+    /// её статус в БД. Жёсткая смерть процесса оставляет 'running' — и это
+    /// единственный случай, который следующий запуск видит как «брошено».
     pub fn run_task(&mut self, task: &str) -> Result<String> {
         let task_id = format!("t{}", chrono::Utc::now().timestamp());
+        if let Ok(m) = self.mem.lock() {
+            let _ = m.task_start(&task_id, task);
+        }
+        let result = self.run_task_inner(task, &task_id);
+        if let Ok(m) = self.mem.lock() {
+            // Остановка человеком — не «успех», честно пишем interrupted.
+            let status = if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                "interrupted"
+            } else if result.is_ok() {
+                "done"
+            } else {
+                "failed"
+            };
+            let _ = m.task_finish(&task_id, status);
+        }
+        result
+    }
+
+    fn run_task_inner(&mut self, task: &str, task_id: &str) -> Result<String> {
         let started = Instant::now();
         self.log(format!("Задача: {task}"));
 

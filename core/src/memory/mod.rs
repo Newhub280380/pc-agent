@@ -128,6 +128,16 @@ impl Memory {
                 ok INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            -- Watchdog задач: статус 'running' из прошлой сессии означает,
+            -- что процесс умер посреди работы (свет, kill, паника).
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                task TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL DEFAULT ''
+            );
             "#,
         )?;
         Ok(())
@@ -312,6 +322,41 @@ impl Memory {
             params![task_id, step, action, result, ok as i32, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// Watchdog: старт задачи. Любой штатный выход помечается task_finish;
+    /// жёсткая смерть процесса оставляет 'running' — и следующий запуск
+    /// приложения видит это как «задача брошена на середине».
+    pub fn task_start(&self, id: &str, task: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tasks (id, task, status, started_at) VALUES (?1,?2,'running',?3)",
+            params![id, task, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Штатный выход: done | failed | interrupted (останов человеком).
+    pub fn task_finish(&self, id: &str, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET status=?2, finished_at=?3 WHERE id=?1",
+            params![id, status, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Задачи, застрявшие в 'running': их процесс уже не существует.
+    pub fn interrupted_tasks(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, task FROM tasks WHERE status='running'")?;
+        let rows = stmt.query_map(params![], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn stats(&self) -> Result<(i64, i64, i64)> {

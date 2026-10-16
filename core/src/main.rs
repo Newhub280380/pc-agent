@@ -170,6 +170,32 @@ fn main() -> Result<()> {
     )];
     initial_log.extend(layers.describe(&paths.searched));
 
+    // Watchdog: задачи прошлой сессии, брошенные на середине (свет, kill,
+    // паника). Их процесс больше не существует, помечаем и честно говорим.
+    {
+        let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(stale) = guard.interrupted_tasks() {
+            if !stale.is_empty() {
+                for (id, _) in &stale {
+                    let _ = guard.task_finish(id, "interrupted");
+                }
+                let names = stale
+                    .iter()
+                    .map(|(_, t)| t.chars().take(60).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                initial_log.push(format!(
+                    "⚠ Прошлая сессия умерла посреди {} задач(и): {}",
+                    stale.len(),
+                    names
+                ));
+                initial_log.push(
+                    "Агент помнит их шаги в БД. Опиши задачу заново, чтобы продолжить.".into(),
+                );
+            }
+        }
+    }
+
     let app = gui::AppState {
         task: String::new(),
         log: initial_log,
