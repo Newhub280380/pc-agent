@@ -620,6 +620,43 @@ UPDATE_MANIFEST_URL=
 
 #[cfg(test)]
 mod tests {
+    /// Снимает LLM-переменные окружения на время теста и восстанавливает
+    /// их в Drop: живой ключ хоста (например OPENROUTER_API_KEY) не должен
+    /// менять результаты тестов, читающих конфиг из временных файлов.
+    /// Без этого тесты зелёные на CI и падают на машине разработчика.
+    struct EnvGuard {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let vars = [
+                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+                "DEEPSEEK_API_KEY", "XAI_API_KEY", "QWEN_API_KEY",
+                "OPENROUTER_API_KEY", "YOUTORIA_API_KEY", "NVIDIA_API_KEY",
+                "KILO_API_KEY", "LOCAL_API_KEY", "LLM_API_KEY",
+                "LLM_BASE_URL", "LLM_PROVIDER", "LLM_MODEL",
+            ];
+            let mut saved = Vec::new();
+            for k in vars {
+                saved.push((k.to_string(), std::env::var_os(k)));
+                std::env::remove_var(k);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
@@ -706,6 +743,7 @@ mod tests {
 
     #[test]
     fn missing_key_is_reported_as_false() {
+        let _env = EnvGuard::new();
         let dir = tmp("nokey");
         std::fs::write(dir.join(".env"), "OCR_LANG=ru-RU\n").unwrap();
         let p = paths_in(&dir);
@@ -719,6 +757,7 @@ mod tests {
 
     #[test]
     fn nvidia_nim_is_configured_by_key_alone() {
+        let _env = EnvGuard::new();
         let dir = tmp("nvidia");
         std::fs::write(dir.join(".env"), "NVIDIA_API_KEY=nvapi-x\n").unwrap();
         let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
@@ -739,6 +778,7 @@ mod tests {
 
     #[test]
     fn kilo_gateway_works_without_a_key() {
+        let _env = EnvGuard::new();
         let dir = tmp("kilo");
         std::fs::write(dir.join("config.json"), r#"{"llm_provider":"kilo"}"#).unwrap();
         let s = Layers::load(&paths_in(&dir)).unwrap().llm_summary();
