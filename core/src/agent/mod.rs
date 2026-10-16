@@ -69,6 +69,8 @@ pub enum AgentCommand {
 
 pub struct AgentConfig {
     pub max_steps: u32,
+    /// Политики для Z3-фильтра планов и действий.
+    pub policies: crate::logic::Policies,
     pub max_minutes: u64,
     /// Порог уверенности для необратимых действий (оплата, отправка, удаление).
     pub destructive_confidence: f64,
@@ -82,6 +84,7 @@ impl Default for AgentConfig {
         Self {
             max_steps: 120,
             max_minutes: 45,
+            policies: crate::logic::Policies::new(),
             destructive_confidence: 0.85,
             confirm_destructive: true,
             ocr_lang: "ru-RU".into(),
@@ -166,6 +169,8 @@ pub struct Agent {
     tx: Sender<AgentEvent>,
     rx: Receiver<AgentCommand>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// JEV: вероятностный да/нет-фильтр на статистике шагов.
+    jev: crate::jev::Jev,
 }
 
 impl Agent {
@@ -186,6 +191,7 @@ impl Agent {
             tx,
             rx,
             stop,
+            jev: crate::jev::Jev::new(),
         }
     }
 
@@ -284,6 +290,24 @@ impl Agent {
         };
         self.send_plan(&graph);
         self.log(format!("Граф из {} узлов", graph.nodes.len()));
+
+        // --- Z3: доказательная проверка плана ДО исполнения ---
+        if let crate::logic::Verdict::Violation(why) =
+            crate::logic::check_plan(&graph, &self.cfg.policies)
+        {
+            self.log(format!("Z3 отклонил план: {why}. Иду одной целью"));
+            let mut g = TaskGraph::linear(
+                task,
+                &[(
+                    task.to_string(),
+                    "цель задачи видна выполненной".to_string(),
+                )],
+            );
+            if g.validate().is_ok() {
+                graph = g;
+                self.send_plan(&graph);
+            }
+        }
 
         let mut trace = Trace::default();
         let mut step: u32 = 0;
@@ -489,6 +513,26 @@ impl Agent {
             let _ = self.tx.send(AgentEvent::Thought(decision.thought.clone()));
             let act_str = decision.next.short();
 
+            // --- ЛОГИКА: политика Z3 + вероятностный JEV ДО действия ---
+            if let crate::logic::Verdict::Violation(why) =
+                crate::logic::gate_action(&act_str, &self.cfg.policies)
+            {
+                self.log(format!("Шаг отклонён логикой: {why}"));
+                failures.push(why);
+                continue;
+            }
+            match self.jev.ask(&act_str) {
+                crate::jev::JevVerdict::No => {
+                    self.log(format!(
+                        "JEV: класс действия «{}» стабильно проваливается — пропускаю",
+                        act_str
+                    ));
+                    failures.push("jev: плохая статистика класса действия".into());
+                    continue;
+                }
+                _ => {}
+            }
+
             // --- GROUNDING: отсекаем выдумки ДО действия ---
             let claims = format!("{} {}", decision.observation, decision.thought);
             let violations = grounding::check_claims(&claims, &ev_before, task, true);
@@ -622,6 +666,7 @@ impl Agent {
                         confidence: decision.confidence,
                         verified: Some(verdict.is_confirmed()),
                     });
+                    self.jev.observe(&act_str, !verdict.is_refuted());
                     self.mem_lock().log_step(
                         &task_id,
                         step as i64,

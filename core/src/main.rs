@@ -18,6 +18,7 @@ mod fuzz;
 mod gui;
 mod llm;
 mod logic;
+mod jev;
 mod memory;
 mod platform;
 mod radar;
