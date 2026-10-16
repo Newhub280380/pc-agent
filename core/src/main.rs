@@ -17,6 +17,7 @@ mod config;
 mod fuzz;
 mod gui;
 mod llm;
+mod logic;
 mod memory;
 mod platform;
 mod radar;

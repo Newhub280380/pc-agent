@@ -33,6 +33,10 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 rand = "0.8"
 dirs = "5"
 log = "0.4"
+z3 = "0.12"
+# Z3 (SMT) — офлайн-логика в самом бинарнике: проверка планов и политик
+# за миллисекунды, без сети и без галлюцинаций. libz3 статически линкуется
+# из системы (libz3-dev); для Windows релиза нужен бандл libz3.dll.
 env_logger = "0.11"
 
 [target.'cfg(windows)'.dependencies]
