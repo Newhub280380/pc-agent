@@ -4,9 +4,16 @@
 //! или запрещённым политикой шагом. Z3 доказывает это за миллисекунды
 //! офлайн: без токенов, без сети, без галлюцинаций. Слой вшит в ядро -
 //! никаких шлюзов и портов, прямой вызов функции внутри бинарника.
+//!
+//! Сборка без фичи `z3logic` использует равноценный DFS-детект циклов
+//! (топологический порядок — эквивалент SMT-модели над целыми позициями),
+//! поэтому вердикты публичного API идентичны в обоих режимах.
 
 use crate::agent::graph::TaskGraph;
+
+#[cfg(feature = "z3logic")]
 use z3::ast::{Ast, Int};
+#[cfg(feature = "z3logic")]
 use z3::{Config, Context, SatResult, Solver};
 
 /// Политики гибридного мышления: то, что LLM решать не имеет права.
@@ -42,10 +49,7 @@ pub enum Verdict {
 /// модель противоречивой - Z3 это доказывает, а не чувствует.
 pub fn check_plan(graph: &TaskGraph, pol: &Policies) -> Verdict {
     if graph.nodes.len() > pol.max_plan_steps {
-        return Verdict::Violation(format!(
-            "план длиннее лимита: {} узлов",
-            graph.nodes.len()
-        ));
+        return Verdict::Violation(format!("план длиннее лимита: {} узлов", graph.nodes.len()));
     }
     for n in &graph.nodes {
         if n.deps.iter().any(|d| d == &n.id) {
@@ -57,33 +61,73 @@ pub fn check_plan(graph: &TaskGraph, pol: &Policies) -> Verdict {
             .iter()
             .find(|f| low.contains(&f.to_lowercase()))
         {
-            return Verdict::Violation(format!(
-                "в плане запрещённое политикой действие: {}",
-                f
-            ));
+            return Verdict::Violation(format!("в плане запрещённое политикой действие: {}", f));
         }
     }
-    let cfg = Config::default();
-    let ctx = Context::new(&cfg);
-    let solver = Solver::new(&ctx);
-    let pos: Vec<Int> = graph
-        .nodes
-        .iter()
-        .map(|n| Int::new_const(&ctx, format!("pos_{}", n.id)))
-        .collect();
-    for (i, n) in graph.nodes.iter().enumerate() {
-        for d in &n.deps {
-            if let Some(j) = graph.nodes.iter().position(|m| &m.id == d) {
-                solver.assert(&pos[i].gt(&pos[j]));
+
+    #[cfg(feature = "z3logic")]
+    {
+        let cfg = Config::default();
+        let ctx = Context::new(&cfg);
+        let solver = Solver::new(&ctx);
+        let pos: Vec<Int> = graph
+            .nodes
+            .iter()
+            .map(|n| Int::new_const(&ctx, format!("pos_{}", n.id)))
+            .collect();
+        for (i, n) in graph.nodes.iter().enumerate() {
+            for d in &n.deps {
+                if let Some(j) = graph.nodes.iter().position(|m| &m.id == d) {
+                    solver.assert(&pos[i].gt(&pos[j]));
+                }
             }
         }
+        return match solver.check() {
+            SatResult::Sat | SatResult::Unknown => Verdict::Ok,
+            SatResult::Unsat => Verdict::Violation("граф зависимостей противоречив (цикл)".into()),
+        };
     }
-    match solver.check() {
-        SatResult::Sat | SatResult::Unknown => Verdict::Ok,
-        SatResult::Unsat => {
-            Verdict::Violation("граф зависимостей противоречив (цикл)".into())
+
+    #[cfg(not(feature = "z3logic"))]
+    {
+        // Фолбэк без Z3: DFS по обратным рёбрам зависимостей. Порядок
+        // pos[i] > pos[j] для каждого ребра эквивалентен отсутствию цикла
+        // в ориентированном графе — тот же вердикт, что дал бы SMT-солвер.
+        if has_dependency_cycle(graph) {
+            return Verdict::Violation("граф зависимостей противоречив (цикл)".into());
         }
+        Verdict::Ok
     }
+}
+
+/// DFS-детект цикла в графе зависимостей задач (без внешних зависимостей).
+#[cfg(not(feature = "z3logic"))]
+fn has_dependency_cycle(graph: &TaskGraph) -> bool {
+    use std::collections::HashMap;
+
+    let idx: HashMap<&str, usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
+    let mut color = vec![0u8; graph.nodes.len()]; // 0=white 1=gray 2=black
+    fn dfs(i: usize, graph: &TaskGraph, idx: &HashMap<&str, usize>, color: &mut Vec<u8>) -> bool {
+        color[i] = 1;
+        for d in &graph.nodes[i].deps {
+            if let Some(&j) = idx.get(d.as_str()) {
+                if color[j] == 1 {
+                    return true; // серый дважды — цикл
+                }
+                if color[j] == 0 && dfs(j, graph, idx, color) {
+                    return true;
+                }
+            }
+        }
+        color[i] = 2;
+        false
+    }
+    (0..graph.nodes.len()).any(|i| color[i] == 0 && { dfs(i, graph, &idx, &mut color) })
 }
 
 /// Предстартовый фильтр ОДНОГО действия: быстрая проверка политики
