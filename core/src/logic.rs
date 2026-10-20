@@ -49,10 +49,7 @@ pub enum Verdict {
 /// модель противоречивой - Z3 это доказывает, а не чувствует.
 pub fn check_plan(graph: &TaskGraph, pol: &Policies) -> Verdict {
     if graph.nodes.len() > pol.max_plan_steps {
-        return Verdict::Violation(format!(
-            "план длиннее лимита: {} узлов",
-            graph.nodes.len()
-        ));
+        return Verdict::Violation(format!("план длиннее лимита: {} узлов", graph.nodes.len()));
     }
     for n in &graph.nodes {
         if n.deps.iter().any(|d| d == &n.id) {
@@ -64,10 +61,7 @@ pub fn check_plan(graph: &TaskGraph, pol: &Policies) -> Verdict {
             .iter()
             .find(|f| low.contains(&f.to_lowercase()))
         {
-            return Verdict::Violation(format!(
-                "в плане запрещённое политикой действие: {}",
-                f
-            ));
+            return Verdict::Violation(format!("в плане запрещённое политикой действие: {}", f));
         }
     }
 
@@ -90,9 +84,7 @@ pub fn check_plan(graph: &TaskGraph, pol: &Policies) -> Verdict {
         }
         return match solver.check() {
             SatResult::Sat | SatResult::Unknown => Verdict::Ok,
-            SatResult::Unsat => {
-                Verdict::Violation("граф зависимостей противоречив (цикл)".into())
-            }
+            SatResult::Unsat => Verdict::Violation("граф зависимостей противоречив (цикл)".into()),
         };
     }
 
@@ -113,15 +105,14 @@ pub fn check_plan(graph: &TaskGraph, pol: &Policies) -> Verdict {
 fn has_dependency_cycle(graph: &TaskGraph) -> bool {
     use std::collections::HashMap;
 
-    let idx: HashMap<&str, usize> =
-        graph.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+    let idx: HashMap<&str, usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
     let mut color = vec![0u8; graph.nodes.len()]; // 0=white 1=gray 2=black
-    fn dfs(
-        i: usize,
-        graph: &TaskGraph,
-        idx: &HashMap<&str, usize>,
-        color: &mut Vec<u8>,
-    ) -> bool {
+    fn dfs(i: usize, graph: &TaskGraph, idx: &HashMap<&str, usize>, color: &mut Vec<u8>) -> bool {
         color[i] = 1;
         for d in &graph.nodes[i].deps {
             if let Some(&j) = idx.get(d.as_str()) {
@@ -136,9 +127,7 @@ fn has_dependency_cycle(graph: &TaskGraph) -> bool {
         color[i] = 2;
         false
     }
-    (0..graph.nodes.len()).any(|i| color[i] == 0 && {
-        dfs(i, graph, &idx, &mut color)
-    })
+    (0..graph.nodes.len()).any(|i| color[i] == 0 && { dfs(i, graph, &idx, &mut color) })
 }
 
 /// Предстартовый фильтр ОДНОГО действия: быстрая проверка политики

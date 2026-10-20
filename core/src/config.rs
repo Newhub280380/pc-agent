@@ -631,11 +631,21 @@ mod tests {
     impl EnvGuard {
         fn new() -> Self {
             let vars = [
-                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
-                "DEEPSEEK_API_KEY", "XAI_API_KEY", "QWEN_API_KEY",
-                "OPENROUTER_API_KEY", "YOUTORIA_API_KEY", "NVIDIA_API_KEY",
-                "KILO_API_KEY", "LOCAL_API_KEY", "LLM_API_KEY",
-                "LLM_BASE_URL", "LLM_PROVIDER", "LLM_MODEL",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "GEMINI_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "XAI_API_KEY",
+                "QWEN_API_KEY",
+                "OPENROUTER_API_KEY",
+                "YOUTORIA_API_KEY",
+                "NVIDIA_API_KEY",
+                "KILO_API_KEY",
+                "LOCAL_API_KEY",
+                "LLM_API_KEY",
+                "LLM_BASE_URL",
+                "LLM_PROVIDER",
+                "LLM_MODEL",
             ];
             let mut saved = Vec::new();
             for k in vars {

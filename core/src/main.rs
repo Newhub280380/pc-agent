@@ -16,9 +16,9 @@ mod config;
 #[cfg(test)]
 mod fuzz;
 mod gui;
+mod jev;
 mod llm;
 mod logic;
-mod jev;
 mod memory;
 mod platform;
 mod radar;
