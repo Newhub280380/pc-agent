@@ -1,4 +1,5 @@
 core/target/
+core/.z3-trace
 dist/
 router/pcagent-router
 router/pcagent-router.exe

@@ -34,6 +34,7 @@ use executor::{Executor, Outcome};
 use graph::TaskGraph;
 use grounding::Evidence;
 use react::{Gate, Step, Trace};
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,6 +66,47 @@ pub enum AgentCommand {
     Start(String),
     Answer(String),
     Stop,
+    /// Процесс умер или завис: продолжить задачу с последнего целого чекпоинта.
+    Resume {
+        task_id: String,
+        task: String,
+    },
+}
+
+/// Итог задачи. `closed` истинно только после доказательства Z3,
+/// а не потому что модель прислала отчёт.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskReport {
+    pub text: String,
+    pub closed: bool,
+    /// Обычный ответ на разговор. Это не выполнение задачи на компьютере.
+    pub chat: bool,
+}
+
+impl TaskReport {
+    fn chat(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            closed: false,
+            chat: true,
+        }
+    }
+
+    fn closed(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            closed: true,
+            chat: false,
+        }
+    }
+
+    fn open(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            closed: false,
+            chat: false,
+        }
+    }
 }
 
 pub struct AgentConfig {
@@ -109,8 +151,8 @@ const ACT_SYSTEM: &str = r#"Ты — автономный агент, управ
 7. Если нужен код из SMS/приложения, 2FA или решение человека — action ask_user.
 8. Если не хватает инструмента или доступа (нет ADB, нет приложения, нет аккаунта) — action need_tool с конкретной просьбой. Не отказывайся от задачи.
 9. Важные факты о сайте/приложении сохраняй через action remember.
-10. subtask_done — только когда критерий «ГОТОВО КОГДА» реально виден на экране. Твой успех проверяется повторным наблюдением: необоснованный subtask_done будет отклонён.
-11. finish — только когда достигнута вся цель и это видно на экране.
+10. subtask_done — только когда критерий «ГОТОВО КОГДА» буквально виден на экране (фраза в кавычках или число из сравнения). Слова отчёта узел не закрывают.
+11. finish задачу не завершает. Она закроется сама, когда каждый нужный узел подтверждён проверкой экрана. Отчёт «готово» без этого будет отклонён.
 
 Отвечай СТРОГО JSON:
 {"observation":"что вижу на экране (только факты оттуда)","thought":"рассуждение: цель, риски, почему этот шаг","confidence":0.0-1.0,"question":"уточняющий вопрос, если confidence<0.8, иначе пусто","next":{"action":"click_element","name":"Войти"}}
@@ -120,24 +162,6 @@ key_combo{combo}, scroll{clicks,horizontal}, drag{x1,y1,x2,y2}, open_url{url}, l
 focus_window{title_contains}, wait{seconds,reason}, remember{title,body,importance}, ask_user{question,secret},
 adb_tap{x,y}, adb_swipe{x1,y1,x2,y2,ms}, adb_text{text}, adb_key{keycode}, adb_open_app{package}, adb_shell{cmd},
 subtask_done{result}, finish{report}, need_tool{what,why,how_to_get}"#;
-
-const VERIFY_SYSTEM: &str = r#"Ты — независимый проверяющий автономного агента. Тебе дают критерий готовности подзадачи и СВЕЖЕЕ описание экрана.
-Твоя работа — не поверить агенту, а проверить по экрану.
-Правила:
-1. verified=true только если критерий ВИДЕН в описании экрана.
-2. В поле evidence процитируй фрагмент описания экрана (дословно), который это подтверждает. Выдумывать цитату запрещено: она сверяется автоматически.
-3. Если данных не хватает — verified=false и в why напиши, чего именно не видно.
-Отвечай СТРОГО JSON: {"verified":true|false,"evidence":"дословная цитата с экрана","why":"кратко"}"#;
-
-#[derive(Debug, serde::Deserialize)]
-struct VerifyAnswer {
-    #[serde(default)]
-    verified: bool,
-    #[serde(default)]
-    evidence: String,
-    #[serde(default)]
-    why: String,
-}
 
 /// Что агент делает прямо сейчас: узел графа или откат ранее выполненного узла.
 enum Work {
@@ -170,7 +194,14 @@ pub struct Agent {
     rx: Receiver<AgentCommand>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// JEV: вероятностный да/нет-фильтр на статистике шагов.
+    /// Если OpenRouter недоступен, остаётся только он.
     jev: crate::jev::Jev,
+    /// Быстрый выбор ветки через OpenRouter. Ключ наружу не пишется.
+    decisions: crate::decisions::Client,
+    optimizer: crate::optimize::Kind,
+    checkpoints: crate::checkpoint::Store,
+    hang: Duration,
+    jev_warned: bool,
 }
 
 impl Agent {
@@ -192,6 +223,15 @@ impl Agent {
             rx,
             stop,
             jev: crate::jev::Jev::new(),
+            decisions: crate::decisions::Client::from_env(),
+            optimizer: crate::optimize::Kind::from_env(),
+            checkpoints: crate::checkpoint::Store::open(crate::checkpoint::default_dir())
+                .or_else(|_| {
+                    crate::checkpoint::Store::open(std::env::temp_dir().join("pcagent-checkpoints"))
+                })
+                .expect("каталог чекпоинтов"),
+            hang: hang_limit(),
+            jev_warned: false,
         }
     }
 
@@ -225,39 +265,78 @@ impl Agent {
     /// Обёртка watchdog: любой выход из задачи (успех, ошибка, паника) помечает
     /// её статус в БД. Жёсткая смерть процесса оставляет 'running' — и это
     /// единственный случай, который следующий запуск видит как «брошено».
-    pub fn run_task(&mut self, task: &str) -> Result<String> {
-        let task_id = format!("t{}", chrono::Utc::now().timestamp());
+    pub fn run_task(&mut self, task: &str) -> Result<TaskReport> {
+        let task_id = format!("t{}", chrono::Utc::now().timestamp_millis());
         if let Ok(m) = self.mem.lock() {
             let _ = m.task_start(&task_id, task);
         }
-        let result = self.run_task_inner(task, &task_id);
+        let result = self.run_task_inner(task, &task_id, false);
+        self.finish_task(&task_id, result)
+    }
+
+    /// Продолжение после падения или зависания. Новый id не заводим:
+    /// в базе задача всё ещё `running`, снимок лежит под старым id.
+    pub fn resume_task(&mut self, task_id: &str, task: &str) -> Result<TaskReport> {
+        self.log(format!("Watchdog: продолжаю задачу {task_id}"));
+        let result = self.run_task_inner(task, task_id, true);
+        self.finish_task(task_id, result)
+    }
+
+    fn finish_task(&mut self, task_id: &str, result: Result<TaskReport>) -> Result<TaskReport> {
         if let Ok(m) = self.mem.lock() {
-            // Остановка человеком — не «успех», честно пишем interrupted.
+            // Остановка человеком — не «успех». Закрытие пишем только когда
+            // Z3 принял решение; отчёт модели такого статуса не даёт.
             let status = if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 "interrupted"
-            } else if result.is_ok() {
-                "done"
             } else {
-                "failed"
+                match &result {
+                    Ok(r) if r.chat => "chat",
+                    Ok(r) if r.closed => "done",
+                    Ok(_) => "incomplete",
+                    Err(_) => "failed",
+                }
             };
-            let _ = m.task_finish(&task_id, status);
+            let _ = m.task_finish(task_id, status);
         }
         result
     }
 
-    fn run_task_inner(&mut self, task: &str, task_id: &str) -> Result<String> {
+    fn run_task_inner(&mut self, task: &str, task_id: &str, resume: bool) -> Result<TaskReport> {
         let started = Instant::now();
         self.log(format!("Задача: {task}"));
 
+        let resumed = if resume {
+            match self.checkpoints.load_latest(task_id)? {
+                Some(snap) => {
+                    self.log(format!(
+                        "Снимок шага {} найден, живое состояние подменю им",
+                        snap.step
+                    ));
+                    Some(snap)
+                }
+                None => {
+                    return Ok(TaskReport::open(
+                        "Чекпоинта нет, продолжать оборванную задачу не из чего",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         // 0. Человек мог просто поздороваться или спросить — тогда отвечаем
         // словами, а не двигаем мышью по случайному плану.
-        if let Some(reply) = planner::chat_reply(&self.llm, task) {
-            self.log(reply.clone());
-            return Ok(reply);
+        if resumed.is_none() {
+            if let Some(reply) = planner::chat_reply(&self.llm, task) {
+                self.log(reply.clone());
+                return Ok(TaskReport::chat(reply));
+            }
         }
 
         // 1. Поднимаем прошлый опыт ДО планирования.
-        let hints = {
+        let hints = if resumed.is_some() {
+            String::new()
+        } else {
             let m = self.mem_lock();
             m.recall_global(task, 8)?
                 .into_iter()
@@ -269,68 +348,133 @@ impl Agent {
             self.log("Нашёл прошлый опыт по этой теме, учитываю в плане");
         }
 
-        // 2. Граф задач. Если модель не смогла его собрать — работаем по одной
-        // цели: агент без плана хуже агента с плохим планом.
-        let mut graph = match planner::make_graph(&self.llm, task, &hints) {
-            Ok(g) => g,
-            Err(e) => {
-                self.log(format!(
-                    "Планировщик не дал валидный граф ({e}), иду одной целью"
-                ));
-                let mut g = TaskGraph::linear(
-                    task,
-                    &[(
-                        task.to_string(),
-                        "цель задачи видна выполненной".to_string(),
-                    )],
-                );
-                g.validate().map_err(anyhow::Error::msg)?;
-                g
+        // 2. Граф задач. Если модель не смогла его собрать — одна цель,
+        // критерий которой состоит из слов самой задачи, а не из выдуманной
+        // фразы «цель видна выполненной».
+        let mut graph = if let Some(snap) = &resumed {
+            snap.graph.clone()
+        } else {
+            match planner::make_graph(&self.llm, task, &hints) {
+                Ok(g) => g,
+                Err(e) => {
+                    self.log(format!(
+                        "Планировщик не дал валидный граф ({e}), иду одной целью"
+                    ));
+                    let mut g = TaskGraph::linear(task, &[(task.to_string(), task.to_string())]);
+                    if let Err(err) = g.validate() {
+                        return Ok(TaskReport::open(format!(
+                            "План не построен: {e}. Запасной план тоже не прошёл проверку: {err}"
+                        )));
+                    }
+                    g
+                }
             }
         };
         self.send_plan(&graph);
         self.log(format!("Граф из {} узлов", graph.nodes.len()));
 
-        // --- Z3: доказательная проверка плана ДО исполнения ---
+        // Z3 отклоняет план целиком. Подменять его одной размытой целью
+        // нельзя: так запрещённый или цикличный план всё равно исполнялся.
         if let crate::logic::Verdict::Violation(why) =
             crate::logic::check_plan(&graph, &self.cfg.policies)
         {
-            self.log(format!("Z3 отклонил план: {why}. Иду одной целью"));
-            let mut g = TaskGraph::linear(
-                task,
-                &[(
-                    task.to_string(),
-                    "цель задачи видна выполненной".to_string(),
-                )],
-            );
-            if g.validate().is_ok() {
-                graph = g;
-                self.send_plan(&graph);
-            }
+            self.log(format!("Z3 отклонил план: {why}"));
+            return Ok(TaskReport::open(format!(
+                "План отклонён проверкой Z3: {why}"
+            )));
+        }
+        if resumed.is_none() {
+            self.order_plan(&mut graph);
+        }
+
+        let mut criteria = resumed
+            .as_ref()
+            .map(|s| s.criteria.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| crate::acceptance::decompose(task));
+        if criteria.is_empty() {
+            self.log("В задаче нет измеримого критерия приёмки: она останется незакрытой");
+        } else {
+            self.log(format!("Критерии приёмки: {}", criteria.join(" | ")));
         }
 
         let mut trace = Trace::default();
-        let mut step: u32 = 0;
+        if let Some(snap) = &resumed {
+            trace.from_steps(snap.trace.clone());
+        }
+        let mut step: u32 = resumed.as_ref().map(|s| s.step).unwrap_or(0);
+        let mut touched: Vec<std::path::PathBuf> = resumed
+            .as_ref()
+            .map(|s| s.touched.iter().map(std::path::PathBuf::from).collect())
+            .unwrap_or_default();
+        let mut observed: HashMap<String, bool> = resumed
+            .as_ref()
+            .map(|s| s.observed.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
         let mut failures: Vec<String> = vec![];
         let mut rollback_queue: Vec<(String, String)> = vec![];
         let mut rollback_steps: u32 = 0;
         let mut need_replan = false;
         let mut pending_lesson: Option<String> = None;
         let mut phone_mode = looks_like_phone_task(task);
+        // Экран на старте отката: закрываем откат только если он изменился.
+        let mut rollback_origin: HashMap<String, Evidence> = HashMap::new();
         if phone_mode {
             self.log("Задача про телефон — смотрю экран Android");
         }
 
+        let beat_path = self.checkpoints.root().join(format!("{task_id}.beat"));
+        let restart = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _watch = spawn_watch(
+            beat_path.clone(),
+            self.hang,
+            restart.clone(),
+            self.stop.clone(),
+        );
+        if resumed.is_none() {
+            if let Err(e) = self.capture_step(
+                task_id, task, step, &graph, &observed, &touched, &criteria, &trace,
+            ) {
+                self.log(format!("Стартовый чекпоинт не снят: {e}"));
+            }
+        }
+
         while step < self.cfg.max_steps {
+            if restart.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                self.log("Watchdog: шаг завис, возвращаюсь к последнему чекпоинту");
+                if self.checkpoints.load_latest(task_id)?.is_some() {
+                    if let Err(e) = self.restore_state(
+                        task_id,
+                        &mut graph,
+                        &mut observed,
+                        &mut trace,
+                        &mut touched,
+                        &mut criteria,
+                    ) {
+                        return Ok(TaskReport::open(format!(
+                            "Watchdog не смог откатиться к чекпоинту: {e}"
+                        )));
+                    }
+                    continue;
+                }
+            }
+            let _ = crate::watchdog::write_beat(
+                &beat_path,
+                &crate::watchdog::Beat {
+                    task_id: task_id.to_string(),
+                    step,
+                    unix_ms: crate::watchdog::now_ms(),
+                },
+            );
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok("Остановлено пользователем".into());
+                return Ok(TaskReport::open("Остановлено пользователем"));
             }
             if started.elapsed() > Duration::from_secs(self.cfg.max_minutes * 60) {
-                return Ok(format!(
+                return Ok(TaskReport::open(format!(
                     "Стоп по таймауту {} мин. {}",
                     self.cfg.max_minutes,
                     self.finish_report(&graph, &trace)
-                ));
+                )));
             }
 
             // --- ЧТО ДЕЛАЕМ СЕЙЧАС ---
@@ -338,7 +482,7 @@ impl Agent {
             // состояние, двигаться вперёд нельзя.
             let work = match rollback_queue.last().cloned() {
                 Some((id, instruction)) => Work::Rollback { id, instruction },
-                None => match graph.next() {
+                None => match self.choose_node(&graph, task) {
                     Some(n) => Work::Node {
                         id: n.id.clone(),
                         goal: n.goal.clone(),
@@ -352,6 +496,7 @@ impl Agent {
                                 Ok(g) => {
                                     self.log("Перепланировал остаток графа");
                                     graph = g;
+                                    retain_observed(&graph, &mut observed);
                                     self.send_plan(&graph);
                                     failures.clear();
                                     continue;
@@ -361,7 +506,9 @@ impl Agent {
                                 }
                             }
                         }
-                        return Ok(self.finish_report(&graph, &trace));
+                        return Ok(
+                            self.close_if_proven(&graph, &trace, &observed, &criteria, phone_mode)
+                        );
                     }
                 },
             };
@@ -403,6 +550,11 @@ impl Agent {
             let ctx = view.ctx.clone();
             let shelf = Memory::shelf_for(&ctx);
             let ev_before = Evidence::from_prompt(&view.prompt);
+            if let Work::Rollback { id, .. } = &work {
+                rollback_origin
+                    .entry(id.clone())
+                    .or_insert_with(|| ev_before.clone());
+            }
 
             // --- ПАМЯТЬ: только нужная полка ---
             let (shelf_notes, lessons, digest) = {
@@ -521,6 +673,23 @@ impl Agent {
                 failures.push(why);
                 continue;
             }
+            if self.decisions.enabled() {
+                let state = serde_json::json!({
+                    "action": act_str,
+                    "goal": work.goal(),
+                    "failures": failures,
+                });
+                match self.decisions.yes(&state, "Делать ли это действие сейчас?")
+                {
+                    Ok(false) => {
+                        self.log("JEV: действие сейчас не подходит, пропускаю");
+                        failures.push("jev: noul отказал в действии".into());
+                        continue;
+                    }
+                    Ok(true) => {}
+                    Err(e) => self.warn_jev(&e.to_string()),
+                }
+            }
             match self.jev.ask(&act_str) {
                 crate::jev::JevVerdict::No => {
                     self.log(format!(
@@ -623,6 +792,21 @@ impl Agent {
                 }
             }
 
+            // --- ЧЕКПОИНТ ДО ШАГА ---
+            // Нет целого снимка — нет действия. Иначе откатывать будет некуда.
+            for path in paths_from(&decision.next) {
+                if !touched.iter().any(|have| have == &path) {
+                    touched.push(path);
+                }
+            }
+            if let Err(e) = self.capture_step(
+                task_id, task, step, &graph, &observed, &touched, &criteria, &trace,
+            ) {
+                self.log(format!("Чекпоинт не снят, шаг не делаю: {e}"));
+                failures.push(format!("чекпоинт: {e}"));
+                continue;
+            }
+
             // --- ДЕЙСТВИЕ ---
             self.log(format!("Шаг {step}: {}", human_readable(&decision.next)));
             let expectation = verify::expectation_of(&decision.next);
@@ -646,11 +830,21 @@ impl Agent {
                     let (verdict, mut observation) =
                         self.observe_and_verify(phone_mode, &expectation, &ev_before, &msg);
                     if verdict.is_refuted() {
-                        failures.push(format!(
-                            "{}: {}",
-                            human_readable(&decision.next),
-                            verdict.human()
-                        ));
+                        let why =
+                            format!("{}: {}", human_readable(&decision.next), verdict.human());
+                        failures.push(why.clone());
+                        if let Err(e) = self.restore_state(
+                            task_id,
+                            &mut graph,
+                            &mut observed,
+                            &mut trace,
+                            &mut touched,
+                            &mut criteria,
+                        ) {
+                            return Ok(TaskReport::open(format!(
+                                "Шаг не подтверждён ({why}), полный откат не удался: {e}"
+                            )));
+                        }
                     } else {
                         if let Some(sig) = pending_lesson.take() {
                             let _ = self.mem_lock().mark_lesson_worked(&sig);
@@ -678,45 +872,68 @@ impl Agent {
                 Ok(Outcome::SubtaskDone(res)) => {
                     match &work {
                         Work::Rollback { id, instruction } => {
-                            self.log(format!("Откат выполнен: {instruction}"));
-                            graph.mark_rolled_back(id);
-                            rollback_queue.pop();
-                            rollback_steps = 0;
-                            need_replan = true;
+                            let proven = self.rollback_visible(
+                                phone_mode,
+                                instruction,
+                                rollback_origin.get(id),
+                            );
+                            if proven {
+                                self.log(format!("Откат виден на экране: {instruction}"));
+                                graph.mark_rolled_back(id);
+                                observed.remove(id);
+                                rollback_queue.pop();
+                                rollback_steps = 0;
+                                need_replan = true;
+                            } else {
+                                self.log(format!(
+                                    "Не закрываю откат {id}: экран его не подтвердил"
+                                ));
+                                failures.push("откат не подтверждён наблюдением экрана".into());
+                            }
                             trace.push(Step {
                                 n: step,
                                 thought: decision.thought.clone(),
                                 action: act_str.clone(),
-                                observation: format!("откат узла {id} завершён: {res}"),
+                                observation: if proven {
+                                    format!("откат узла {id} подтверждён экраном")
+                                } else {
+                                    format!(
+                                        "откат узла {id} НЕ подтверждён. Модель написала: {res}"
+                                    )
+                                },
                                 confidence: decision.confidence,
-                                verified: Some(true),
+                                verified: Some(proven),
                             });
                         }
-                        Work::Node {
-                            id,
-                            goal,
-                            done_when,
-                        } => {
-                            // Do → Verify → Report: закрываем узел только после
-                            // независимой проверки критерия по свежему экрану.
-                            let (ok, why) = self.verify_node(phone_mode, goal, done_when);
+                        Work::Node { id, done_when, .. } => {
+                            // Слова subtask_done не закрывают узел. Сначала
+                            // свежий экран, потом Z3: критерий наблюдён и
+                            // зависимости уже выполнены.
+                            let (met, why) = self.criterion_on_screen(phone_mode, done_when);
+                            let verdict = crate::logic::allow_node_done(&graph, id, met);
+                            let ok = verdict == crate::logic::Verdict::Ok;
                             if ok {
-                                self.log(format!("Узел {id} готов: {res}"));
-                                graph.mark_done(id, &res);
+                                self.log(format!("Узел {id} закрыт проверкой Z3"));
+                                graph.mark_done(id, &why);
+                                observed.insert(id.clone(), true);
                                 self.send_plan(&graph);
                                 failures.clear();
                             } else {
-                                self.log(format!("Не закрываю {id}: {why}"));
-                                failures.push(format!("критерий готовности не подтверждён: {why}"));
+                                let msg = match verdict {
+                                    crate::logic::Verdict::Violation(v) if met => v,
+                                    _ => why.clone(),
+                                };
+                                self.log(format!("Не закрываю {id}: {msg}"));
+                                failures.push(format!("критерий готовности не подтверждён: {msg}"));
                             }
                             trace.push(Step {
                                 n: step,
                                 thought: decision.thought.clone(),
                                 action: act_str.clone(),
                                 observation: if ok {
-                                    format!("узел {id} подтверждён проверкой: {why}")
+                                    format!("узел {id} подтверждён экраном: {why}")
                                 } else {
-                                    format!("узел {id} НЕ подтверждён: {why}")
+                                    format!("узел {id} НЕ подтверждён. Модель написала: {res}")
                                 },
                                 confidence: decision.confidence,
                                 verified: Some(ok),
@@ -725,40 +942,48 @@ impl Agent {
                     }
                 }
                 Ok(Outcome::Finished(report)) => {
-                    // Отчёт без единого подтверждённого шага — это галлюцинация
-                    // успеха, самый дорогой вид ошибки.
-                    if let Err(why) = grounding::report_is_grounded(&report, trace.verified_count())
-                    {
-                        self.log(format!("Отклонил finish: {why}"));
-                        failures.push(format!("{why}: сделай проверяемый шаг и покажи результат"));
-                        continue;
+                    // Отчёт не является сертификатом. Если решение уже доказано,
+                    // наружу уходит отчёт по узлам, а не текст модели.
+                    match crate::logic::check_solution(&graph, &observed) {
+                        crate::logic::Verdict::Ok => {
+                            self.log(
+                                "Задача закрыта: Z3 подтвердил решение, текст finish не использован как доказательство",
+                            );
+                            let proven = self
+                                .close_if_proven(&graph, &trace, &observed, &criteria, phone_mode);
+                            let m = self.mem_lock();
+                            let note = crate::text::truncate(&proven.text, 400);
+                            m.remember(
+                                &shelf,
+                                "outcome",
+                                &format!("Задача: {task}"),
+                                &note,
+                                &note,
+                                0.7,
+                            )?;
+                            m.set_shelf_digest(&shelf, &note)?;
+                            drop(m);
+                            return Ok(proven);
+                        }
+                        crate::logic::Verdict::Violation(why) => {
+                            let claim = grounding::report_is_grounded(&report)
+                                .err()
+                                .unwrap_or_else(|| "finish без доказанного результата".into());
+                            self.log(format!("Отклонил finish: {claim}. {why}"));
+                            failures.push(format!(
+                                "{claim}. {why}. Сделай шаг и добейся, чтобы критерий был виден на экране"
+                            ));
+                            trace.push(Step {
+                                n: step,
+                                thought: decision.thought.clone(),
+                                action: act_str.clone(),
+                                observation: format!("finish отклонён: {why}"),
+                                confidence: decision.confidence,
+                                verified: Some(false),
+                            });
+                            continue;
+                        }
                     }
-                    let left = graph
-                        .nodes
-                        .iter()
-                        .filter(|n| n.state == graph::NodeState::Pending)
-                        .count();
-                    self.log("Задача выполнена");
-                    let m = self.mem_lock();
-                    m.remember(
-                        &shelf,
-                        "outcome",
-                        &format!("Задача: {task}"),
-                        &report,
-                        &report,
-                        0.7,
-                    )?;
-                    // Короткая «шпаргалка» по месту: читается всегда, в отличие от
-                    // отдельных заметок, которые достаются только по совпадению слов.
-                    let digest = format!("{task} — получилось за {step} шагов: {report}");
-                    let digest: String = digest.chars().take(400).collect();
-                    m.set_shelf_digest(&shelf, &digest)?;
-                    drop(m);
-                    return Ok(if left > 0 {
-                        format!("{report}\n\n(узлов графа не закрыто: {left} — проверь результат)")
-                    } else {
-                        report
-                    });
                 }
                 Ok(Outcome::NeedHuman { question, secret }) => {
                     let ans = self.ask_human(&question, secret);
@@ -801,9 +1026,23 @@ impl Agent {
                 Err(e) => {
                     let err = e.to_string();
                     self.log(format!("Ошибка: {err}"));
+                    // Сначала целиком назад, и только потом разбор. Иначе
+                    // заметка об ошибке пишется в уже испорченную память.
+                    if let Err(re) = self.restore_state(
+                        task_id,
+                        &mut graph,
+                        &mut observed,
+                        &mut trace,
+                        &mut touched,
+                        &mut criteria,
+                    ) {
+                        return Ok(TaskReport::open(format!(
+                            "Сбой «{err}». Полный откат к чекпоинту не удался, дальше состояние не меняю: {re}"
+                        )));
+                    }
                     failures.push(err.clone());
                     self.mem_lock()
-                        .log_step(&task_id, step as i64, &act_str, &err, false)?;
+                        .log_step(task_id, step as i64, &act_str, &err, false)?;
                     trace.push(Step {
                         n: step,
                         thought: decision.thought.clone(),
@@ -812,8 +1051,9 @@ impl Agent {
                         confidence: decision.confidence,
                         verified: Some(false),
                     });
+                    let cause = crate::failure::analyze(&trace.render(), &err);
+                    self.log(format!("Причина сбоя: {}", cause.summary));
 
-                    // --- РЕФЛЕКСИЯ ---
                     let screen = view.prompt.clone();
                     match reflection::analyze(
                         &self.llm,
@@ -835,24 +1075,27 @@ impl Agent {
                         Err(e2) => self.log(format!("Не смог разобрать ошибку: {e2}")),
                     }
 
-                    // Узел исчерпал попытки — откатываем сделанное и перепланируем.
                     if let Work::Node { id, .. } = &work {
-                        if graph.mark_attempt_failed(id, &err) {
-                            self.log(format!("Узел {id} провалился — откатываю выполненное"));
-                            rollback_queue = graph.rollback_plan();
-                            rollback_steps = 0;
-                            need_replan = true;
-                            self.send_plan(&graph);
-                            if rollback_queue.is_empty() {
-                                // Откатывать нечего — сразу к перепланированию.
-                                let screen = view.prompt.clone();
-                                if let Ok(g) =
-                                    planner::replan(&self.llm, &graph, &screen, &failures)
-                                {
-                                    graph = g;
-                                    self.send_plan(&graph);
-                                    failures.clear();
-                                    need_replan = false;
+                        if graph.mark_attempt_failed(id, &cause.summary) {
+                            self.log(format!(
+                                "Узел {id} исчерпал попытки. Состояние уже на чекпоинте, перепланирую остаток"
+                            ));
+                            match crate::failure::replan_remaining(&graph, &cause) {
+                                Ok(g) => {
+                                    self.accept_replan(&mut graph, &mut observed, g, &mut failures);
+                                }
+                                Err(e2) => {
+                                    self.log(format!("Локальный переплан не вышел: {e2}"));
+                                    if let Ok(g) =
+                                        planner::replan(&self.llm, &graph, &screen, &failures)
+                                    {
+                                        self.accept_replan(
+                                            &mut graph,
+                                            &mut observed,
+                                            g,
+                                            &mut failures,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -860,11 +1103,234 @@ impl Agent {
                 }
             }
         }
-        Ok(format!(
+        Ok(TaskReport::open(format!(
             "Достигнут лимит {} шагов. {}",
             self.cfg.max_steps,
             self.finish_report(&graph, &trace)
-        ))
+        )))
+    }
+
+    /// Свежий экран против критерия. Вторая половина ответа — короткая
+    /// выжимка того, что именно увидели, чтобы положить её в узел.
+    fn criterion_on_screen(&self, phone_mode: bool, done_when: &str) -> (bool, String) {
+        let view = match self.perceive(phone_mode, false) {
+            Ok(v) => v,
+            Err(PerceiveError::PhoneGone(e)) | Err(PerceiveError::ScreenGone(e)) => {
+                return (false, format!("экран не читается: {e}"));
+            }
+        };
+        let ev = Evidence::from_prompt(&view.prompt);
+        let met = verify::criterion_observed(done_when, &ev);
+        let seen = crate::text::truncate(&view.prompt, 160);
+        if met {
+            (true, format!("критерий «{done_when}» виден: {seen}"))
+        } else {
+            (false, format!("на экране нет критерия «{done_when}»"))
+        }
+    }
+
+    /// Откат закрывается по экрану. Если в инструкции есть кавычки или
+    /// сравнение — они тоже обязаны выполниться. Иначе достаточно того,
+    /// что экран изменился с момента начала отката: «удалить файл» часто
+    /// видно как отсутствие, а не как новая надпись.
+    fn rollback_visible(
+        &self,
+        phone_mode: bool,
+        instruction: &str,
+        origin: Option<&Evidence>,
+    ) -> bool {
+        let view = match self.perceive(phone_mode, false) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let after = Evidence::from_prompt(&view.prompt);
+        let before = origin.cloned().unwrap_or_default();
+        let changed =
+            verify::verify(&verify::Expectation::ScreenChanged, &before, &after).is_confirmed();
+        if verify::has_checkable_literal(instruction) {
+            changed && verify::criterion_observed(instruction, &after)
+        } else {
+            changed
+        }
+    }
+
+    fn close_if_proven(
+        &self,
+        graph: &TaskGraph,
+        trace: &Trace,
+        observed: &HashMap<String, bool>,
+        criteria: &[String],
+        phone_mode: bool,
+    ) -> TaskReport {
+        let evidence = match self.perceive(phone_mode, false) {
+            Ok(view) => Evidence::from_prompt(&view.prompt),
+            Err(_) => Evidence::default(),
+        };
+        let unmet = crate::acceptance::unmet(criteria, &evidence);
+        if !unmet.is_empty() {
+            return TaskReport::open(format!(
+                "Задача не закрыта: {}\n\n{}",
+                unmet.join("; "),
+                self.finish_report(graph, trace)
+            ));
+        }
+        match crate::logic::check_solution(graph, observed) {
+            crate::logic::Verdict::Ok => TaskReport::closed(self.finish_report(graph, trace)),
+            crate::logic::Verdict::Violation(why) => TaskReport::open(format!(
+                "Задача не закрыта: {why}\n\n{}",
+                self.finish_report(graph, trace)
+            )),
+        }
+    }
+
+    fn order_plan(&self, graph: &mut TaskGraph) {
+        let draft = crate::optimize::problem_from_graph(
+            graph,
+            crate::optimize::Limits {
+                max_time: 1,
+                max_cost: 1,
+                max_risk: 1,
+            },
+        );
+        let problem =
+            crate::optimize::problem_from_graph(graph, crate::optimize::loose_limits(&draft));
+        match crate::optimize::solve(self.optimizer, &problem) {
+            Ok(sol) => {
+                let mut ordered = graph.clone();
+                crate::optimize::apply_solution(&mut ordered, &sol);
+                match crate::logic::check_plan(&ordered, &self.cfg.policies) {
+                    crate::logic::Verdict::Ok => {
+                        self.log(format!(
+                            "Порядок шагов выбрал {}: {}",
+                            sol.solver,
+                            sol.order.join(" → ")
+                        ));
+                        *graph = ordered;
+                    }
+                    crate::logic::Verdict::Violation(why) => {
+                        self.log(format!(
+                            "Z3 отклонил порядок оптимизатора ({why}), оставляю исходный план"
+                        ));
+                    }
+                }
+            }
+            Err(e) => self.log(format!("Оптимизатор порядка недоступен: {e}")),
+        }
+    }
+
+    fn accept_replan(
+        &self,
+        graph: &mut TaskGraph,
+        observed: &mut HashMap<String, bool>,
+        next: TaskGraph,
+        failures: &mut Vec<String>,
+    ) {
+        match crate::logic::check_plan(&next, &self.cfg.policies) {
+            crate::logic::Verdict::Ok => {
+                self.log("Остаток плана заново прошёл Z3");
+                *graph = next;
+                retain_observed(graph, observed);
+                self.send_plan(graph);
+                failures.clear();
+            }
+            crate::logic::Verdict::Violation(why) => {
+                self.log(format!("Z3 отклонил перепланированный остаток: {why}"));
+            }
+        }
+    }
+
+    fn choose_node(&mut self, graph: &TaskGraph, task: &str) -> Option<graph::Node> {
+        let ready: Vec<(String, String)> = graph
+            .ready()
+            .iter()
+            .map(|n| (n.id.clone(), n.goal.clone()))
+            .collect();
+        if ready.len() > 1 && self.decisions.enabled() {
+            let state = serde_json::json!({ "task": task });
+            match self
+                .decisions
+                .choice(&state, "Какой оставшийся узел делать сейчас?", &ready)
+            {
+                Ok(choice) => {
+                    if let Some(n) = graph.nodes.iter().find(|n| n.id == choice.id) {
+                        return Some(n.clone());
+                    }
+                }
+                Err(e) => self.warn_jev(&e.to_string()),
+            }
+        }
+        graph.next().cloned()
+    }
+
+    fn warn_jev(&mut self, text: &str) {
+        if self.jev_warned {
+            return;
+        }
+        self.jev_warned = true;
+        self.log(format!(
+            "JEV OpenRouter недоступен, решаю локальной статистикой: {text}"
+        ));
+    }
+
+    fn capture_step(
+        &self,
+        task_id: &str,
+        task: &str,
+        step: u32,
+        graph: &TaskGraph,
+        observed: &HashMap<String, bool>,
+        touched: &[std::path::PathBuf],
+        criteria: &[String],
+        trace: &Trace,
+    ) -> Result<()> {
+        let files = crate::checkpoint::read_files(touched)?;
+        let (window_id, window_title) =
+            crate::platform::foreground_window().unwrap_or((0, String::new()));
+        let snap = crate::checkpoint::Snapshot {
+            task_id: task_id.to_string(),
+            task: task.to_string(),
+            step,
+            graph: graph.clone(),
+            observed: observed.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            window_id,
+            window_title,
+            files,
+            criteria: criteria.to_vec(),
+            trace: trace.to_steps(),
+            touched: touched.iter().map(|p| p.display().to_string()).collect(),
+        };
+        let mem = self.mem_lock();
+        self.checkpoints.save(&snap, &mem)?;
+        Ok(())
+    }
+
+    fn restore_state(
+        &mut self,
+        task_id: &str,
+        graph: &mut TaskGraph,
+        observed: &mut HashMap<String, bool>,
+        trace: &mut Trace,
+        touched: &mut Vec<std::path::PathBuf>,
+        criteria: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut mem = self.mem_lock();
+        let snap = self
+            .checkpoints
+            .restore_latest(task_id, &mut mem, &mut |id, _title| {
+                if id == 0 {
+                    return Ok(());
+                }
+                crate::platform::focus_window(id).map_err(|e| e.to_string())
+            })?;
+        drop(mem);
+        *graph = snap.graph;
+        *observed = snap.observed.into_iter().collect();
+        trace.from_steps(snap.trace);
+        *touched = snap.touched.iter().map(std::path::PathBuf::from).collect();
+        if !snap.criteria.is_empty() {
+            *criteria = snap.criteria;
+        }
+        Ok(())
     }
 
     /// Восприятие ПК или телефона одним вызовом: цикл выше не должен знать,
@@ -925,59 +1391,6 @@ impl Agent {
         }
     }
 
-    /// Независимая проверка критерия готовности узла по свежему экрану.
-    /// Цитату модели сверяем с наблюдением: сочинённое «подтверждение» не
-    /// проходит (см. grounding.rs).
-    fn verify_node(&self, phone_mode: bool, goal: &str, done_when: &str) -> (bool, String) {
-        let view = match self.perceive(phone_mode, false) {
-            Ok(v) => v,
-            Err(PerceiveError::PhoneGone(e)) | Err(PerceiveError::ScreenGone(e)) => {
-                return (false, format!("экран не читается: {e}"))
-            }
-        };
-        let ev = Evidence::from_prompt(&view.prompt);
-        let user = format!(
-            "ПОДЗАДАЧА: {goal}\nКРИТЕРИЙ ГОТОВНОСТИ: {done_when}\n\nСВЕЖИЙ ЭКРАН:\n{}",
-            view.prompt
-        );
-        let resp = match self.llm.complete(
-            &[Message::system(VERIFY_SYSTEM), Message::user(user)],
-            "verify",
-            true,
-            0.0,
-        ) {
-            Ok(r) => r,
-            Err(e) => return (false, format!("проверяющий вызов не удался: {e}")),
-        };
-        let ans: VerifyAnswer = match extract_json(&resp.text)
-            .and_then(|v| serde_json::from_value::<VerifyAnswer>(v).map_err(anyhow::Error::from))
-        {
-            Ok(a) => a,
-            Err(e) => return (false, format!("проверяющий ответил не по формату: {e}")),
-        };
-        if !ans.verified {
-            return (
-                false,
-                if ans.why.is_empty() {
-                    "критерий не виден".into()
-                } else {
-                    ans.why
-                },
-            );
-        }
-        // Цитата обязательна и обязана существовать на экране.
-        if ans.evidence.trim().is_empty() {
-            return (false, "нет цитаты с экрана".into());
-        }
-        if !ev.mentions(&ans.evidence) {
-            return (
-                false,
-                format!("цитата «{}» отсутствует на экране", short(&ans.evidence)),
-            );
-        }
-        (true, ans.evidence)
-    }
-
     /// Восприятие телефона: uiautomator даёт элементы с координатами,
     /// скриншот подключаем только когда элементов мало или что-то сломалось
     /// (PNG с телефона — это ~1-2 МБ и лишняя секунда на каждый шаг).
@@ -1025,7 +1438,7 @@ impl Agent {
                     self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     return String::new();
                 }
-                Ok(AgentCommand::Start(_)) => {} // новая задача во время ожидания игнорируется
+                Ok(AgentCommand::Start(_)) | Ok(AgentCommand::Resume { .. }) => {}
                 Err(_) => continue,
             }
         }
@@ -1111,12 +1524,76 @@ fn human_readable(a: &Action) -> String {
     }
 }
 
-fn short(s: &str) -> String {
-    if s.chars().count() <= 60 {
-        s.to_string()
-    } else {
-        s.chars().take(60).collect::<String>() + "…"
+fn hang_limit() -> Duration {
+    let secs = std::env::var("PCAGENT_HANG_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    Duration::from_secs(secs.max(5))
+}
+
+fn paths_from(action: &Action) -> Vec<std::path::PathBuf> {
+    match action {
+        Action::LaunchApp { path, args } => {
+            let mut out = crate::checkpoint::paths_of_action(path);
+            for tok in args.split_whitespace() {
+                out.extend(crate::checkpoint::paths_of_action(tok));
+            }
+            out
+        }
+        _ => Vec::new(),
     }
+}
+
+struct WatchStop {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for WatchStop {
+    fn drop(&mut self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_watch(
+    beat_path: std::path::PathBuf,
+    hang: Duration,
+    restart: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> WatchStop {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_watch = flag.clone();
+    let handle = std::thread::spawn(move || {
+        while !stop_watch.load(std::sync::atomic::Ordering::Relaxed)
+            && !stop.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            std::thread::sleep(Duration::from_secs(1));
+            if let Some(beat) = crate::watchdog::read_beat(&beat_path) {
+                if crate::watchdog::assess(true, Some(&beat), crate::watchdog::now_ms(), hang)
+                    == crate::watchdog::Watch::Hung
+                {
+                    restart.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    });
+    WatchStop {
+        flag,
+        handle: Some(handle),
+    }
+}
+
+fn retain_observed(graph: &TaskGraph, observed: &mut HashMap<String, bool>) {
+    observed.retain(|id, ok| {
+        *ok && graph
+            .nodes
+            .iter()
+            .any(|n| n.id == *id && n.state == graph::NodeState::Done)
+    });
 }
 
 #[cfg(test)]
@@ -1161,11 +1638,14 @@ mod tests {
         );
 
         // Отчёт не имеет права выглядеть успешным: нет ни одного проверенного шага.
-        let trace = Trace::default();
-        assert!(grounding::report_is_grounded(
-            "Всё готово, игра установлена",
-            trace.verified_count()
-        )
-        .is_err());
+        assert!(grounding::report_is_grounded("Всё готово, игра установлена").is_err());
+        let observed = std::collections::HashMap::from([("n1".to_string(), true)]);
+        assert!(
+            matches!(
+                crate::logic::check_solution(&g, &observed),
+                crate::logic::Verdict::Violation(_)
+            ),
+            "проваленный граф нельзя закрыть отчётом"
+        );
     }
 }

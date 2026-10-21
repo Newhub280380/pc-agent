@@ -220,7 +220,10 @@ impl Executor {
                     bail!("слишком длинная adb-команда");
                 }
                 let out = self.adb.shell(cmd)?;
-                Ok(Outcome::Ok(format!("adb shell: {}", truncate(&out, 500))))
+                Ok(Outcome::Ok(format!(
+                    "adb shell: {}",
+                    crate::text::truncate(&out, 500)
+                )))
             }
         }
     }
@@ -275,14 +278,6 @@ fn launch(path: &str, args: &str) -> Result<()> {
     cmd.stdin(std::process::Stdio::null());
     cmd.spawn()?;
     Ok(())
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n).collect::<String>() + "…"
-    }
 }
 
 #[cfg(test)]

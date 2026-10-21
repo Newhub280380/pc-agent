@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Одна команда: тесты, сборка и selfcheck.
+# Z3 собирается внутрь ядра (CMake + Clang), отдельно ставить солвер не нужно.
+#   ./run         — тесты, release, --selfcheck
+#   ./run --gui   — то же и затем окно агента
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+need() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "нужна программа «$1»" >&2
+    exit 1
+  fi
+}
+need cargo
+need go
+need cmake
+need clang
+need g++
+
+# go.mod роутера требует Go 1.25.
+if ! go version | grep -Eq 'go1\.(2[5-9]|[3-9][0-9])'; then
+  echo "нужен Go 1.25 или новее, сейчас: $(go version)" >&2
+  exit 1
+fi
+
+# Z3 собирает CMake. Если компилятором C++ выбран clang с --target,
+# линковщик не находит libstdc++. g++ знает свой каталог библиотек.
+export CC="${CC:-gcc}"
+export CXX="${CXX:-g++}"
+
+echo "== тесты роутера =="
+( cd router && go test ./... )
+
+echo "== тесты ядра (Z3 включён) =="
+( cd core && cargo test )
+
+echo "== сборка =="
+( cd router && CGO_ENABLED=0 go build -ldflags "-s -w" -o pcagent-router . )
+( cd core && cargo build --release )
+
+EXE="$ROOT/core/target/release/pcagent"
+REPORT="${TMPDIR:-/tmp}/pcagent-selfcheck.txt"
+echo "== selfcheck =="
+run_selfcheck() {
+  # Без окна X не знает активное окно, и проверка «экран» была бы пустой.
+  if command -v openbox >/dev/null 2>&1; then
+    openbox >/dev/null 2>&1 &
+    sleep 1
+  fi
+  if command -v xterm >/dev/null 2>&1; then
+    xterm -geometry 40x10+0+0 -e sleep 90 >/dev/null 2>&1 &
+    sleep 1
+  fi
+  "$EXE" --selfcheck --report "$REPORT"
+}
+export EXE REPORT
+export -f run_selfcheck
+if [[ -z "${DISPLAY:-}" ]] && command -v xvfb-run >/dev/null 2>&1; then
+  xvfb-run -a bash -c 'run_selfcheck'
+else
+  run_selfcheck
+fi
+echo "отчёт selfcheck: $REPORT"
+
+if [[ "${1:-}" == "--gui" ]]; then
+  exec "$EXE"
+fi

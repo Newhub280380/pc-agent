@@ -80,14 +80,10 @@ pub fn analyze(
     mem.remember(
         &Memory::shelf_for(context),
         "lesson",
-        &format!("Ошибка: {}", truncate(error, 60)),
+        &format!("Ошибка: {}", crate::text::truncate(error, 60)),
         &format!("Причина: {}\nФикс: {}", lesson.cause, lesson.fix),
         &lesson.fix,
         0.8,
     )?;
     Ok(lesson)
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
 }

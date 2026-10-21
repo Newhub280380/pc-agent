@@ -12,6 +12,7 @@
 //! шаг — уже делается для журнала, но для промпта нужен именно короткий
 //! хвост в оперативке, без запросов к SQLite на каждом шаге.
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// Сколько шагов агент держит «в голове». Требование: последние 10.
@@ -20,7 +21,7 @@ pub const MEMORY_STEPS: usize = 10;
 /// Порог уверенности: ниже — уточняющий вопрос вместо действия.
 pub const MIN_CONFIDENCE: f64 = 0.8;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub n: u32,
     pub thought: String,
@@ -47,6 +48,19 @@ impl Trace {
 
     pub fn len(&self) -> usize {
         self.steps.len()
+    }
+
+    /// Снимок хвоста для чекпоинта. На диске лежит тот же порядок,
+    /// что агент держит в голове, без отдельного формата.
+    pub fn to_steps(&self) -> Vec<Step> {
+        self.steps.iter().cloned().collect()
+    }
+
+    pub fn from_steps(&mut self, steps: Vec<Step>) {
+        self.steps.clear();
+        for step in steps.into_iter().take(MEMORY_STEPS) {
+            self.steps.push_back(step);
+        }
     }
 
     pub fn verified_count(&self) -> usize {

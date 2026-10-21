@@ -614,6 +614,11 @@ ADB_WIFI=
 ADB_SERIAL=
 # URL манифеста автообновления (пусто = выключено)
 UPDATE_MANIFEST_URL=
+
+# Порядок шагов: minizinc (если нет бинаря — OR-Tools) или qubo
+PCAGENT_OPTIMIZER=minizinc
+# Через сколько секунд без пульса считать шаг зависшим
+PCAGENT_HANG_SEC=30
 "#
     )
 }
