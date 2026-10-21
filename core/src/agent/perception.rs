@@ -39,7 +39,7 @@ impl Observation {
                 let (cx, cy) = e.center();
                 s.push_str(&format!(
                     "- {} | {} | {},{} | {}x{}\n",
-                    truncate(&e.name, 70),
+                    crate::text::truncate(&e.name, 70),
                     e.kind,
                     cx,
                     cy,
@@ -51,7 +51,7 @@ impl Observation {
         if !self.ocr_lines.is_empty() {
             s.push_str("ТЕКСТ НА ЭКРАНЕ (OCR):\n");
             for l in self.ocr_lines.iter().take(60) {
-                s.push_str(&format!("- {}\n", truncate(l, 100)));
+                s.push_str(&format!("- {}\n", crate::text::truncate(l, 100)));
             }
         }
         if self.elements.is_empty() && self.ocr_lines.is_empty() {
@@ -101,12 +101,4 @@ pub fn perceive(need_screenshot: bool, ocr_lang: &str) -> Result<Observation> {
         screen_w: sw,
         screen_h: sh,
     })
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n).collect::<String>() + "…"
-    }
 }

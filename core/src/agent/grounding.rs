@@ -268,12 +268,11 @@ pub fn check_claims(text: &str, ev: &Evidence, task: &str, check_fs: bool) -> Ve
     out
 }
 
-/// Итоговый отчёт нельзя объявлять успехом без подтверждённых шагов:
-/// «Do → Verify → Report», где Report опирается на Verify.
-pub fn report_is_grounded(report: &str, verified_steps: usize) -> Result<(), String> {
-    if verified_steps > 0 {
-        return Ok(());
-    }
+/// Текст отчёта не закрывает задачу. Раньше функция пропускала любой
+/// успех, если где-то в трассе был хотя бы один подтверждённый шаг:
+/// модель писала «готово», и этого хватало. Число шагов сюда больше
+/// не входит — закрытие решает `logic::check_solution`.
+pub fn report_is_grounded(report: &str) -> Result<(), String> {
     let low = report.to_lowercase();
     let success = [
         "готово",
@@ -289,7 +288,10 @@ pub fn report_is_grounded(report: &str, verified_steps: usize) -> Result<(), Str
     .iter()
     .any(|k| low.contains(k));
     if success {
-        Err("отчёт заявляет успех, но ни один шаг не был подтверждён проверкой".into())
+        Err(
+            "отчёт заявляет успех, но задача закрывается только проверкой результата, не текстом"
+                .into(),
+        )
     } else {
         Ok(())
     }
@@ -361,10 +363,11 @@ mod tests {
 
     #[test]
     fn hallucination_4_success_report_without_verification_is_rejected() {
-        assert!(report_is_grounded("Готово, реклама настроена и запущена", 0).is_err());
-        assert!(report_is_grounded("Готово, реклама настроена", 3).is_ok());
-        // Честный отчёт о неудаче пропускаем: это не галлюцинация.
-        assert!(report_is_grounded("Не смог: нет доступа к Ads Manager", 0).is_ok());
+        assert!(report_is_grounded("Готово, реклама настроена и запущена").is_err());
+        // Даже пачка подтверждённых шагов не превращает текст отчёта в доказательство.
+        assert!(report_is_grounded("Готово, реклама настроена").is_err());
+        // Честный отчёт о неудаче — не заявление об успехе.
+        assert!(report_is_grounded("Не смог: нет доступа к Ads Manager").is_ok());
     }
 
     #[test]

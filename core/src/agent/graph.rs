@@ -142,9 +142,13 @@ impl TaskGraph {
                 return Err(format!("узел {} без цели", n.id));
             }
             if n.done_when.trim().is_empty() {
-                // Критерий готовности обязателен, но выдумывать его за модель
-                // дешевле, чем ронять весь план.
-                n.done_when = format!("видно, что «{}» выполнено", n.goal);
+                // Раньше сюда подставлялась фраза «видно, что цель выполнено».
+                // Это был критерий, который нельзя проверить, и узел закрывался
+                // по настроению модели. Пустой критерий — невалидный план.
+                return Err(format!(
+                    "узел {} без наблюдаемого критерия готовности",
+                    n.id
+                ));
             }
             if n.deps.len() > MAX_DEPS {
                 return Err(format!("у узла {} слишком много зависимостей", n.id));
@@ -163,9 +167,13 @@ impl TaskGraph {
                 }
             }
         }
-        self.topo_order()
-            .map(|_| ())
-            .ok_or_else(|| "в графе задач есть цикл зависимостей".to_string())
+        // Цикл доказывает Z3 (различные позиции и строгий порядок), а не
+        // второй обход графа. Топологический порядок ниже — это уже
+        // расписание исполнения, оно нужно после того, как план доказан.
+        match crate::logic::prove_schedule(self) {
+            crate::logic::Verdict::Ok => Ok(()),
+            crate::logic::Verdict::Violation(why) => Err(why),
+        }
     }
 
     /// Топологический порядок (Кан). None = цикл.
@@ -403,12 +411,13 @@ mod tests {
 
     #[test]
     fn unknown_dep_and_dup_id_rejected() {
-        let mut a: TaskGraph =
-            serde_json::from_str(r#"{"goal":"g","nodes":[{"id":"a","goal":"a","deps":["zzz"]}]}"#)
-                .expect("парсинг");
+        let mut a: TaskGraph = serde_json::from_str(
+            r#"{"goal":"g","nodes":[{"id":"a","goal":"a","done_when":"a","deps":["zzz"]}]}"#,
+        )
+        .expect("парсинг");
         assert!(a.validate().is_err());
         let mut b: TaskGraph = serde_json::from_str(
-            r#"{"goal":"g","nodes":[{"id":"a","goal":"a"},{"id":"a","goal":"b"}]}"#,
+            r#"{"goal":"g","nodes":[{"id":"a","goal":"a","done_when":"a"},{"id":"a","goal":"b","done_when":"b"}]}"#,
         )
         .expect("парсинг");
         assert!(b.validate().is_err());
@@ -452,6 +461,13 @@ mod tests {
         ))
         .expect("парсинг");
         assert!(big.validate().is_err());
+    }
+
+    #[test]
+    fn empty_done_when_is_rejected() {
+        let mut g = TaskGraph::linear("цель", &[("шаг".into(), "   ".into())]);
+        let err = g.validate().expect_err("пустой критерий");
+        assert!(err.contains("критерия"), "{err}");
     }
 
     #[test]

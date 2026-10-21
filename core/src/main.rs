@@ -25,6 +25,7 @@ mod radar;
 mod retry;
 mod sandbox;
 mod supervisor;
+mod text;
 
 use agent::{Agent, AgentCommand, AgentConfig, AgentEvent};
 use anyhow::Result;
@@ -291,8 +292,13 @@ fn worker_loop(agent: &mut Agent, ev_tx: &Sender<AgentEvent>) {
             AgentCommand::Start(task) => {
                 agent.reset_stop();
                 match agent.run_task(&task) {
+                    // «Готово» — только доказанное решение или обычный ответ
+                    // на разговор. Незакрытая задача не маскируется под успех.
+                    Ok(report) if report.closed || report.chat => {
+                        let _ = ev_tx.send(AgentEvent::Done(report.text));
+                    }
                     Ok(report) => {
-                        let _ = ev_tx.send(AgentEvent::Done(report));
+                        let _ = ev_tx.send(AgentEvent::Failed(report.text));
                     }
                     Err(e) => {
                         let _ = ev_tx.send(AgentEvent::Failed(e.to_string()));
