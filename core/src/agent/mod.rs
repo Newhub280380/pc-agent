@@ -66,6 +66,11 @@ pub enum AgentCommand {
     Start(String),
     Answer(String),
     Stop,
+    /// Процесс умер или завис: продолжить задачу с последнего целого чекпоинта.
+    Resume {
+        task_id: String,
+        task: String,
+    },
 }
 
 /// Итог задачи. `closed` истинно только после доказательства Z3,
@@ -189,7 +194,14 @@ pub struct Agent {
     rx: Receiver<AgentCommand>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// JEV: вероятностный да/нет-фильтр на статистике шагов.
+    /// Если OpenRouter недоступен, остаётся только он.
     jev: crate::jev::Jev,
+    /// Быстрый выбор ветки через OpenRouter. Ключ наружу не пишется.
+    decisions: crate::decisions::Client,
+    optimizer: crate::optimize::Kind,
+    checkpoints: crate::checkpoint::Store,
+    hang: Duration,
+    jev_warned: bool,
 }
 
 impl Agent {
@@ -211,6 +223,15 @@ impl Agent {
             rx,
             stop,
             jev: crate::jev::Jev::new(),
+            decisions: crate::decisions::Client::from_env(),
+            optimizer: crate::optimize::Kind::from_env(),
+            checkpoints: crate::checkpoint::Store::open(crate::checkpoint::default_dir())
+                .or_else(|_| {
+                    crate::checkpoint::Store::open(std::env::temp_dir().join("pcagent-checkpoints"))
+                })
+                .expect("каталог чекпоинтов"),
+            hang: hang_limit(),
+            jev_warned: false,
         }
     }
 
@@ -245,11 +266,23 @@ impl Agent {
     /// её статус в БД. Жёсткая смерть процесса оставляет 'running' — и это
     /// единственный случай, который следующий запуск видит как «брошено».
     pub fn run_task(&mut self, task: &str) -> Result<TaskReport> {
-        let task_id = format!("t{}", chrono::Utc::now().timestamp());
+        let task_id = format!("t{}", chrono::Utc::now().timestamp_millis());
         if let Ok(m) = self.mem.lock() {
             let _ = m.task_start(&task_id, task);
         }
-        let result = self.run_task_inner(task, &task_id);
+        let result = self.run_task_inner(task, &task_id, false);
+        self.finish_task(&task_id, result)
+    }
+
+    /// Продолжение после падения или зависания. Новый id не заводим:
+    /// в базе задача всё ещё `running`, снимок лежит под старым id.
+    pub fn resume_task(&mut self, task_id: &str, task: &str) -> Result<TaskReport> {
+        self.log(format!("Watchdog: продолжаю задачу {task_id}"));
+        let result = self.run_task_inner(task, task_id, true);
+        self.finish_task(task_id, result)
+    }
+
+    fn finish_task(&mut self, task_id: &str, result: Result<TaskReport>) -> Result<TaskReport> {
         if let Ok(m) = self.mem.lock() {
             // Остановка человеком — не «успех». Закрытие пишем только когда
             // Z3 принял решение; отчёт модели такого статуса не даёт.
@@ -263,24 +296,47 @@ impl Agent {
                     Err(_) => "failed",
                 }
             };
-            let _ = m.task_finish(&task_id, status);
+            let _ = m.task_finish(task_id, status);
         }
         result
     }
 
-    fn run_task_inner(&mut self, task: &str, task_id: &str) -> Result<TaskReport> {
+    fn run_task_inner(&mut self, task: &str, task_id: &str, resume: bool) -> Result<TaskReport> {
         let started = Instant::now();
         self.log(format!("Задача: {task}"));
 
+        let resumed = if resume {
+            match self.checkpoints.load_latest(task_id)? {
+                Some(snap) => {
+                    self.log(format!(
+                        "Снимок шага {} найден, живое состояние подменю им",
+                        snap.step
+                    ));
+                    Some(snap)
+                }
+                None => {
+                    return Ok(TaskReport::open(
+                        "Чекпоинта нет, продолжать оборванную задачу не из чего",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         // 0. Человек мог просто поздороваться или спросить — тогда отвечаем
         // словами, а не двигаем мышью по случайному плану.
-        if let Some(reply) = planner::chat_reply(&self.llm, task) {
-            self.log(reply.clone());
-            return Ok(TaskReport::chat(reply));
+        if resumed.is_none() {
+            if let Some(reply) = planner::chat_reply(&self.llm, task) {
+                self.log(reply.clone());
+                return Ok(TaskReport::chat(reply));
+            }
         }
 
         // 1. Поднимаем прошлый опыт ДО планирования.
-        let hints = {
+        let hints = if resumed.is_some() {
+            String::new()
+        } else {
             let m = self.mem_lock();
             m.recall_global(task, 8)?
                 .into_iter()
@@ -295,19 +351,23 @@ impl Agent {
         // 2. Граф задач. Если модель не смогла его собрать — одна цель,
         // критерий которой состоит из слов самой задачи, а не из выдуманной
         // фразы «цель видна выполненной».
-        let mut graph = match planner::make_graph(&self.llm, task, &hints) {
-            Ok(g) => g,
-            Err(e) => {
-                self.log(format!(
-                    "Планировщик не дал валидный граф ({e}), иду одной целью"
-                ));
-                let mut g = TaskGraph::linear(task, &[(task.to_string(), task.to_string())]);
-                if let Err(err) = g.validate() {
-                    return Ok(TaskReport::open(format!(
-                        "План не построен: {e}. Запасной план тоже не прошёл проверку: {err}"
-                    )));
+        let mut graph = if let Some(snap) = &resumed {
+            snap.graph.clone()
+        } else {
+            match planner::make_graph(&self.llm, task, &hints) {
+                Ok(g) => g,
+                Err(e) => {
+                    self.log(format!(
+                        "Планировщик не дал валидный граф ({e}), иду одной целью"
+                    ));
+                    let mut g = TaskGraph::linear(task, &[(task.to_string(), task.to_string())]);
+                    if let Err(err) = g.validate() {
+                        return Ok(TaskReport::open(format!(
+                            "План не построен: {e}. Запасной план тоже не прошёл проверку: {err}"
+                        )));
+                    }
+                    g
                 }
-                g
             }
         };
         self.send_plan(&graph);
@@ -323,24 +383,89 @@ impl Agent {
                 "План отклонён проверкой Z3: {why}"
             )));
         }
+        if resumed.is_none() {
+            self.order_plan(&mut graph);
+        }
+
+        let mut criteria = resumed
+            .as_ref()
+            .map(|s| s.criteria.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| crate::acceptance::decompose(task));
+        if criteria.is_empty() {
+            self.log("В задаче нет измеримого критерия приёмки: она останется незакрытой");
+        } else {
+            self.log(format!("Критерии приёмки: {}", criteria.join(" | ")));
+        }
 
         let mut trace = Trace::default();
-        let mut step: u32 = 0;
+        if let Some(snap) = &resumed {
+            trace.from_steps(snap.trace.clone());
+        }
+        let mut step: u32 = resumed.as_ref().map(|s| s.step).unwrap_or(0);
+        let mut touched: Vec<std::path::PathBuf> = resumed
+            .as_ref()
+            .map(|s| s.touched.iter().map(std::path::PathBuf::from).collect())
+            .unwrap_or_default();
+        let mut observed: HashMap<String, bool> = resumed
+            .as_ref()
+            .map(|s| s.observed.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
         let mut failures: Vec<String> = vec![];
         let mut rollback_queue: Vec<(String, String)> = vec![];
         let mut rollback_steps: u32 = 0;
         let mut need_replan = false;
         let mut pending_lesson: Option<String> = None;
         let mut phone_mode = looks_like_phone_task(task);
-        // id узла → критерий уже был виден на экране в момент закрытия.
-        let mut observed: HashMap<String, bool> = HashMap::new();
         // Экран на старте отката: закрываем откат только если он изменился.
         let mut rollback_origin: HashMap<String, Evidence> = HashMap::new();
         if phone_mode {
             self.log("Задача про телефон — смотрю экран Android");
         }
 
+        let beat_path = self.checkpoints.root().join(format!("{task_id}.beat"));
+        let restart = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _watch = spawn_watch(
+            beat_path.clone(),
+            self.hang,
+            restart.clone(),
+            self.stop.clone(),
+        );
+        if resumed.is_none() {
+            if let Err(e) = self.capture_step(
+                task_id, task, step, &graph, &observed, &touched, &criteria, &trace,
+            ) {
+                self.log(format!("Стартовый чекпоинт не снят: {e}"));
+            }
+        }
+
         while step < self.cfg.max_steps {
+            if restart.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                self.log("Watchdog: шаг завис, возвращаюсь к последнему чекпоинту");
+                if self.checkpoints.load_latest(task_id)?.is_some() {
+                    if let Err(e) = self.restore_state(
+                        task_id,
+                        &mut graph,
+                        &mut observed,
+                        &mut trace,
+                        &mut touched,
+                        &mut criteria,
+                    ) {
+                        return Ok(TaskReport::open(format!(
+                            "Watchdog не смог откатиться к чекпоинту: {e}"
+                        )));
+                    }
+                    continue;
+                }
+            }
+            let _ = crate::watchdog::write_beat(
+                &beat_path,
+                &crate::watchdog::Beat {
+                    task_id: task_id.to_string(),
+                    step,
+                    unix_ms: crate::watchdog::now_ms(),
+                },
+            );
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return Ok(TaskReport::open("Остановлено пользователем"));
             }
@@ -357,7 +482,7 @@ impl Agent {
             // состояние, двигаться вперёд нельзя.
             let work = match rollback_queue.last().cloned() {
                 Some((id, instruction)) => Work::Rollback { id, instruction },
-                None => match graph.next() {
+                None => match self.choose_node(&graph, task) {
                     Some(n) => Work::Node {
                         id: n.id.clone(),
                         goal: n.goal.clone(),
@@ -381,7 +506,9 @@ impl Agent {
                                 }
                             }
                         }
-                        return Ok(self.close_if_proven(&graph, &trace, &observed));
+                        return Ok(
+                            self.close_if_proven(&graph, &trace, &observed, &criteria, phone_mode)
+                        );
                     }
                 },
             };
@@ -546,6 +673,23 @@ impl Agent {
                 failures.push(why);
                 continue;
             }
+            if self.decisions.enabled() {
+                let state = serde_json::json!({
+                    "action": act_str,
+                    "goal": work.goal(),
+                    "failures": failures,
+                });
+                match self.decisions.yes(&state, "Делать ли это действие сейчас?")
+                {
+                    Ok(false) => {
+                        self.log("JEV: действие сейчас не подходит, пропускаю");
+                        failures.push("jev: noul отказал в действии".into());
+                        continue;
+                    }
+                    Ok(true) => {}
+                    Err(e) => self.warn_jev(&e.to_string()),
+                }
+            }
             match self.jev.ask(&act_str) {
                 crate::jev::JevVerdict::No => {
                     self.log(format!(
@@ -648,6 +792,21 @@ impl Agent {
                 }
             }
 
+            // --- ЧЕКПОИНТ ДО ШАГА ---
+            // Нет целого снимка — нет действия. Иначе откатывать будет некуда.
+            for path in paths_from(&decision.next) {
+                if !touched.iter().any(|have| have == &path) {
+                    touched.push(path);
+                }
+            }
+            if let Err(e) = self.capture_step(
+                task_id, task, step, &graph, &observed, &touched, &criteria, &trace,
+            ) {
+                self.log(format!("Чекпоинт не снят, шаг не делаю: {e}"));
+                failures.push(format!("чекпоинт: {e}"));
+                continue;
+            }
+
             // --- ДЕЙСТВИЕ ---
             self.log(format!("Шаг {step}: {}", human_readable(&decision.next)));
             let expectation = verify::expectation_of(&decision.next);
@@ -671,11 +830,21 @@ impl Agent {
                     let (verdict, mut observation) =
                         self.observe_and_verify(phone_mode, &expectation, &ev_before, &msg);
                     if verdict.is_refuted() {
-                        failures.push(format!(
-                            "{}: {}",
-                            human_readable(&decision.next),
-                            verdict.human()
-                        ));
+                        let why =
+                            format!("{}: {}", human_readable(&decision.next), verdict.human());
+                        failures.push(why.clone());
+                        if let Err(e) = self.restore_state(
+                            task_id,
+                            &mut graph,
+                            &mut observed,
+                            &mut trace,
+                            &mut touched,
+                            &mut criteria,
+                        ) {
+                            return Ok(TaskReport::open(format!(
+                                "Шаг не подтверждён ({why}), полный откат не удался: {e}"
+                            )));
+                        }
                     } else {
                         if let Some(sig) = pending_lesson.take() {
                             let _ = self.mem_lock().mark_lesson_worked(&sig);
@@ -780,7 +949,8 @@ impl Agent {
                             self.log(
                                 "Задача закрыта: Z3 подтвердил решение, текст finish не использован как доказательство",
                             );
-                            let proven = self.close_if_proven(&graph, &trace, &observed);
+                            let proven = self
+                                .close_if_proven(&graph, &trace, &observed, &criteria, phone_mode);
                             let m = self.mem_lock();
                             let note = crate::text::truncate(&proven.text, 400);
                             m.remember(
@@ -856,9 +1026,23 @@ impl Agent {
                 Err(e) => {
                     let err = e.to_string();
                     self.log(format!("Ошибка: {err}"));
+                    // Сначала целиком назад, и только потом разбор. Иначе
+                    // заметка об ошибке пишется в уже испорченную память.
+                    if let Err(re) = self.restore_state(
+                        task_id,
+                        &mut graph,
+                        &mut observed,
+                        &mut trace,
+                        &mut touched,
+                        &mut criteria,
+                    ) {
+                        return Ok(TaskReport::open(format!(
+                            "Сбой «{err}». Полный откат к чекпоинту не удался, дальше состояние не меняю: {re}"
+                        )));
+                    }
                     failures.push(err.clone());
                     self.mem_lock()
-                        .log_step(&task_id, step as i64, &act_str, &err, false)?;
+                        .log_step(task_id, step as i64, &act_str, &err, false)?;
                     trace.push(Step {
                         n: step,
                         thought: decision.thought.clone(),
@@ -867,8 +1051,9 @@ impl Agent {
                         confidence: decision.confidence,
                         verified: Some(false),
                     });
+                    let cause = crate::failure::analyze(&trace.render(), &err);
+                    self.log(format!("Причина сбоя: {}", cause.summary));
 
-                    // --- РЕФЛЕКСИЯ ---
                     let screen = view.prompt.clone();
                     match reflection::analyze(
                         &self.llm,
@@ -890,25 +1075,27 @@ impl Agent {
                         Err(e2) => self.log(format!("Не смог разобрать ошибку: {e2}")),
                     }
 
-                    // Узел исчерпал попытки — откатываем сделанное и перепланируем.
                     if let Work::Node { id, .. } = &work {
-                        if graph.mark_attempt_failed(id, &err) {
-                            self.log(format!("Узел {id} провалился — откатываю выполненное"));
-                            rollback_queue = graph.rollback_plan();
-                            rollback_steps = 0;
-                            need_replan = true;
-                            self.send_plan(&graph);
-                            if rollback_queue.is_empty() {
-                                // Откатывать нечего — сразу к перепланированию.
-                                let screen = view.prompt.clone();
-                                if let Ok(g) =
-                                    planner::replan(&self.llm, &graph, &screen, &failures)
-                                {
-                                    graph = g;
-                                    retain_observed(&graph, &mut observed);
-                                    self.send_plan(&graph);
-                                    failures.clear();
-                                    need_replan = false;
+                        if graph.mark_attempt_failed(id, &cause.summary) {
+                            self.log(format!(
+                                "Узел {id} исчерпал попытки. Состояние уже на чекпоинте, перепланирую остаток"
+                            ));
+                            match crate::failure::replan_remaining(&graph, &cause) {
+                                Ok(g) => {
+                                    self.accept_replan(&mut graph, &mut observed, g, &mut failures);
+                                }
+                                Err(e2) => {
+                                    self.log(format!("Локальный переплан не вышел: {e2}"));
+                                    if let Ok(g) =
+                                        planner::replan(&self.llm, &graph, &screen, &failures)
+                                    {
+                                        self.accept_replan(
+                                            &mut graph,
+                                            &mut observed,
+                                            g,
+                                            &mut failures,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -972,7 +1159,21 @@ impl Agent {
         graph: &TaskGraph,
         trace: &Trace,
         observed: &HashMap<String, bool>,
+        criteria: &[String],
+        phone_mode: bool,
     ) -> TaskReport {
+        let evidence = match self.perceive(phone_mode, false) {
+            Ok(view) => Evidence::from_prompt(&view.prompt),
+            Err(_) => Evidence::default(),
+        };
+        let unmet = crate::acceptance::unmet(criteria, &evidence);
+        if !unmet.is_empty() {
+            return TaskReport::open(format!(
+                "Задача не закрыта: {}\n\n{}",
+                unmet.join("; "),
+                self.finish_report(graph, trace)
+            ));
+        }
         match crate::logic::check_solution(graph, observed) {
             crate::logic::Verdict::Ok => TaskReport::closed(self.finish_report(graph, trace)),
             crate::logic::Verdict::Violation(why) => TaskReport::open(format!(
@@ -980,6 +1181,156 @@ impl Agent {
                 self.finish_report(graph, trace)
             )),
         }
+    }
+
+    fn order_plan(&self, graph: &mut TaskGraph) {
+        let draft = crate::optimize::problem_from_graph(
+            graph,
+            crate::optimize::Limits {
+                max_time: 1,
+                max_cost: 1,
+                max_risk: 1,
+            },
+        );
+        let problem =
+            crate::optimize::problem_from_graph(graph, crate::optimize::loose_limits(&draft));
+        match crate::optimize::solve(self.optimizer, &problem) {
+            Ok(sol) => {
+                let mut ordered = graph.clone();
+                crate::optimize::apply_solution(&mut ordered, &sol);
+                match crate::logic::check_plan(&ordered, &self.cfg.policies) {
+                    crate::logic::Verdict::Ok => {
+                        self.log(format!(
+                            "Порядок шагов выбрал {}: {}",
+                            sol.solver,
+                            sol.order.join(" → ")
+                        ));
+                        *graph = ordered;
+                    }
+                    crate::logic::Verdict::Violation(why) => {
+                        self.log(format!(
+                            "Z3 отклонил порядок оптимизатора ({why}), оставляю исходный план"
+                        ));
+                    }
+                }
+            }
+            Err(e) => self.log(format!("Оптимизатор порядка недоступен: {e}")),
+        }
+    }
+
+    fn accept_replan(
+        &self,
+        graph: &mut TaskGraph,
+        observed: &mut HashMap<String, bool>,
+        next: TaskGraph,
+        failures: &mut Vec<String>,
+    ) {
+        match crate::logic::check_plan(&next, &self.cfg.policies) {
+            crate::logic::Verdict::Ok => {
+                self.log("Остаток плана заново прошёл Z3");
+                *graph = next;
+                retain_observed(graph, observed);
+                self.send_plan(graph);
+                failures.clear();
+            }
+            crate::logic::Verdict::Violation(why) => {
+                self.log(format!("Z3 отклонил перепланированный остаток: {why}"));
+            }
+        }
+    }
+
+    fn choose_node(&mut self, graph: &TaskGraph, task: &str) -> Option<graph::Node> {
+        let ready: Vec<(String, String)> = graph
+            .ready()
+            .iter()
+            .map(|n| (n.id.clone(), n.goal.clone()))
+            .collect();
+        if ready.len() > 1 && self.decisions.enabled() {
+            let state = serde_json::json!({ "task": task });
+            match self
+                .decisions
+                .choice(&state, "Какой оставшийся узел делать сейчас?", &ready)
+            {
+                Ok(choice) => {
+                    if let Some(n) = graph.nodes.iter().find(|n| n.id == choice.id) {
+                        return Some(n.clone());
+                    }
+                }
+                Err(e) => self.warn_jev(&e.to_string()),
+            }
+        }
+        graph.next().cloned()
+    }
+
+    fn warn_jev(&mut self, text: &str) {
+        if self.jev_warned {
+            return;
+        }
+        self.jev_warned = true;
+        self.log(format!(
+            "JEV OpenRouter недоступен, решаю локальной статистикой: {text}"
+        ));
+    }
+
+    fn capture_step(
+        &self,
+        task_id: &str,
+        task: &str,
+        step: u32,
+        graph: &TaskGraph,
+        observed: &HashMap<String, bool>,
+        touched: &[std::path::PathBuf],
+        criteria: &[String],
+        trace: &Trace,
+    ) -> Result<()> {
+        let files = crate::checkpoint::read_files(touched)?;
+        let (window_id, window_title) =
+            crate::platform::foreground_window().unwrap_or((0, String::new()));
+        let snap = crate::checkpoint::Snapshot {
+            task_id: task_id.to_string(),
+            task: task.to_string(),
+            step,
+            graph: graph.clone(),
+            observed: observed.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            window_id,
+            window_title,
+            files,
+            criteria: criteria.to_vec(),
+            trace: trace.to_steps(),
+            touched: touched.iter().map(|p| p.display().to_string()).collect(),
+        };
+        let mem = self.mem_lock();
+        self.checkpoints.save(&snap, &mem)?;
+        Ok(())
+    }
+
+    fn restore_state(
+        &mut self,
+        task_id: &str,
+        graph: &mut TaskGraph,
+        observed: &mut HashMap<String, bool>,
+        trace: &mut Trace,
+        touched: &mut Vec<std::path::PathBuf>,
+        criteria: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut mem = self.mem_lock();
+        let snap = self
+            .checkpoints
+            .restore_latest(task_id, &mut mem, &mut |id, _title| {
+                if id == 0 {
+                    return Ok(());
+                }
+                crate::platform::focus_window(id).map_err(|e| e.to_string())
+            })?;
+        drop(mem);
+        *graph = snap.graph;
+        *observed = snap.observed.into_iter().collect();
+        trace.from_steps(snap.trace);
+        *touched = snap.touched.iter().map(std::path::PathBuf::from).collect();
+        if !snap.criteria.is_empty() {
+            *criteria = snap.criteria;
+        }
+        Ok(())
     }
 
     /// Восприятие ПК или телефона одним вызовом: цикл выше не должен знать,
@@ -1087,7 +1438,7 @@ impl Agent {
                     self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     return String::new();
                 }
-                Ok(AgentCommand::Start(_)) => {} // новая задача во время ожидания игнорируется
+                Ok(AgentCommand::Start(_)) | Ok(AgentCommand::Resume { .. }) => {}
                 Err(_) => continue,
             }
         }
@@ -1170,6 +1521,69 @@ fn human_readable(a: &Action) -> String {
         Action::AdbOpenApp { package } => format!("телефон: открываю {package}"),
         Action::AdbTap { x, y } => format!("телефон: тап ({x},{y})"),
         other => other.short(),
+    }
+}
+
+fn hang_limit() -> Duration {
+    let secs = std::env::var("PCAGENT_HANG_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    Duration::from_secs(secs.max(5))
+}
+
+fn paths_from(action: &Action) -> Vec<std::path::PathBuf> {
+    match action {
+        Action::LaunchApp { path, args } => {
+            let mut out = crate::checkpoint::paths_of_action(path);
+            for tok in args.split_whitespace() {
+                out.extend(crate::checkpoint::paths_of_action(tok));
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+struct WatchStop {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for WatchStop {
+    fn drop(&mut self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_watch(
+    beat_path: std::path::PathBuf,
+    hang: Duration,
+    restart: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> WatchStop {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_watch = flag.clone();
+    let handle = std::thread::spawn(move || {
+        while !stop_watch.load(std::sync::atomic::Ordering::Relaxed)
+            && !stop.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            std::thread::sleep(Duration::from_secs(1));
+            if let Some(beat) = crate::watchdog::read_beat(&beat_path) {
+                if crate::watchdog::assess(true, Some(&beat), crate::watchdog::now_ms(), hang)
+                    == crate::watchdog::Watch::Hung
+                {
+                    restart.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    });
+    WatchStop {
+        flag,
+        handle: Some(handle),
     }
 }
 

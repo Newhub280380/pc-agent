@@ -324,6 +324,31 @@ impl Memory {
         Ok(())
     }
 
+    /// Полная копия базы. Чекпоинт хранит файл, а не «разницу»: откат
+    /// подменяет память целиком, а не дописывает пропавшие строки.
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        self.conn
+            .backup(rusqlite::DatabaseName::Main, path, None)
+            .context("не удалось снять копию памяти")?;
+        Ok(())
+    }
+
+    /// Подмена текущей базы снимком. Вызывающий держит `&mut`, потому что
+    /// SQLite пишет в это же соединение и параллельный читатель здесь не нужен.
+    pub fn restore_from(&mut self, path: &Path) -> Result<()> {
+        let src = Connection::open(path).context("снимок памяти не открывается")?;
+        {
+            let backup = rusqlite::backup::Backup::new(&src, &mut self.conn)?;
+            backup
+                .run_to_completion(64, std::time::Duration::from_millis(0), None)
+                .context("не удалось вернуть память из снимка")?;
+        }
+        Ok(())
+    }
+
     /// Watchdog: старт задачи. Любой штатный выход помечается task_finish;
     /// жёсткая смерть процесса оставляет 'running' — и следующий запуск
     /// приложения видит это как «задача брошена на середине».

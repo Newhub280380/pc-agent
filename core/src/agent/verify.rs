@@ -184,6 +184,45 @@ pub fn has_checkable_literal(done_when: &str) -> bool {
     !quoted_fragments(done_when).is_empty() || !comparisons(done_when).is_empty()
 }
 
+/// Критерий вообще можно сверить с экраном: есть цитата, сравнение
+/// или содержательное слово. «ок» и пустая строка сюда не попадают.
+pub fn is_measurable(done_when: &str) -> bool {
+    let criterion = done_when.trim();
+    if criterion.is_empty() {
+        return false;
+    }
+    has_checkable_literal(criterion) || !significant_tokens(criterion).is_empty()
+}
+
+/// Куски задачи, которые проверяются отдельно: цитаты и сравнения.
+/// Целая фраза без них остаётся на вызывающем — здесь только то, что
+/// уже является буквальным условием.
+pub fn measurable_parts(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for q in quoted_fragments(text) {
+        out.push(format!("«{q}»"));
+    }
+    for c in comparisons(text) {
+        out.push(comparison_text(&c));
+    }
+    out
+}
+
+fn comparison_text(c: &Comparison) -> String {
+    let op = match c.op {
+        Cmp::Gt => ">",
+        Cmp::Ge => ">=",
+        Cmp::Lt => "<",
+        Cmp::Le => "<=",
+    };
+    let n = if c.threshold.fract() == 0.0 {
+        format!("{}", c.threshold as i64)
+    } else {
+        format!("{}", c.threshold)
+    };
+    format!("{op} {n}")
+}
+
 /// Критерий выполнен, только если экран его показывает.
 ///
 /// Правила, все обязательные:

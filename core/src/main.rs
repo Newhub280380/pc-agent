@@ -10,9 +10,13 @@
 // Без консольного окна в релизе; в debug консоль оставляем для логов.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acceptance;
 mod agent;
 mod android;
+mod checkpoint;
 mod config;
+mod decisions;
+mod failure;
 #[cfg(test)]
 mod fuzz;
 mod gui;
@@ -20,12 +24,15 @@ mod jev;
 mod llm;
 mod logic;
 mod memory;
+mod optimize;
 mod platform;
 mod radar;
 mod retry;
 mod sandbox;
+mod stage_bench;
 mod supervisor;
 mod text;
+mod watchdog;
 
 use agent::{Agent, AgentCommand, AgentConfig, AgentEvent};
 use anyhow::Result;
@@ -173,28 +180,42 @@ fn main() -> Result<()> {
     )];
     initial_log.extend(layers.describe(&paths.searched));
 
-    // Watchdog: задачи прошлой сессии, брошенные на середине (свет, kill,
-    // паника). Их процесс больше не существует, помечаем и честно говорим.
+    // Watchdog: брошенная задача с целым чекпоинтом продолжается сама.
+    // Без снимка продолжать нечего — помечаем её прерванной и говорим об этом.
     {
         let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
         if let Ok(stale) = guard.interrupted_tasks() {
-            if !stale.is_empty() {
-                for (id, _) in &stale {
+            let store = checkpoint::Store::open(checkpoint::default_dir()).ok();
+            let resume = store
+                .as_ref()
+                .and_then(|s| watchdog::resume_candidate(s, &stale).ok().and_then(|v| v));
+            for (id, _) in &stale {
+                let picked = resume
+                    .as_ref()
+                    .map(|(rid, _, _)| rid == id)
+                    .unwrap_or(false);
+                if !picked {
                     let _ = guard.task_finish(id, "interrupted");
                 }
+            }
+            if let Some((id, task, snap)) = resume {
+                let title: String = task.chars().take(60).collect();
+                initial_log.push(format!(
+                    "Прошлая сессия оборвалась. Продолжаю «{title}» с чекпоинта, шаг {}.",
+                    snap.step
+                ));
+                let _ = cmd_tx.send(AgentCommand::Resume { task_id: id, task });
+            } else if !stale.is_empty() {
                 let names = stale
                     .iter()
                     .map(|(_, t)| t.chars().take(60).collect::<String>())
                     .collect::<Vec<_>>()
                     .join("; ");
                 initial_log.push(format!(
-                    "⚠ Прошлая сессия умерла посреди {} задач(и): {}",
+                    "⚠ Прошлая сессия умерла посреди {} задач(и) без чекпоинта: {}",
                     stale.len(),
                     names
                 ));
-                initial_log.push(
-                    "Агент помнит их шаги в БД. Опиши задачу заново, чтобы продолжить.".into(),
-                );
             }
         }
     }
@@ -283,6 +304,22 @@ fn run_gui(app: gui::AppState) -> Result<()> {
     anyhow::bail!("GUI: {why}")
 }
 
+fn dispatch(ev_tx: &Sender<AgentEvent>, result: Result<agent::TaskReport>) {
+    match result {
+        // «Готово» — только доказанное решение или обычный ответ
+        // на разговор. Незакрытая задача не маскируется под успех.
+        Ok(report) if report.closed || report.chat => {
+            let _ = ev_tx.send(AgentEvent::Done(report.text));
+        }
+        Ok(report) => {
+            let _ = ev_tx.send(AgentEvent::Failed(report.text));
+        }
+        Err(e) => {
+            let _ = ev_tx.send(AgentEvent::Failed(e.to_string()));
+        }
+    }
+}
+
 /// Приём команд из GUI. Живёт всё время работы приложения: после задачи
 /// агент возвращается сюда и ждёт следующую.
 fn worker_loop(agent: &mut Agent, ev_tx: &Sender<AgentEvent>) {
@@ -291,19 +328,13 @@ fn worker_loop(agent: &mut Agent, ev_tx: &Sender<AgentEvent>) {
         match cmd {
             AgentCommand::Start(task) => {
                 agent.reset_stop();
-                match agent.run_task(&task) {
-                    // «Готово» — только доказанное решение или обычный ответ
-                    // на разговор. Незакрытая задача не маскируется под успех.
-                    Ok(report) if report.closed || report.chat => {
-                        let _ = ev_tx.send(AgentEvent::Done(report.text));
-                    }
-                    Ok(report) => {
-                        let _ = ev_tx.send(AgentEvent::Failed(report.text));
-                    }
-                    Err(e) => {
-                        let _ = ev_tx.send(AgentEvent::Failed(e.to_string()));
-                    }
-                }
+                let result = agent.run_task(&task);
+                dispatch(ev_tx, result);
+            }
+            AgentCommand::Resume { task_id, task } => {
+                agent.reset_stop();
+                let result = agent.resume_task(&task_id, &task);
+                dispatch(ev_tx, result);
             }
             AgentCommand::Stop => {
                 agent.request_stop();

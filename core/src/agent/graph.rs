@@ -64,6 +64,19 @@ pub struct Node {
     /// иначе агент вечно бьётся в одну и ту же дверь.
     #[serde(default)]
     pub attempts: u32,
+    /// Минуты, условная цена и риск 0..100. Планировщик может их не прислать:
+    /// тогда узел дешёвый и короткий, и оптимизатор не выдумывает цифры.
+    #[serde(default = "unit")]
+    pub time_min: u32,
+    #[serde(default = "unit")]
+    pub cost: u32,
+    #[serde(default = "unit")]
+    pub risk: u32,
+    #[serde(default)]
+    pub variants: Vec<Variant>,
+    /// Какой вариант выбрал оптимизатор. Пусто — базовые поля узла.
+    #[serde(default)]
+    pub chosen: String,
 }
 
 fn pending() -> NodeState {
@@ -85,6 +98,23 @@ pub struct TaskGraph {
 /// Максимум попыток на узел до признания его провалившимся.
 pub const MAX_NODE_ATTEMPTS: u32 = 3;
 
+fn unit() -> u32 {
+    1
+}
+
+/// Вариант узла для оптимизатора: те же зависимости, другая цена.
+/// Пустой список у узла значит один вариант `base` с полями узла.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Variant {
+    pub id: String,
+    #[serde(default = "unit")]
+    pub time_min: u32,
+    #[serde(default = "unit")]
+    pub cost: u32,
+    #[serde(default = "unit")]
+    pub risk: u32,
+}
+
 impl TaskGraph {
     /// Линейная цепочка — фолбэк, когда модель не смогла выдать зависимости.
     /// Плохой граф лучше отсутствия графа: порядок хотя бы сохранён.
@@ -104,6 +134,11 @@ impl TaskGraph {
                 state: NodeState::Pending,
                 note: String::new(),
                 attempts: 0,
+                time_min: 1,
+                cost: 1,
+                risk: 1,
+                variants: Vec::new(),
+                chosen: String::new(),
             });
         }
         Self {
