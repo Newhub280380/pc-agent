@@ -37,6 +37,12 @@ jobs:
           go build -ldflags "-s -w -X main.Version=${{ github.sha }}" -o pcagent-router.exe .
       - name: Rust core + C++ native
         working-directory: core
+        env:
+          # CMake 4 на windows-2025 снимает совместимость с cmake_minimum_required
+          # ниже 3.5. У вшитого Z3 4.12 (z3-sys, static-link-z3) стоит 3.4, и
+          # конфигурация падает до сборки. Переменная поднимает нижнюю границу
+          # политик; солвер по-прежнему собирается из исходников внутрь exe.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           cargo fmt --check
           cargo build --release

@@ -36,6 +36,8 @@ log = "0.4"
 # Z3 вшит в бинарник. static-link-z3 собирает libz3 4.12 вместе с ядром:
 # отдельная установка солвера пользователю не нужна, и фичи «выключить Z3»
 # больше нет. Проверка плана и закрытие задачи идут через SAT/UNSAT.
+# CMake 4 не принимает cmake_minimum_required(3.4) этого дерева — сборка
+# задаёт CMAKE_POLICY_VERSION_MINIMUM=3.5 (.cargo/config.toml и Windows CI).
 z3 = { version = "0.12", features = ["static-link-z3"] }
 env_logger = "0.11"
 
