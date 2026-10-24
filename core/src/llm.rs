@@ -169,6 +169,50 @@ impl LlmClient {
             Err(e) => Err(anyhow!("роутер недоступен: {e}")),
         }
     }
+
+    /// Векторизация текстов для смысловой памяти. `Ok(None)` — эмбеддер не
+    /// настроен (роутер отвечает 501): это не ошибка, память просто остаётся
+    /// на полнотекстовом поиске и не шумит в лог на каждой записи.
+    pub fn embed(&self, texts: &[String]) -> Result<Option<Vec<Vec<f32>>>> {
+        if texts.is_empty() {
+            return Ok(Some(vec![]));
+        }
+        let resp = self
+            .agent
+            .post(&format!("{}/v1/embed", self.base))
+            .set("X-Agent-Token", &self.token)
+            .send_json(serde_json::json!({ "texts": texts }));
+        match resp {
+            Ok(r) => {
+                let out: EmbedResponse = r.into_json()?;
+                if !out.error.is_empty() {
+                    bail!("эмбеддер: {}", out.error);
+                }
+                if out.vectors.len() != texts.len() {
+                    bail!(
+                        "эмбеддер вернул {} векторов на {} текстов",
+                        out.vectors.len(),
+                        texts.len()
+                    );
+                }
+                Ok(Some(out.vectors))
+            }
+            Err(ureq::Error::Status(501, _)) => Ok(None),
+            Err(ureq::Error::Status(code, r)) => {
+                let body: EmbedResponse = r.into_json().unwrap_or_default();
+                Err(anyhow!("эмбеддер HTTP {code}: {}", body.error))
+            }
+            Err(e) => Err(anyhow!("роутер недоступен: {e}")),
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct EmbedResponse {
+    #[serde(default)]
+    vectors: Vec<Vec<f32>>,
+    #[serde(default)]
+    error: String,
 }
 
 /// Модели любят обрамлять JSON текстом и ```-блоками. Дёргать их повторно

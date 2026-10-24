@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -36,6 +37,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/v1/providers", s.auth(s.handleProviders))
 	mux.HandleFunc("/v1/complete", s.auth(s.handleComplete))
+	mux.HandleFunc("/v1/embed", s.auth(s.handleEmbed))
 	return mux
 }
 
@@ -102,6 +104,35 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		// 502, а не 500: ошибка вне нашего процесса. Ядро по этому коду
 		// понимает, что задачу можно повторить позже, а не «код сломан».
 		writeJSON(w, http.StatusBadGateway, llm.Response{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleEmbed — векторизация для смысловой памяти. Ненастроенный эмбеддер —
+// это 501, а не 502: ядро по такому коду понимает, что повторять бессмысленно,
+// и молча живёт на полнотекстовом поиске.
+func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	var req llm.EmbedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, llm.EmbedResponse{Error: "bad request: " + err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.cfg.TimeoutSec+30)*time.Second)
+	defer cancel()
+
+	resp, err := s.router.Embed(ctx, req)
+	if err != nil {
+		code := http.StatusBadGateway
+		if errors.Is(err, llm.ErrNoEmbedder) {
+			code = http.StatusNotImplemented
+		}
+		writeJSON(w, code, llm.EmbedResponse{Error: err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)

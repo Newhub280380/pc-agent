@@ -206,6 +206,9 @@ pub struct Agent {
     checkpoints: crate::checkpoint::Store,
     hang: Duration,
     jev_warned: bool,
+    /// Эмбеддер ответил «не настроено» — больше не спрашиваем. Без этого
+    /// каждый шаг тратил бы два сетевых запроса впустую.
+    embed_off: std::sync::atomic::AtomicBool,
 }
 
 impl Agent {
@@ -244,6 +247,7 @@ impl Agent {
                 .expect("каталог чекпоинтов"),
             hang: hang_limit(),
             jev_warned: false,
+            embed_off: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -252,6 +256,64 @@ impl Agent {
     /// содержимое и работаем дальше.
     fn mem_lock(&self) -> std::sync::MutexGuard<'_, Memory> {
         self.mem.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Вектор запроса для смыслового поиска по памяти. `None` — эмбеддер не
+    /// настроен или не ответил: тогда работает только полнотекстовый поиск,
+    /// и шаг из-за этого падать не должен.
+    fn query_vec(&self, query: &str) -> Option<Vec<f32>> {
+        if self.embed_off.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        match self.llm.embed(&[query.to_string()]) {
+            Ok(Some(mut v)) if !v.is_empty() => Some(v.remove(0)),
+            Ok(_) => {
+                self.embed_off
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+            Err(e) => {
+                log::debug!("смысловой поиск недоступен: {e}");
+                None
+            }
+        }
+    }
+
+    /// Доиндексация памяти: записи без вектора векторизуются пачкой. Делается
+    /// по ходу задачи, а не при записи, чтобы `remember` не ждал сеть.
+    fn index_memory(&self, batch: usize) {
+        if self.embed_off.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let pending = match self.mem_lock().unembedded(batch) {
+            Ok(p) => p,
+            Err(e) => {
+                log::debug!("очередь индексации недоступна: {e}");
+                return;
+            }
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let texts: Vec<String> = pending.iter().map(Memory::embed_text).collect();
+        let vectors = match self.llm.embed(&texts) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                self.embed_off
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            Err(e) => {
+                log::debug!("векторизация памяти не прошла: {e}");
+                return;
+            }
+        };
+        let m = self.mem_lock();
+        for (it, v) in pending.iter().zip(vectors.iter()) {
+            if let Err(e) = m.set_embedding(it.id, v) {
+                log::debug!("вектор записи {} не сохранён: {e}", it.id);
+            }
+        }
     }
 
     /// Блокирующее ожидание команды от GUI. None = GUI закрылся.
@@ -569,10 +631,14 @@ impl Agent {
             }
 
             // --- ПАМЯТЬ: только нужная полка ---
+            // Доиндексация и вектор запроса — до блокировки мьютекса: сеть
+            // под замком памяти держала бы GUI.
+            self.index_memory(16);
+            let qv = self.query_vec(work.goal());
             let (shelf_notes, lessons, digest) = {
                 let m = self.mem_lock();
                 let notes = m
-                    .recall(&shelf, work.goal(), 6)?
+                    .recall_hybrid(&shelf, work.goal(), qv.as_deref(), 6)?
                     .into_iter()
                     .map(|i| {
                         format!(

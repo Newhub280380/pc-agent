@@ -34,9 +34,19 @@ type Provider struct {
 	Vision   bool // умеет ли принимать картинки (критично: агент шлёт скриншоты)
 }
 
+// Embedder — сервис векторизации текста для смысловой памяти ядра.
+// Отдельно от Providers: векторы разных моделей несопоставимы, поэтому
+// фолбэка и очереди приоритетов здесь быть не должно — эмбеддер один.
+type Embedder struct {
+	BaseURL string
+	APIKey  string
+	Model   string
+}
+
 // Config — всё, что роутер читает из окружения.
 type Config struct {
 	Providers  []Provider
+	Embed      Embedder
 	Listen     string // адрес локального HTTP-сервера, только 127.0.0.1
 	AuthToken  string // общий секрет между Rust-ядром и Go-роутером
 	LogDir     string
@@ -265,7 +275,42 @@ func Load(envPath string) (*Config, error) {
 		}
 		cfg.Providers = append(cfg.Providers, p)
 	}
+	cfg.Embed = resolveEmbedder(get, cfg.Providers)
 	return cfg, nil
+}
+
+// embedDefaults — модель векторизации по умолчанию у тех сервисов, где
+// /embeddings реально есть и проверен. Угадывать за остальных нельзя: шлюз
+// без этого метода отдал бы 404 на каждой записи памяти.
+var embedDefaults = map[string]string{
+	"openai": "text-embedding-3-small",
+	"local":  "nomic-embed-text",
+}
+
+// resolveEmbedder: сначала явные EMBED_*, иначе берём уже настроенный
+// OpenAI-совместимый сервис с известным /embeddings. Если ничего нет —
+// пустой Embedder, и ядро остаётся на полнотекстовом поиске.
+func resolveEmbedder(get func(string) string, providers []Provider) Embedder {
+	if base := get("EMBED_BASE_URL"); base != "" {
+		return Embedder{
+			BaseURL: strings.TrimRight(base, "/"),
+			APIKey:  firstNonEmpty(get("EMBED_API_KEY"), get("OPENAI_API_KEY"), get("LLM_API_KEY")),
+			Model:   firstNonEmpty(get("EMBED_MODEL"), "text-embedding-3-small"),
+		}
+	}
+	for _, want := range []string{"openai", "local"} {
+		for _, p := range providers {
+			if p.Name != want || p.Kind != "openai" {
+				continue
+			}
+			return Embedder{
+				BaseURL: p.BaseURL,
+				APIKey:  p.APIKey,
+				Model:   firstNonEmpty(get("EMBED_MODEL"), embedDefaults[want]),
+			}
+		}
+	}
+	return Embedder{}
 }
 
 func fileExists(path string) bool {
