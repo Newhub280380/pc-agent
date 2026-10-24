@@ -11,6 +11,11 @@ use anyhow::{anyhow, bail, Result};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Метка в отчёте шага: сюда попали глазами, а не по дереву. Проверка
+/// об этом должна знать: там, где работают глаза (Canvas, игры, холсты),
+/// текстового следа на экране часто нет вообще.
+pub const SIGHT_MARK: &str = "клик по зрению";
+
 pub enum Outcome {
     /// Действие выполнено, текст — что получилось (уходит в журнал и в промпт).
     Ok(String),
@@ -62,15 +67,19 @@ impl Executor {
             .ok_or_else(|| anyhow!("элемент \"{name}\" не найден в UI-дереве"))?;
         let shot = platform::capture_screen()
             .map_err(|e| anyhow!("элемент \"{name}\" не найден, и скриншот не снять: {e}"))?;
-        let (x, y) = eyes
+        let (ix, iy) = eyes
             .locate(&shot.png, shot.width, shot.height, name)
             .map_err(|e| anyhow!("элемент \"{name}\" не найден ни в UI-дереве, ни глазами: {e}"))?;
+        // Глаза видят картинку, мышь живёт на рабочем столе: если кадр
+        // начинается не в нуле (второй монитор слева/сверху под Windows),
+        // без сдвига клик уйдёт на другой экран.
+        let (x, y) = (ix + shot.origin_x, iy + shot.origin_y);
         self.wait_for_user_idle();
         platform::click_at(x, y, MouseButton::Left, false)?;
         // В журнал и в промпт честно пишем, что попали по зрению: это менее
         // надёжный источник, чем дерево, и проверка должна об этом знать.
         Ok(Outcome::Ok(format!(
-            "клик по зрению ({}) по цели \"{name}\" в ({x},{y})",
+            "{SIGHT_MARK} ({}) по цели \"{name}\" в ({x},{y})",
             eyes.provider()
         )))
     }
@@ -94,7 +103,16 @@ impl Executor {
             Action::ClickElement { name, control_type } => {
                 self.wait_for_user_idle();
                 let (hwnd, _) = platform::foreground_window().unwrap_or((0, String::new()));
-                let tree = platform::ui_tree(hwnd)?;
+                // Дерево окна есть только под Windows: на Linux ui_tree всегда
+                // ошибка, и без этой ветки до зрения дело бы не дошло вообще.
+                let tree = match platform::ui_tree(hwnd) {
+                    Ok(t) => t,
+                    Err(e) if self.eyes.is_some() => {
+                        log::debug!("дерево UI недоступно ({e}) — иду по зрению");
+                        return self.click_by_sight(name);
+                    }
+                    Err(e) => return Err(e),
+                };
                 let needle = name.to_lowercase();
                 let hit = tree
                     .iter()

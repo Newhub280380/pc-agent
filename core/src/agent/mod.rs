@@ -1391,6 +1391,21 @@ impl Agent {
                         verdict = better;
                     }
                 }
+                // Клик по зрению на холсте: нажатие могло сработать, а текст
+                // экрана при этом не меняется вовсе (Canvas, игры, картинки).
+                // Объявлять такой шаг провалом нельзя — за Refuted идёт откат
+                // уже сделанного действия. Успехом тоже не объявляем: это
+                // честное «не знаю».
+                if verdict.is_refuted()
+                    && *expectation == verify::Expectation::ScreenChanged
+                    && tool_output.contains(crate::agent::executor::SIGHT_MARK)
+                {
+                    verdict = verify::Verdict::Unknown(
+                        "клик был по зрению, а экран читается только текстом — изменение \
+                         не доказуемо и не опровергнуто"
+                            .into(),
+                    );
+                }
                 let head: String = v
                     .prompt
                     .lines()

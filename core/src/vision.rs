@@ -160,31 +160,91 @@ pub fn parse_point(text: &str) -> Result<(i32, i32)> {
     Ok(clamp_point(x, y))
 }
 
-/// Разбор «x=120, y=880», «(120, 880)», «120 880» без regex-зависимости.
+/// Разбор «x=120, y=880» и «(120, 880)» без regex-зависимости.
+///
+/// Намеренно НЕ берём любые два числа из текста: ответ «target not found on
+/// 1920x1080 image» — это честный отказ, а не координаты, и превращать его в
+/// клик по углу экрана недопустимо. Числа принимаются только в явной записи
+/// точки: с метками x/y или парой в скобках через запятую.
 fn scan_pair(text: &str) -> Option<(i64, i64)> {
-    let mut nums = vec![];
-    let mut cur = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_digit() {
-            cur.push(ch);
-            // Переполнение i64 на мусорной строке из тысячи цифр недопустимо.
-            if cur.len() > 9 {
-                cur.clear();
-            }
-        } else if !cur.is_empty() {
-            if let Ok(n) = cur.parse::<i64>() {
-                nums.push(n);
-            }
-            cur.clear();
+    if let (Some(x), Some(y)) = (labeled(text, 'x'), labeled(text, 'y')) {
+        return Some((x, y));
+    }
+    bracketed_pair(text)
+}
+
+/// Число после метки: «x=120», «x: 120», «X = 120».
+fn labeled(text: &str, label: char) -> Option<i64> {
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch.to_ascii_lowercase() != label {
+            continue;
+        }
+        // «max=5» или «box» — это не метка координаты.
+        if i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        if j >= chars.len() || !matches!(chars[j], '=' | ':') {
+            continue;
+        }
+        j += 1;
+        while j < chars.len() && (chars[j].is_whitespace() || chars[j] == '"') {
+            j += 1;
+        }
+        if let Some(n) = read_int(&chars, j) {
+            return Some(n);
         }
     }
-    if let Ok(n) = cur.parse::<i64>() {
-        nums.push(n);
+    None
+}
+
+/// Пара в скобках через запятую: «(120, 880)», «[120,880]».
+fn bracketed_pair(text: &str) -> Option<(i64, i64)> {
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch != '(' && ch != '[' {
+            continue;
+        }
+        let close = if ch == '(' { ')' } else { ']' };
+        let end = chars[i + 1..].iter().position(|&c| c == close)? + i + 1;
+        let inner: String = chars[i + 1..end].iter().collect();
+        let mut parts = inner.split(',');
+        let first = parts.next()?.trim().to_string();
+        let second = parts.next()?.trim().to_string();
+        if let (Some(x), Some(y)) = (whole_int(&first), whole_int(&second)) {
+            return Some((x, y));
+        }
     }
-    match nums.len() {
-        0 | 1 => None,
-        _ => Some((nums[0], nums[1])),
+    None
+}
+
+/// Строка целиком — целое число (возможно со знаком). «1920x1080» не подходит.
+fn whole_int(s: &str) -> Option<i64> {
+    let s = s.trim().trim_matches('"');
+    if s.is_empty() || s.len() > 10 {
+        return None;
     }
+    s.parse::<i64>().ok()
+}
+
+/// Целое со знаком, начиная с позиции `from`. Длину ограничиваем: мусорная
+/// строка из тысячи цифр не должна переполнять i64.
+fn read_int(chars: &[char], from: usize) -> Option<i64> {
+    let mut s = String::new();
+    let mut j = from;
+    if j < chars.len() && (chars[j] == '-' || chars[j] == '+') {
+        s.push(chars[j]);
+        j += 1;
+    }
+    while j < chars.len() && chars[j].is_ascii_digit() && s.len() < 10 {
+        s.push(chars[j]);
+        j += 1;
+    }
+    whole_int(&s)
 }
 
 /// Диапазон Holo — [0, 1000]. Выход за него значит либо модель ответила в
@@ -240,6 +300,27 @@ mod tests {
             (1, 2)
         );
         assert_eq!(parse_point("точка: (10, 20)").unwrap(), (10, 20));
+    }
+
+    #[test]
+    fn honest_refusal_is_not_a_click() {
+        // Самое опасное: отказ модели с размерами кадра раньше превращался
+        // в клик по правому нижнему углу.
+        for refusal in [
+            "Target absent on 1920x1080 image",
+            "я не вижу такой кнопки, экран 1920 на 1080",
+            "not found; candidates: 3, confidence 0",
+            "{\"ok\":false,\"почему\":\"кнопки нет\"}",
+        ] {
+            assert!(
+                parse_point(refusal).is_err(),
+                "отказ принят за координаты: {refusal}"
+            );
+        }
+        // А явные формы точки обязаны работать по-прежнему.
+        assert_eq!(parse_point("x: 12 y: 34").unwrap(), (12, 34));
+        assert_eq!(parse_point("[800,900]").unwrap(), (800, 900));
+        assert_eq!(parse_point("max=5 (10, 20)").unwrap(), (10, 20));
     }
 
     #[test]
@@ -302,9 +383,9 @@ mod tests {
         let eyes = Eyes::new(llm.clone(), "holo", &avail).unwrap();
         assert_eq!(eyes.provider(), "holo");
         // Нужного нет — берём первого зрячего, а не падаем.
-        let eyes = Eyes::new(llm.clone(), "holo", &avail[..1].to_vec()).is_none();
+        let eyes = Eyes::new(llm.clone(), "holo", &avail[..1]).is_none();
         assert!(eyes);
-        let eyes = Eyes::new(llm.clone(), "holo", &avail[2..].to_vec()).unwrap();
+        let eyes = Eyes::new(llm.clone(), "holo", &avail[2..]).unwrap();
         assert_eq!(eyes.provider(), "nvidia");
         assert!(Eyes::new(llm, "нет", &avail).is_none());
     }
