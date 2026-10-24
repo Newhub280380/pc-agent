@@ -253,6 +253,13 @@ const PROVIDERS: &[(&str, &str, &str, &str, &str)] = &[
         "OPENROUTER_MODEL",
     ),
     (
+        "holo",
+        "HOLO_API_KEY",
+        "HOLO_BASE_URL",
+        "https://api.hcompany.ai/v1",
+        "HOLO_MODEL",
+    ),
+    (
         "nvidia",
         "NVIDIA_API_KEY",
         "NVIDIA_BASE_URL",
@@ -358,6 +365,12 @@ impl Layers {
                     None
                 }
             });
+            // Holo нужна как зрение, а не как мозг: пока её не назвали явно,
+            // диагностика не должна объявлять её основным провайдером —
+            // роутер её тоже держит в конце очереди.
+            if name == "holo" && !explicit {
+                continue;
+            }
             let usable = key.is_some() || (!base.is_empty() && keyless(name, explicit));
             if !usable {
                 continue;
@@ -518,6 +531,8 @@ pub struct Settings {
     pub adb_wifi: Option<String>,
     /// Serial конкретного телефона, если их подключено несколько.
     pub adb_serial: Option<String>,
+    /// Кто служит зрением: прицел по скриншоту и визуальный судья.
+    pub vision_provider: String,
 }
 
 impl Settings {
@@ -532,6 +547,9 @@ impl Settings {
             ocr_lang: layers.get("OCR_LANG").unwrap_or_else(|| "ru-RU".into()),
             adb_wifi: layers.get("ADB_WIFI"),
             adb_serial: layers.get("ADB_SERIAL"),
+            vision_provider: layers
+                .get("VISION_PROVIDER")
+                .unwrap_or_else(|| "holo".into()),
         })
     }
 }
@@ -593,6 +611,13 @@ YOUTORIA_API_KEY=
 YOUTORIA_BASE_URL=https://api.youtoria.ai/v1
 YOUTORIA_MODEL=gpt-4o
 
+# Зрение для управления экраном: Holo3.1 от H Company — скриншот и описание
+# цели → координаты клика. Ключ из кабинета (в их доках он назван HAI_API_KEY —
+# работают оба имени). VISION_PROVIDER=нет отключает зрение совсем.
+HOLO_API_KEY=
+HOLO_MODEL=holo3-1-35b-a3b
+VISION_PROVIDER=holo
+
 # Локальная модель (LM Studio / Ollama / llama.cpp в OpenAI-режиме)
 LOCAL_BASE_URL=
 LOCAL_MODEL=qwen2.5-vl-7b
@@ -645,6 +670,7 @@ mod tests {
                 "OPENROUTER_API_KEY",
                 "YOUTORIA_API_KEY",
                 "NVIDIA_API_KEY",
+                "HOLO_API_KEY",
                 "KILO_API_KEY",
                 "LOCAL_API_KEY",
                 "LLM_API_KEY",
@@ -691,6 +717,35 @@ mod tests {
             router_exe: dir.join("router.exe"),
             consent: dir.join("consent.json"),
         }
+    }
+
+    #[test]
+    fn holo_key_alone_does_not_become_the_brain() {
+        let _g = EnvGuard::new();
+        let dir = tmp("holo");
+        std::fs::write(
+            dir.join(".env"),
+            "OPENAI_API_KEY=sk-o\nHOLO_API_KEY=hai-x\n",
+        )
+        .unwrap();
+        let l = Layers::load(&paths_in(&dir)).unwrap();
+        assert_eq!(l.llm_summary().provider, "openai");
+        // Зрение по умолчанию смотрит на holo и выключается словом «нет».
+        assert_eq!(Settings::load(&l).unwrap().vision_provider, "holo");
+        std::fs::write(
+            dir.join(".env"),
+            "OPENAI_API_KEY=sk-o\nVISION_PROVIDER=нет\n",
+        )
+        .unwrap();
+        let l = Layers::load(&paths_in(&dir)).unwrap();
+        assert_eq!(Settings::load(&l).unwrap().vision_provider, "нет");
+
+        // А назвали явно — значит человек так и хотел.
+        std::fs::write(dir.join(".env"), "HOLO_API_KEY=hai-x\nLLM_PRIORITY=holo\n").unwrap();
+        let l = Layers::load(&paths_in(&dir)).unwrap();
+        let s = l.llm_summary();
+        assert_eq!(s.provider, "holo");
+        assert_eq!(s.base_url, "https://api.hcompany.ai/v1");
     }
 
     #[test]

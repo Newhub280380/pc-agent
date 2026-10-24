@@ -158,6 +158,38 @@ func TestNvidiaNimProviderFromKeyAlone(t *testing.T) {
 	}
 }
 
+func TestHoloProviderFromEitherKeyName(t *testing.T) {
+	// Прицел для управления экраном: holo обязан быть vision-провайдером,
+	// иначе ядро не найдёт, кому показывать скриншот.
+	for _, env := range []string{"HOLO_API_KEY=hai-x\n", "HAI_API_KEY=hai-x\n"} {
+		cfg, err := Load(writeEnv(t, env))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.Providers) != 1 {
+			t.Fatalf("%s: ожидался 1 провайдер: %+v", env, cfg.Providers)
+		}
+		p := cfg.Providers[0]
+		if p.Name != "holo" || p.Kind != "openai" || p.BaseURL != "https://api.hcompany.ai/v1" {
+			t.Fatalf("%s: holo настроена неверно: %+v", env, p)
+		}
+		if p.Model != "holo3-1-35b-a3b" || !p.Vision {
+			t.Fatalf("%s: нужна vision-модель Holo по умолчанию: %+v", env, p)
+		}
+	}
+
+	// Без ключа holo не подключается: платный чужой сервис молча не зовём.
+	cfg, err := Load(writeEnv(t, "OPENAI_API_KEY=sk-o\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range cfg.Providers {
+		if p.Name == "holo" {
+			t.Fatalf("holo подключилась без ключа: %+v", p)
+		}
+	}
+}
+
 func TestKiloGatewayWithoutKeyNeedsExplicitRequest(t *testing.T) {
 	// Без просьбы бесплатный шлюз не подключается: чужие запросы не должны
 	// молча уходить на сторонний сервис.

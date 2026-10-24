@@ -6,7 +6,9 @@
 use super::action::Action;
 use crate::android::Adb;
 use crate::platform::{self, MouseButton};
+use crate::vision::Eyes;
 use anyhow::{anyhow, bail, Result};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub enum Outcome {
@@ -31,6 +33,9 @@ pub struct Executor {
     pub adb: Adb,
     /// Если пользователь активно работает мышью — агент ждёт, а не борется.
     pub yield_to_user: bool,
+    /// Зрение: прицел по скриншоту, когда UI-дерево и OCR пусты. None =
+    /// видение не настроено, работаем по-старому.
+    pub eyes: Option<Arc<Eyes>>,
 }
 
 impl Executor {
@@ -38,7 +43,36 @@ impl Executor {
         Self {
             adb,
             yield_to_user: true,
+            eyes: None,
         }
+    }
+
+    pub fn with_eyes(mut self, eyes: Option<Arc<Eyes>>) -> Self {
+        self.eyes = eyes;
+        self
+    }
+
+    /// Последний шанс попасть по элементу: спросить глаза. На Canvas,
+    /// в браузерном Instagram и в игровых интерфейсах дерево пусто, и раньше
+    /// шаг просто падал с «элемент не найден».
+    fn click_by_sight(&self, name: &str) -> Result<Outcome> {
+        let eyes = self
+            .eyes
+            .as_ref()
+            .ok_or_else(|| anyhow!("элемент \"{name}\" не найден в UI-дереве"))?;
+        let shot = platform::capture_screen()
+            .map_err(|e| anyhow!("элемент \"{name}\" не найден, и скриншот не снять: {e}"))?;
+        let (x, y) = eyes
+            .locate(&shot.png, shot.width, shot.height, name)
+            .map_err(|e| anyhow!("элемент \"{name}\" не найден ни в UI-дереве, ни глазами: {e}"))?;
+        self.wait_for_user_idle();
+        platform::click_at(x, y, MouseButton::Left, false)?;
+        // В журнал и в промпт честно пишем, что попали по зрению: это менее
+        // надёжный источник, чем дерево, и проверка должна об этом знать.
+        Ok(Outcome::Ok(format!(
+            "клик по зрению ({}) по цели \"{name}\" в ({x},{y})",
+            eyes.provider()
+        )))
     }
 
     fn wait_for_user_idle(&self) {
@@ -67,10 +101,12 @@ impl Executor {
                     .filter(|e| {
                         control_type.is_empty() || e.kind.eq_ignore_ascii_case(control_type)
                     })
-                    .find(|e| e.name.to_lowercase().contains(&needle))
-                    // Точное совпадение приоритетнее, но частичное лучше промаха:
-                    // подписи кнопок часто содержат лишние пробелы и значки.
-                    .ok_or_else(|| anyhow!("элемент \"{name}\" не найден в UI-дереве"))?;
+                    .find(|e| e.name.to_lowercase().contains(&needle));
+                // Точное совпадение приоритетнее, но частичное лучше промаха:
+                // подписи кнопок часто содержат лишние пробелы и значки.
+                let Some(hit) = hit else {
+                    return self.click_by_sight(name);
+                };
                 let (x, y) = hit.center();
                 platform::click_at(x, y, MouseButton::Left, false)?;
                 Ok(Outcome::Ok(format!("клик по \"{}\" в ({x},{y})", hit.name)))

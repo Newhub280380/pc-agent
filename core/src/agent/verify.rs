@@ -86,6 +86,23 @@ pub fn expectation_of(act: &Action) -> Expectation {
     }
 }
 
+/// Вопрос визуальному судье, если текстовая проверка не дала ответа.
+/// Для `ScreenChanged` и `NotApplicable` вопроса нет: «изменился ли экран»
+/// считается точно по двум наблюдениям, а судья добавил бы только догадку.
+pub fn question_of(exp: &Expectation) -> Option<String> {
+    match exp {
+        Expectation::Visible(what) if !what.trim().is_empty() => Some(format!(
+            "На экране видно «{}»?",
+            crate::text::truncate(what, 60)
+        )),
+        Expectation::WindowTitle(t) if !t.trim().is_empty() => Some(format!(
+            "Активное окно — это «{}»?",
+            crate::text::truncate(t, 60)
+        )),
+        _ => None,
+    }
+}
+
 /// Вердикт по двум наблюдениям. `after` снимается после действия — тем же
 /// перцептором, что и `before`.
 pub fn verify(exp: &Expectation, before: &Evidence, after: &Evidence) -> Verdict {
@@ -445,6 +462,18 @@ mod tests {
             elements: els.iter().map(|e| e.to_lowercase()).collect(),
             texts: vec![],
         }
+    }
+
+    #[test]
+    fn judge_asked_only_where_screen_can_answer() {
+        assert!(question_of(&Expectation::Visible("Direct".into()))
+            .unwrap()
+            .contains("Direct"));
+        assert!(question_of(&Expectation::WindowTitle("Chrome".into())).is_some());
+        // Изменение экрана считается точно, судья тут не нужен.
+        assert!(question_of(&Expectation::ScreenChanged).is_none());
+        assert!(question_of(&Expectation::NotApplicable).is_none());
+        assert!(question_of(&Expectation::Visible("   ".into())).is_none());
     }
 
     #[test]

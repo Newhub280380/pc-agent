@@ -67,6 +67,10 @@ var providerSpecs = []struct {
 	// nvidia: NIM-каталог NVIDIA в OpenAI-совместимом режиме, vision-модель
 	// llama-3.2-90b проверена на скриншотах.
 	{"nvidia", "openai", "NVIDIA_API_KEY", "NVIDIA_MODEL", "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1", "meta/llama-3.2-90b-vision-instruct", true},
+	// holo: Models API от H Company — Holo3.1, модель класса computer-use.
+	// Она нужна именно как прицел: скриншот + описание цели → координаты
+	// клика. Бесплатный уровень — holo3-1-35b-a3b, 10 запросов в минуту, карта не нужна.
+	{"holo", "openai", "HOLO_API_KEY", "HOLO_MODEL", "HOLO_BASE_URL", "https://api.hcompany.ai/v1", "holo3-1-35b-a3b", true},
 	// kilo: OpenAI-совместимый шлюз Kilo. Бесплатные модели отвечают без ключа,
 	// платные требуют его, поэтому провайдер активен и с пустым KILO_API_KEY.
 	{"kilo", "openai", "KILO_API_KEY", "KILO_MODEL", "KILO_BASE_URL", "https://api.kilo.ai/api/gateway", "kilo-auto/frontier", true},
@@ -210,6 +214,11 @@ func Load(envPath string) (*Config, error) {
 
 	for _, s := range providerSpecs {
 		key := get(s.envKey)
+		// В документации H Company ключ называется HAI_API_KEY, и человек
+		// скопирует именно так. Пусть работают оба имени, а не молча ничего.
+		if key == "" && s.name == "holo" {
+			key = get("HAI_API_KEY")
+		}
 		base := firstNonEmpty(get(s.envBase), s.defaultBase)
 		if key == "" && base == "" {
 			continue // провайдер не сконфигурирован — просто пропускаем
@@ -242,6 +251,11 @@ func Load(envPath string) (*Config, error) {
 		switch v, ok := prio[s.name]; {
 		case ok:
 			p.Priority = v
+		case s.name == "holo":
+			// Holo — прицел, а не мышление: computer-use модель с коротким
+			// контекстом не должна стать основным планировщиком только потому,
+			// что ключ для зрения прописали. Явный LLM_PRIORITY сильнее этого.
+			p.Priority = 150
 		case p.APIKey == "":
 			// Локальный сервер без ключа не должен опережать провайдера с ключом:
 			// иначе агент уходит на localhost, а в логе — «base_url localhost».
