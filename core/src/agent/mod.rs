@@ -1379,10 +1379,18 @@ impl Agent {
     ) -> (verify::Verdict, String) {
         match self.perceive(phone_mode, false) {
             Ok(v) => {
-                let mut after = Evidence::from_prompt(&v.prompt);
+                // Только экран, без слов инструмента. Для «экран изменился»
+                // сравнивать можно лишь это: отчёт шага сам по себе всегда
+                // новый текст, и с ним любое действие выглядело бы удачным.
+                let screen_only = Evidence::from_prompt(&v.prompt);
+                let mut after = screen_only.clone();
                 // Вывод инструмента — тоже законное наблюдение (adb shell и т.п.).
                 after.add_tool_output(tool_output);
-                let mut verdict = verify::verify(expectation, before, &after);
+                let mut verdict = if *expectation == verify::Expectation::ScreenChanged {
+                    verify::verify(expectation, before, &screen_only)
+                } else {
+                    verify::verify(expectation, before, &after)
+                };
                 // Текст экрана не дал ответа — спрашиваем глаза. Это и есть
                 // случай Canvas/картинки, где подтверждения в дереве нет, а
                 // человек на скриншоте всё видит.
