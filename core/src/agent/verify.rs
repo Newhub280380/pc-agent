@@ -150,7 +150,14 @@ pub fn verify(exp: &Expectation, before: &Evidence, after: &Evidence) -> Verdict
             if changed(before, after) {
                 Verdict::Confirmed("состояние экрана изменилось".into())
             } else {
-                Verdict::Refuted("экран не изменился — действие не дало эффекта".into())
+                // Не Refuted: у одних действий следа в тексте экрана не бывает
+                // вообще — ctrl+c кладёт текст в буфер, клик по холсту меняет
+                // картинку. Объявлять такое провалом нельзя: за Refuted идёт откат,
+                // а буфер обмена и холст откатить всё равно невозможно. Успехом тоже
+                // не считается: Unknown не даёт закрыть задачу «всё готово».
+                Verdict::Unknown(
+                    "текст экрана не изменился — эффект не доказан и не опровергнут".into(),
+                )
             }
         }
     }
@@ -477,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn click_without_screen_change_is_refuted() {
+    fn click_without_screen_change_is_unknown_not_refuted() {
         let before = ev("Steam", &["Установить"]);
         let after = before.clone();
         let exp = expectation_of(&Action::ClickElement {
@@ -485,7 +492,21 @@ mod tests {
             control_type: String::new(),
         });
         assert_eq!(exp, Expectation::ScreenChanged);
-        assert!(verify(&exp, &before, &after).is_refuted());
+        // Успехом это не считается — но и провалом тоже: откат по Refuted
+        // отменял бы удачные действия без текстового следа (ctrl+c, холст).
+        let v = verify(&exp, &before, &after);
+        assert!(!v.is_refuted());
+        assert!(matches!(v, Verdict::Unknown(_)));
+    }
+
+    #[test]
+    fn clipboard_shortcut_is_not_a_failure() {
+        let before = ev("Блокнот", &["текст"]);
+        let after = before.clone();
+        let exp = expectation_of(&Action::KeyCombo {
+            combo: "ctrl+c".into(),
+        });
+        assert!(matches!(verify(&exp, &before, &after), Verdict::Unknown(_)));
     }
 
     #[test]
