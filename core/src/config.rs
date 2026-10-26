@@ -126,9 +126,12 @@ fn canonical_key(k: &str) -> String {
 }
 
 /// Ключи, которые читаются через `std::env` в разных местах ядра: порог
-/// смысловой памяти, выбор солвера, таймаут зависания и ключ быстрых решений.
-pub const CORE_ENV_KEYS: [&str; 4] = [
+/// смысловой памяти, адрес и прогон эндоскопа, выбор солвера, таймаут
+/// зависания и ключ быстрых решений.
+pub const CORE_ENV_KEYS: [&str; 6] = [
     "MEMORY_SEMANTIC_MIN",
+    "ENDOSCOPE_URL",
+    "ENDOSCOPE_RUN_ID",
     "PCAGENT_OPTIMIZER",
     "PCAGENT_HANG_SEC",
     "OPENROUTER_API_KEY",

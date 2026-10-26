@@ -1294,12 +1294,25 @@ impl Agent {
                 self.finish_report(graph, trace)
             ));
         }
-        match crate::logic::check_solution(graph, observed) {
-            crate::logic::Verdict::Ok => TaskReport::closed(self.finish_report(graph, trace)),
-            crate::logic::Verdict::Violation(why) => TaskReport::open(format!(
+        if let crate::logic::Verdict::Violation(why) = crate::logic::check_solution(graph, observed)
+        {
+            return TaskReport::open(format!(
                 "Задача не закрыта: {why}\n\n{}",
                 self.finish_report(graph, trace)
-            )),
+            ));
+        }
+        // Последний шлагбаум — независимая проверка. Всё выше этой строки
+        // ядро проверяет само, то есть своими же словами; эндоскоп сверяет
+        // отчёт со своей записью прогона, на которую агент не влияет.
+        let report = self.finish_report(graph, trace);
+        let verdict = match crate::endoscope::Endoscope::from_env() {
+            Some(e) => e.judge(&report),
+            None => crate::endoscope::Verdict::NotConfigured,
+        };
+        if verdict.closes() {
+            TaskReport::closed(report)
+        } else {
+            TaskReport::open(format!("Задача не закрыта: {}\n\n{report}", verdict.why()))
         }
     }
 
