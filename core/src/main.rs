@@ -16,6 +16,7 @@ mod android;
 mod checkpoint;
 mod config;
 mod decisions;
+mod endoscope;
 mod failure;
 #[cfg(test)]
 mod fuzz;
