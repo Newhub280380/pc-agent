@@ -965,6 +965,17 @@ impl Agent {
                                 "Шаг не подтверждён ({why}), полный откат не удался: {e}"
                             )));
                         }
+                        if let Work::Node { id, .. } = &work {
+                            let id = id.clone();
+                            self.setback(
+                                &mut graph,
+                                &mut observed,
+                                &mut failures,
+                                &id,
+                                &why,
+                                &view.prompt,
+                            );
+                        }
                     } else {
                         if let Some(sig) = pending_lesson.take() {
                             let _ = self.mem_lock().mark_lesson_worked(&sig);
@@ -1045,6 +1056,15 @@ impl Agent {
                                 };
                                 self.log(format!("Не закрываю {id}: {msg}"));
                                 failures.push(format!("критерий готовности не подтверждён: {msg}"));
+                                let id = id.clone();
+                                self.setback(
+                                    &mut graph,
+                                    &mut observed,
+                                    &mut failures,
+                                    &id,
+                                    &msg,
+                                    &view.prompt,
+                                );
                             }
                             trace.push(Step {
                                 n: step,
@@ -1410,6 +1430,38 @@ impl Agent {
             }
             crate::logic::Verdict::Violation(why) => {
                 self.log(format!("Z3 отклонил перепланированный остаток: {why}"));
+            }
+        }
+    }
+
+    /// Провал без исключения: шаг опровергнут проверкой или критерий узла не
+    /// подтвердился. Такое раньше только дописывалось в подсказки модели, и
+    /// узел крутился до лимита шагов — модель повторяла то же действие, а
+    /// плана никто не менял. Теперь это такая же неудачная попытка, как
+    /// ошибка инструмента: попытки кончились — перепланируем остаток.
+    fn setback(
+        &self,
+        graph: &mut TaskGraph,
+        observed: &mut HashMap<String, bool>,
+        failures: &mut Vec<String>,
+        id: &str,
+        why: &str,
+        screen: &str,
+    ) {
+        if !graph.mark_attempt_failed(id, why) {
+            return;
+        }
+        self.log(format!(
+            "Узел {id} исчерпал попытки без подтверждения, перепланирую остаток"
+        ));
+        let cause = crate::failure::analyze(screen, why);
+        match crate::failure::replan_remaining(graph, &cause) {
+            Ok(g) => self.accept_replan(graph, observed, g, failures),
+            Err(e) => {
+                self.log(format!("Локальный переплан не вышел: {e}"));
+                if let Ok(g) = planner::replan(&self.llm, graph, screen, failures) {
+                    self.accept_replan(graph, observed, g, failures);
+                }
             }
         }
     }
@@ -1825,6 +1877,32 @@ mod tests {
         assert!(looks_like_phone_task("Открой CapCut на телефоне"));
         assert!(looks_like_phone_task("зайди в тикток"));
         assert!(!looks_like_phone_task("настрой рекламу в Ads Manager"));
+    }
+
+    /// Шаг может «пройти», но проверка его опровергнуть — и раньше такое
+    /// не считалось попыткой: узел оставался готовым, модель повторяла то же
+    /// действие до лимита шагов. Проверяем, что неподтверждённый критерий
+    /// исчерпывает попытки узла и остаток плана после этого снова рабочий.
+    #[test]
+    fn unconfirmed_criterion_burns_attempts_and_reopens_the_plan() {
+        let mut g = TaskGraph::linear(
+            "скачать и установить",
+            &[
+                ("скачать файл".into(), "файл виден в папке".into()),
+                ("установить".into(), "в меню есть ярлык".into()),
+            ],
+        );
+        let id = g.ready()[0].id.clone();
+        let why = "на экране нет критерия «файл виден в папке»";
+        for _ in 1..crate::agent::graph::MAX_NODE_ATTEMPTS {
+            assert!(!g.mark_attempt_failed(&id, why), "попытки ещё есть");
+        }
+        assert!(g.mark_attempt_failed(&id, why), "попытки должны кончиться");
+        // Пока план не переделан, брать нечего: зависимый узел не выполняем.
+        assert!(g.next().is_none());
+        let cause = crate::failure::analyze("пустой экран", why);
+        let g2 = crate::failure::replan_remaining(&g, &cause).expect("переплан остатка");
+        assert!(g2.next().is_some(), "после переплана работа снова есть");
     }
 
     /// Сквозная проверка связки «провал узла → откат → отчёт» без сети:
