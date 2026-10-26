@@ -236,6 +236,114 @@ impl Memory {
         Ok(rows)
     }
 
+    // ---- смысловой слой (векторы) ----
+    //
+    // Зачем он при живом FTS5: полнотекстовый поиск не знает синонимов —
+    // «оформить заказ» не находит запись про «купить». Вектор находит.
+    // Поэтому слои работают вместе: FTS даёт точные попадания по словам,
+    // вектор добирает смысл. Векторы хранятся в той же колонке `embedding`
+    // как f32 little-endian: внешняя база ради 10k записей не нужна, полный
+    // проход по полке — это доли миллисекунды.
+
+    /// Текст, который имеет смысл векторизовать: заголовок, смысл, тело.
+    pub fn embed_text(it: &MemoryItem) -> String {
+        let body: String = it.body.chars().take(600).collect();
+        format!("{} {} {}", it.title, it.summary, body)
+            .trim()
+            .to_string()
+    }
+
+    /// Записи без вектора — очередь на индексацию. Индексируем лениво и
+    /// пачками: запись в память не должна ждать сеть.
+    pub fn unembedded(&self, limit: usize) -> Result<Vec<MemoryItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, shelf, kind, title, body, summary, importance, uses, created_at, last_used
+             FROM memories WHERE embedding IS NULL ORDER BY importance DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], row_to_item)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_embedding(&self, id: i64, vec: &[f32]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE memories SET embedding = ?2 WHERE id = ?1",
+            params![id, pack_vec(vec)],
+        )?;
+        Ok(())
+    }
+
+    /// Поиск по смыслу внутри полки: косинусная близость к вектору запроса.
+    /// Записи без вектора просто не участвуют — их найдёт FTS5.
+    pub fn recall_semantic(
+        &self,
+        shelf: &str,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<Vec<MemoryItem>> {
+        if query.is_empty() || limit == 0 {
+            return Ok(vec![]);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, shelf, kind, title, body, summary, importance, uses, created_at, last_used,
+                    embedding
+             FROM memories WHERE shelf = ?1 AND embedding IS NOT NULL",
+        )?;
+        let mut scored: Vec<(f32, MemoryItem)> = stmt
+            .query_map(params![shelf], |r| {
+                let blob: Vec<u8> = r.get(10)?;
+                Ok((blob, row_to_item(r)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(blob, it)| {
+                let v = unpack_vec(&blob);
+                // Разная размерность = сменили модель эмбеддингов. Сравнивать
+                // такие векторы нельзя, молча врать близостью — тем более.
+                if v.len() != query.len() {
+                    return None;
+                }
+                let sim = cosine(&v, query);
+                // Порог: без него «ближайшая» запись находится всегда, даже
+                // когда на полке нет ничего по теме.
+                (sim >= 0.75).then_some((sim, it))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let rows: Vec<MemoryItem> = scored.into_iter().take(limit).map(|(_, it)| it).collect();
+        self.touch(&rows)?;
+        Ok(rows)
+    }
+
+    /// Слова плюс смысл: сначала точные попадания FTS5, затем то, что добрал
+    /// вектор и чего ещё нет в списке.
+    pub fn recall_hybrid(
+        &self,
+        shelf: &str,
+        query: &str,
+        query_vec: Option<&[f32]>,
+        limit: usize,
+    ) -> Result<Vec<MemoryItem>> {
+        let mut out = self.recall(shelf, query, limit)?;
+        let Some(qv) = query_vec else {
+            return Ok(out);
+        };
+        if out.len() >= limit {
+            return Ok(out);
+        }
+        let known: std::collections::HashSet<i64> = out.iter().map(|i| i.id).collect();
+        for it in self.recall_semantic(shelf, qv, limit)? {
+            if out.len() >= limit {
+                break;
+            }
+            if !known.contains(&it.id) {
+                out.push(it);
+            }
+        }
+        Ok(out)
+    }
+
     fn touch(&self, items: &[MemoryItem]) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         for it in items {
@@ -413,6 +521,41 @@ fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryItem> {
     })
 }
 
+/// Вектор в BLOB: f32 little-endian. Свой формат, а не JSON, потому что
+/// 1536 чисел текстом — это 10 КБ на запись вместо 6 КБ и парсинг на каждом
+/// сравнении.
+fn pack_vec(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+fn unpack_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Косинус между векторами. Нормировку не предполагаем: часть сервисов
+/// отдаёт ненормированные векторы, и тогда скалярное произведение само по
+/// себе врёт в пользу длинных записей.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na <= f32::EPSILON || nb <= f32::EPSILON {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
 /// FTS5 падает на спецсимволах пользовательского ввода — чистим и склеиваем
 /// токены через OR, чтобы частичное совпадение тоже находилось.
 fn sanitize_fts(q: &str) -> String {
@@ -436,6 +579,70 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{}.db", rand::random::<u64>()));
         Memory::open(&path).unwrap()
+    }
+
+    #[test]
+    fn semantic_finds_synonym_that_fts_misses() {
+        let m = mem();
+        let id = m
+            .remember(
+                "web:shop.kz",
+                "ui_hint",
+                "Кнопка «Оформить заказ»",
+                "внизу справа, зелёная",
+                "",
+                0.6,
+            )
+            .unwrap();
+        // Слова не совпадают — полнотекстовый поиск пуст.
+        assert!(m.recall("web:shop.kz", "купить", 5).unwrap().is_empty());
+
+        // Вектор «купить» рядом с вектором записи — запись находится.
+        m.set_embedding(id, &[1.0, 0.0, 0.0]).unwrap();
+        let near = [0.98, 0.1, 0.0];
+        let found = m.recall_semantic("web:shop.kz", &near, 5).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, id);
+
+        // Далёкий вектор ничего не находит: «ближайшая» запись не должна
+        // находиться всегда — иначе в промпт уедет случайный мусор.
+        assert!(m
+            .recall_semantic("web:shop.kz", &[0.0, 0.0, 1.0], 5)
+            .unwrap()
+            .is_empty());
+
+        // Гибрид отдаёт и точное попадание по словам, и смысловое.
+        let hybrid = m
+            .recall_hybrid("web:shop.kz", "купить", Some(&near), 5)
+            .unwrap();
+        assert_eq!(hybrid.len(), 1);
+    }
+
+    #[test]
+    fn embedding_of_other_model_is_ignored() {
+        let m = mem();
+        let id = m
+            .remember("app:x", "fact", "запись", "тело", "", 0.5)
+            .unwrap();
+        m.set_embedding(id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        // Сменили модель эмбеддингов: размерность другая, сравнивать нельзя.
+        assert!(m
+            .recall_semantic("app:x", &[1.0, 0.0, 0.0], 5)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn unembedded_queue_empties_after_indexing() {
+        let m = mem();
+        let id = m
+            .remember("app:x", "fact", "ждёт вектора", "тело", "смысл", 0.9)
+            .unwrap();
+        let pending = m.unembedded(10).unwrap();
+        assert!(pending.iter().any(|i| i.id == id));
+        assert!(Memory::embed_text(&pending[0]).contains("ждёт вектора"));
+        m.set_embedding(id, &[0.1, 0.2]).unwrap();
+        assert!(!m.unembedded(10).unwrap().iter().any(|i| i.id == id));
     }
 
     #[test]

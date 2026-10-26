@@ -299,3 +299,31 @@ func TestProcessEnvBeatsDotenv(t *testing.T) {
 		t.Fatalf("приоритет окружения сломан: %+v", cfg.Providers[0])
 	}
 }
+
+func TestEmbedderFromOpenAIKeyAndExplicitEnv(t *testing.T) {
+	cfg, err := Load(writeEnv(t, "OPENAI_API_KEY=sk-e\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embed.Model != "text-embedding-3-small" || cfg.Embed.APIKey != "sk-e" {
+		t.Fatalf("эмбеддер не подхватил ключ OpenAI: %+v", cfg.Embed)
+	}
+
+	// Чужой шлюз без /embeddings эмбеддером становиться не должен: иначе
+	// каждая запись памяти ловила бы 404.
+	cfg, err = Load(writeEnv(t, "OPENROUTER_API_KEY=sk-or\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embed.BaseURL != "" {
+		t.Fatalf("эмбеддер угадан там, где его нет: %+v", cfg.Embed)
+	}
+
+	cfg, err = Load(writeEnv(t, "EMBED_BASE_URL=http://127.0.0.1:11434/v1/\nEMBED_MODEL=nomic-embed-text\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embed.BaseURL != "http://127.0.0.1:11434/v1" || cfg.Embed.Model != "nomic-embed-text" {
+		t.Fatalf("явные EMBED_* не применились: %+v", cfg.Embed)
+	}
+}
