@@ -100,13 +100,40 @@ func TestBreakerOpensAfterRepeatedFailures(t *testing.T) {
 	req := Request{Messages: []Message{{Role: RoleUser, Text: "hi"}}}
 	_, _ = r.Complete(context.Background(), req)
 	before := hits
-	// Провайдер на cooldown — второй вызов не должен трогать сеть вообще.
+	// Провайдер на cooldown и он единственный: совсем не звонить нельзя —
+	// иначе ядро видит «нет провайдеров: заполни .env» и задача встаёт.
+	// Но и серию ретраев делать не за что: ровно одна попытка.
 	_, err := r.Complete(context.Background(), req)
 	if err == nil {
 		t.Fatal("ожидалась ошибка при разомкнутой цепи")
 	}
-	if hits != before {
-		t.Fatalf("circuit breaker не разомкнулся: %d -> %d", before, hits)
+	if hits != before+1 {
+		t.Fatalf("на остывании ждём ровно одну попытку: %d -> %d", before, hits)
+	}
+}
+
+func TestOpenBreakerIsSkippedWhenAnotherProviderIsReady(t *testing.T) {
+	var badHits, goodHits int
+	bad := openaiStub(t, 503, `{"error":{"message":"down"}}`, &badHits)
+	good := openaiStub(t, 200, `{"choices":[{"message":{"content":"ok"}}]}`, &goodHits)
+
+	r := New(&config.Config{
+		MaxRetries: 3,
+		TimeoutSec: 5,
+		Providers: []config.Provider{
+			{Name: "bad", Kind: "openai", BaseURL: bad.URL, APIKey: "k", Model: "m", Priority: 1},
+			{Name: "good", Kind: "openai", BaseURL: good.URL, APIKey: "k", Model: "m", Priority: 2},
+		},
+	}, quietLogger())
+
+	req := Request{Messages: []Message{{Role: RoleUser, Text: "hi"}}}
+	_, _ = r.Complete(context.Background(), req)
+	badBefore := badHits
+	if _, err := r.Complete(context.Background(), req); err != nil {
+		t.Fatalf("живой провайдер должен ответить: %v", err)
+	}
+	if badHits != badBefore {
+		t.Fatalf("провайдер на остывании не должен трогаться при живой замене: %d -> %d", badBefore, badHits)
 	}
 }
 

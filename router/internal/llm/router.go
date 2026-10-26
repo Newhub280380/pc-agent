@@ -63,8 +63,12 @@ func New(cfg *config.Config, log *slog.Logger) *Router {
 // Providers возвращает список активных провайдеров (для GUI и диагностики).
 func (r *Router) Providers() []config.Provider { return r.cfg.Providers }
 
-func (r *Router) candidates(req Request) []config.Provider {
-	var out []config.Provider
+// candidates возвращает подходящие провайдеры: сначала те, что не на
+// остывании, и отдельно — все подходящие вообще. Второй список нужен, когда
+// провайдер один: его лимит (429) открывает предохранитель на минуты, и
+// запрос падал как «нет доступных LLM-провайдеров: заполни .env». Ядро из
+// такого делает вывод, что ключа нет, и задача стоит, хотя ключ рабочий.
+func (r *Router) candidates(req Request) (ready, all []config.Provider) {
 	for _, p := range r.cfg.Providers {
 		if req.ForceProvide != "" && p.Name != req.ForceProvide {
 			continue
@@ -72,13 +76,18 @@ func (r *Router) candidates(req Request) []config.Provider {
 		if req.NeedVision && !p.Vision {
 			continue // бессмысленно слать скриншот в текстовую модель
 		}
+		all = append(all, p)
 		if r.isOpen(p.Name) {
 			continue
 		}
-		out = append(out, p)
+		ready = append(ready, p)
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
-	return out
+	byPriority := func(s []config.Provider) {
+		sort.SliceStable(s, func(i, j int) bool { return s[i].Priority < s[j].Priority })
+	}
+	byPriority(ready)
+	byPriority(all)
+	return ready, all
 }
 
 func (r *Router) isOpen(name string) bool {
@@ -116,7 +125,15 @@ func (r *Router) reward(name string) {
 
 // Complete — единственная точка входа для ядра.
 func (r *Router) Complete(ctx context.Context, req Request) (*Response, error) {
-	cands := r.candidates(req)
+	cands, all := r.candidates(req)
+	bestEffort := false
+	if len(cands) == 0 && len(all) > 0 {
+		// Все на остывании. Лучше попробовать и получить настоящую ошибку
+		// провайдера, чем вернуть «нет провайдеров» и остановить задачу.
+		r.log.Warn("все подходящие провайдеры на остывании, пробую всё равно", "purpose", req.Purpose)
+		cands = all
+		bestEffort = true
+	}
 	if len(cands) == 0 {
 		// Явное сообщение вместо тихого отказа: агенту нужно понять,
 		// что просить у пользователя (ключ/модель с vision).
@@ -128,6 +145,12 @@ func (r *Router) Complete(ctx context.Context, req Request) (*Response, error) {
 
 	attempts := 0
 	var lastErr error
+	// На остывании бьём один раз на провайдера: цель — живая ошибка от API,
+	// а не новая серия запросов в закрытую дверь.
+	retries := r.cfg.MaxRetries
+	if bestEffort {
+		retries = 1
+	}
 	unreachable := []string{}
 	for _, p := range cands {
 		// Пинг до ретраев: три таймаута по 120с на мёртвом адресе выглядят как
@@ -139,7 +162,7 @@ func (r *Router) Complete(ctx context.Context, req Request) (*Response, error) {
 			r.log.Warn("llm unreachable", "provider", p.Name, "base_url", p.BaseURL, "err", err.Error())
 			continue
 		}
-		for try := 0; try < r.cfg.MaxRetries; try++ {
+		for try := 0; try < retries; try++ {
 			attempts++
 			start := time.Now()
 			resp, err := r.dispatch(ctx, p, req)

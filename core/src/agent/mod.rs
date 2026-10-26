@@ -142,6 +142,12 @@ impl Default for AgentConfig {
 /// бесконечно ковырять его хуже, чем честно сказать «откатить не смог».
 const MAX_ROLLBACK_STEPS: u32 = 8;
 
+/// Сколько запретов JEV подряд терпим. Фильтр вероятностный: он бывает не прав
+/// и при этом отвечает «нет» на любое действие — тогда шаг не делается никогда,
+/// а задача упирается в лимит шагов, ничего не сделав. После лимита шаг идёт,
+/// а запрет остаётся в подсказках модели.
+const MAX_JEV_VETOES: u32 = 2;
+
 const ACT_SYSTEM: &str = r#"Ты — автономный агент, управляющий компьютером Windows и телефоном Android как живой человек.
 Ты работаешь строго по циклу ReAct: Thought → Action → Observation. За один ответ — РОВНО ОДНО действие, не забегая вперёд.
 
@@ -522,6 +528,10 @@ impl Agent {
             .map(|s| s.observed.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
         let mut failures: Vec<String> = vec![];
+        // Сколько раз подряд внешний JEV запретил действие. Он может отвечать
+        // «нет» на всё (так живой прогон встал: ни одного действия за 120
+        // шагов), поэтому запрет ограничен — советчик, а не стоп-кран.
+        let mut jev_vetoes: u32 = 0;
         let mut rollback_queue: Vec<(String, String)> = vec![];
         let mut rollback_steps: u32 = 0;
         let mut need_replan = false;
@@ -801,17 +811,25 @@ impl Agent {
                 });
                 match self.decisions.yes(&state, "Делать ли это действие сейчас?")
                 {
-                    Ok(false) => {
+                    Ok(false) if jev_vetoes < MAX_JEV_VETOES => {
+                        jev_vetoes += 1;
                         self.log("JEV: действие сейчас не подходит, пропускаю");
                         failures.push("jev: noul отказал в действии".into());
                         continue;
                     }
-                    Ok(true) => {}
+                    Ok(false) => {
+                        self.log(format!(
+                            "JEV отказал {jev_vetoes} раз подряд — делаю шаг, иначе задача стоит"
+                        ));
+                        jev_vetoes = 0;
+                    }
+                    Ok(true) => jev_vetoes = 0,
                     Err(e) => self.warn_jev(&e.to_string()),
                 }
             }
             match self.jev.ask(&act_str) {
-                crate::jev::JevVerdict::No => {
+                crate::jev::JevVerdict::No if jev_vetoes < MAX_JEV_VETOES => {
+                    jev_vetoes += 1;
                     self.log(format!(
                         "JEV: класс действия «{}» стабильно проваливается — пропускаю",
                         act_str
@@ -1456,7 +1474,14 @@ impl Agent {
         ));
         let cause = crate::failure::analyze(screen, why);
         match crate::failure::replan_remaining(graph, &cause) {
-            Ok(g) => self.accept_replan(graph, observed, g, failures),
+            Ok(g) => {
+                self.accept_replan(graph, observed, g, failures);
+                // accept_replan чистит подсказки, но историю отказа узла
+                // терять нельзя: без неё модель заходит тем же путём.
+                failures.push(format!(
+                    "узел {id} уже не подтвердился: {why}. Тот же способ не повторяй"
+                ));
+            }
             Err(e) => {
                 self.log(format!("Локальный переплан не вышел: {e}"));
                 if let Ok(g) = planner::replan(&self.llm, graph, screen, failures) {
@@ -1711,6 +1736,20 @@ impl Agent {
                     return String::new();
                 }
                 Ok(AgentCommand::Start(_)) | Ok(AgentCommand::Resume { .. }) => {}
+                // Канал оборван — человека в этом запуске нет вообще.
+                // Ждать его бесконечно нельзя: так живой прогон вставал
+                // на уточняющем вопросе и не делал больше ни шага.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.log("Ответить некому — работаю сам, без подсказки");
+                    // Секрет (код из SMS, пароль) выдумывать нельзя: пустой
+                    // ответ агент запишет как «нет кода». На обычный вопрос
+                    // отвечаем честно: человека нет, решай сам.
+                    return if secret {
+                        String::new()
+                    } else {
+                        "человека рядом нет, подсказки не будет: решай сам и делай следующий шаг".into()
+                    };
+                }
                 Err(_) => continue,
             }
         }

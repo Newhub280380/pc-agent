@@ -72,6 +72,11 @@ fn main() -> Result<()> {
     if let Some(path) = flag_value(&args, "--radar") {
         return radar_scan(std::path::Path::new(&path), &args);
     }
+    // Задача из командной строки: так агента запускают под ловушкой эндоскопа
+    // и по расписанию, где окна нет вообще. Код выхода — приговор по задаче.
+    if let Some(task) = flag_value(&args, "--task") {
+        return headless(&task);
+    }
 
     let paths = config::Paths::resolve()?;
     init_logging(&paths.logs);
@@ -308,6 +313,85 @@ fn run_gui(app: gui::AppState) -> Result<()> {
         "Не удалось открыть окно агента.\n\n{why}\n\nСкорее всего нет драйвера видеокарты или сессия без рабочего стола. Подробности в логе %APPDATA%\\PCAgent\\logs."
     ));
     anyhow::bail!("GUI: {why}")
+}
+
+/// Один прогон без окна. Печатает отчёт в stdout и выходит с кодом 1, если
+/// задача не закрыта: иначе «готово» нельзя отличить от падения в скриптах.
+fn headless(task: &str) -> Result<()> {
+    let paths = config::Paths::resolve()?;
+    init_logging(&paths.logs);
+    config::ensure_env_file(&paths.env_file)?;
+    let layers = config::Layers::load(&paths)?;
+    layers.export_core_env();
+    let settings = config::Settings::load(&layers)?;
+    let _router = supervisor::Router::start(
+        &paths.router_exe,
+        &paths.env_file,
+        &format!("{}/health", settings.router_url),
+        &layers.router_env(),
+    )
+    .map_err(|e| anyhow::anyhow!("роутер не поднялся: {e}"))?;
+    if let Err(e) = platform::init() {
+        log::error!("native-слой недоступен: {e}");
+    }
+
+    let llm = llm::LlmClient::new(&settings.router_url, &settings.router_token);
+    let mem = Arc::new(Mutex::new(memory::Memory::open(&paths.memory_db)?));
+    let adb = android::Adb::new(settings.adb_path.clone());
+    let (ev_tx, ev_rx) = channel::<AgentEvent>();
+    let (cmd_tx, cmd_rx) = channel::<AgentCommand>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut agent = Agent::new(
+        llm,
+        mem,
+        adb,
+        AgentConfig {
+            ocr_lang: settings.ocr_lang.clone(),
+            vision_provider: settings.vision_provider.clone(),
+            ..AgentConfig::default()
+        },
+        ev_tx,
+        cmd_rx,
+        stop,
+    );
+    // Отвечать на вопросы в этом режиме некому: обрываем канал сразу, чтобы
+    // агент не ждал человека вечно, а честно записал это как причину.
+    drop(cmd_tx);
+    // События печатаем по ходу дела, а не в конце: иначе долгая задача
+    // выглядит зависшей, и непонятно, на каком шаге она стоит.
+    let printer = std::thread::spawn(move || {
+        while let Ok(ev) = ev_rx.recv() {
+            match ev {
+                AgentEvent::Log(l) => println!("{l}"),
+                AgentEvent::Thought(t) => println!("мысль: {t}"),
+                AgentEvent::Done(t) => println!("ГОТОВО: {t}"),
+                AgentEvent::Failed(t) => println!("НЕ ЗАКРЫТО: {t}"),
+                AgentEvent::Ask { question, .. } => println!("нужен человек: {question}"),
+                AgentEvent::NeedTool { what, why, .. } => {
+                    println!("нужен доступ: {what} — {why}")
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let report = agent.run_task(task);
+    drop(agent);
+    let _ = printer.join();
+    match report {
+        Ok(r) if r.closed || r.chat => {
+            println!("{}", r.text);
+            Ok(())
+        }
+        Ok(r) => {
+            println!("{}", r.text);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            println!("сорвалось: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn dispatch(ev_tx: &Sender<AgentEvent>, result: Result<agent::TaskReport>) {

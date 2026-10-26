@@ -39,17 +39,29 @@ impl Evidence {
     /// структурам — иначе проверка «знает больше» модели и врёт в её пользу.
     pub fn from_prompt(prompt: &str) -> Self {
         let mut ev = Evidence::default();
+        // Строку «- a | b» нельзя считать элементом по одному наличию «|»:
+        // в OCR палка встречается сплошь (шапка Hacker News «new | past |
+        // comments»), и тогда дерево выглядело непустым там, где его нет.
+        // Поэтому идём по заголовкам разделов промпта.
+        let mut in_elements = false;
         for raw in prompt.lines() {
             let line = raw.trim();
+            if line.starts_with("ЭЛЕМЕНТЫ") {
+                in_elements = true;
+                continue;
+            }
+            if line.starts_with("ТЕКСТ НА ЭКРАНЕ") || line.starts_with("ЭКРАН ") {
+                in_elements = false;
+            }
             if let Some(rest) = line.strip_prefix("- ") {
                 match rest.split_once('|') {
-                    Some((name, tail)) => {
+                    Some((name, tail)) if in_elements => {
                         ev.elements.push(name.trim().to_lowercase());
                         // Хвост тоже сохраняем: там тип элемента и координаты,
                         // на них модель иногда ссылается.
                         ev.texts.push(tail.trim().to_lowercase());
                     }
-                    None => ev.texts.push(rest.trim().to_lowercase()),
+                    _ => ev.texts.push(rest.trim().to_lowercase()),
                 }
                 continue;
             }
@@ -259,10 +271,20 @@ pub fn check_claims(text: &str, ev: &Evidence, task: &str, check_fs: bool) -> Ve
                 why: "ссылка не встречается ни в задаче, ни на экране".into(),
                 claim,
             }),
-            ClaimKind::Element => out.push(Violation {
-                why: "такого элемента нет в UI-дереве и в тексте экрана".into(),
-                claim,
-            }),
+            ClaimKind::Element => {
+                // Пустое UI-дерево — это не доказательство отсутствия элемента.
+                // На Linux у Chrome дерева нет вообще, а OCR мелкую ссылку
+                // («login» в углу HN) не читает: так живой прогон вставал на
+                // единственном верном шаге. Прицел по такому элементу делает
+                // зрение, а результат всё равно проверит self-verify.
+                if ev.elements.is_empty() {
+                    continue;
+                }
+                out.push(Violation {
+                    why: "такого элемента нет в UI-дереве и в тексте экрана".into(),
+                    claim,
+                })
+            }
         }
     }
     out
@@ -408,5 +430,36 @@ mod tests {
         let _ = check_claims("нажимаю «неполная кавычка", &ev, "", false);
         let _ = extract_claims("\"\"\"'''«»«");
         let _ = extract_claims(&"«".repeat(5000));
+    }
+
+    #[test]
+    fn element_claim_is_allowed_when_there_is_no_ui_tree() {
+        // Chrome на Linux не отдаёт дерево, OCR мелкую ссылку не видит.
+        let ev = Evidence {
+            window_title: "hacker news".into(),
+            elements: vec![],
+            texts: vec!["hacker news".into(), "new | past | comments".into()],
+        };
+        let v = check_claims("нажимаю «login»", &ev, "создай аккаунт", false);
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn element_claim_is_still_checked_when_tree_exists() {
+        let ev = Evidence {
+            window_title: "окно".into(),
+            elements: vec!["файл".into(), "правка".into()],
+            texts: vec![],
+        };
+        let v = check_claims("нажимаю «login»", &ev, "создай аккаунт", false);
+        assert_eq!(v.len(), 1, "{v:?}");
+    }
+
+    #[test]
+    fn ocr_pipes_are_not_a_ui_tree() {
+        let ev = Evidence::from_prompt(
+            "ЭКРАН 1920x1080. Активное окно: \"Hacker News\"\nТЕКСТ НА ЭКРАНЕ (OCR):\n- new | past | comments | ask\n",
+        );
+        assert!(ev.elements.is_empty(), "{:?}", ev.elements);
     }
 }
