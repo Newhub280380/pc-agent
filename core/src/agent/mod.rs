@@ -209,6 +209,12 @@ pub struct Agent {
     /// Эмбеддер ответил «не настроено» — больше не спрашиваем. Без этого
     /// каждый шаг тратил бы два сетевых запроса впустую.
     embed_off: std::sync::atomic::AtomicBool,
+    /// Отказы эмбеддера подряд: по ним видно, что сеть легла, а не один
+    /// запрос не повезло.
+    embed_fails: std::sync::atomic::AtomicUsize,
+    /// Размерность векторов текущей модели: по ней видно, что эмбеддер
+    /// сменился и старые векторы надо снять заново, а не терять их.
+    embed_dim: std::sync::atomic::AtomicUsize,
 }
 
 impl Agent {
@@ -248,6 +254,8 @@ impl Agent {
             hang: hang_limit(),
             jev_warned: false,
             embed_off: std::sync::atomic::AtomicBool::new(false),
+            embed_fails: std::sync::atomic::AtomicUsize::new(0),
+            embed_dim: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -266,26 +274,50 @@ impl Agent {
             return None;
         }
         match self.llm.embed(&[query.to_string()]) {
-            Ok(Some(mut v)) if !v.is_empty() => Some(v.remove(0)),
+            Ok(Some(mut v)) if !v.is_empty() => {
+                let vec = v.remove(0);
+                self.embed_fails
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                self.embed_dim
+                    .store(vec.len(), std::sync::atomic::Ordering::Relaxed);
+                Some(vec)
+            }
             Ok(_) => {
                 self.embed_off
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 None
             }
             Err(e) => {
-                log::debug!("смысловой поиск недоступен: {e}");
+                self.embed_failed(&e.to_string());
                 None
             }
         }
     }
 
+    /// Эмбеддер не ответил. Два отказа подряд — выключаем смысловой слой до
+    /// перезапуска: иначе каждый шаг ждёт таймаут сети, и сторож по
+    /// зависанию откатывает задачу вместо того, чтобы спокойно идти по FTS.
+    fn embed_failed(&self, why: &str) {
+        let n = self
+            .embed_fails
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        log::debug!("смысловой поиск недоступен ({n}): {why}");
+        if n >= 2 {
+            self.embed_off
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            log::warn!("смысловой слой выключен: эмбеддер не отвечает, память работает по словам");
+        }
+    }
+
     /// Доиндексация памяти: записи без вектора векторизуются пачкой. Делается
     /// по ходу задачи, а не при записи, чтобы `remember` не ждал сеть.
-    fn index_memory(&self, batch: usize) {
+    fn index_memory(&self, shelf: &str, batch: usize) {
         if self.embed_off.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        let pending = match self.mem_lock().unembedded(batch) {
+        let dim = self.embed_dim.load(std::sync::atomic::Ordering::Relaxed);
+        let pending = match self.mem_lock().unembedded(shelf, batch, dim) {
             Ok(p) => p,
             Err(e) => {
                 log::debug!("очередь индексации недоступна: {e}");
@@ -304,10 +336,14 @@ impl Agent {
                 return;
             }
             Err(e) => {
-                log::debug!("векторизация памяти не прошла: {e}");
+                self.embed_failed(&e.to_string());
                 return;
             }
         };
+        if let Some(v) = vectors.first() {
+            self.embed_dim
+                .store(v.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         let m = self.mem_lock();
         for (it, v) in pending.iter().zip(vectors.iter()) {
             if let Err(e) = m.set_embedding(it.id, v) {
@@ -633,12 +669,18 @@ impl Agent {
             // --- ПАМЯТЬ: только нужная полка ---
             // Доиндексация и вектор запроса — до блокировки мьютекса: сеть
             // под замком памяти держала бы GUI.
-            self.index_memory(16);
-            let qv = self.query_vec(work.goal());
+            self.index_memory(&shelf, 16);
+            // Слова сначала: вектор запроса стоит сети, и когда FTS5 уже
+            // набрал нужное, платить за него незачем.
+            let mut found = self.mem_lock().recall(&shelf, work.goal(), 6)?;
+            if found.len() < 6 {
+                if let Some(qv) = self.query_vec(work.goal()) {
+                    self.mem_lock().fill_semantic(&shelf, &qv, &mut found, 6)?;
+                }
+            }
             let (shelf_notes, lessons, digest) = {
                 let m = self.mem_lock();
-                let notes = m
-                    .recall_hybrid(&shelf, work.goal(), qv.as_deref(), 6)?
+                let notes = found
                     .into_iter()
                     .map(|i| {
                         format!(

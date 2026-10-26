@@ -14,6 +14,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -45,6 +46,10 @@ func (s *Server) Handler() http.Handler {
 // — единицы мегабайт; 32 МиБ с запасом. Без лимита любой локальный процесс
 // (или вкладка браузера через fetch) кладёт роутер одним POST-ом.
 const maxBodyBytes = 32 << 20
+
+// Сколько текстов принимаем за один /v1/embed. Ядро индексирует память
+// пачками по 16, так что это предел с запасом.
+const maxEmbedTexts = 256
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +126,15 @@ func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
 	var req llm.EmbedRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, llm.EmbedResponse{Error: "bad request: " + err.Error()})
+		return
+	}
+	// Потолок пачки: тело в 32 МБ вмещает десятки тысяч текстов, и всё это
+	// ушло бы наверх одним платным запросом. Ядро индексирует по 16 записей,
+	// так что лимит никому из своих не мешает.
+	if len(req.Texts) > maxEmbedTexts {
+		writeJSON(w, http.StatusRequestEntityTooLarge, llm.EmbedResponse{
+			Error: fmt.Sprintf("too many texts: %d > %d", len(req.Texts), maxEmbedTexts),
+		})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.cfg.TimeoutSec+30)*time.Second)

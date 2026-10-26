@@ -339,3 +339,45 @@ func TestEmbedderFromOpenAIKeyAndExplicitEnv(t *testing.T) {
 		t.Fatalf("явные EMBED_* не применились: %+v", cfg.Embed)
 	}
 }
+
+// Явный сторонний эндпоинт не должен получать чужой ключ: это и 401, и
+// утечка секрета постороннему сервису.
+func TestExplicitEmbedEndpointGetsNoForeignKey(t *testing.T) {
+	cfg, err := Load(writeEnv(t, "EMBED_BASE_URL=https://embeddings.example/v1\nOPENROUTER_API_KEY=sk-or\nOPENAI_API_KEY=sk-oa\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embed.APIKey != "" {
+		t.Fatalf("чужой ключ уехал на сторонний эндпоинт: %+v", cfg.Embed)
+	}
+
+	// Свой ключ в EMBED_API_KEY работает всегда.
+	cfg, err = Load(writeEnv(t, "EMBED_BASE_URL=https://embeddings.example/v1\nEMBED_API_KEY=sk-emb\nOPENROUTER_API_KEY=sk-or\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embed.APIKey != "sk-emb" {
+		t.Fatalf("явный EMBED_API_KEY не применился: %+v", cfg.Embed)
+	}
+
+	// Тот же хост, что у настроенного провайдера — ключ берём у него.
+	cfg, err = Load(writeEnv(t, "EMBED_BASE_URL=https://openrouter.ai/api/v1\nOPENROUTER_API_KEY=sk-or\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embed.APIKey != "sk-or" {
+		t.Fatalf("ключ своего же провайдера не подхватился: %+v", cfg.Embed)
+	}
+}
+
+// Локальный эмбеддер уже снял память своей размерностью; добавленный для
+// чата ключ шлюза не должен молча менять модель векторов.
+func TestLocalEmbedderOutranksOpenRouter(t *testing.T) {
+	cfg, err := Load(writeEnv(t, "LOCAL_BASE_URL=http://127.0.0.1:11434/v1\nOPENROUTER_API_KEY=sk-or\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embed.Model != "nomic-embed-text" {
+		t.Fatalf("ключ чата перебил локальный эмбеддер: %+v", cfg.Embed)
+	}
+}

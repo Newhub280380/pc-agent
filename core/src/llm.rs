@@ -68,6 +68,10 @@ pub struct LlmClient {
     base: String,
     token: String,
     agent: ureq::Agent,
+    /// Отдельный клиент для эмбеддингов: вектор памяти — это удобство, а не
+    /// смысл шага. Со общим таймаутом 180 с лежащий эмбеддер успевал
+    /// перебить сторожа по зависанию (30 с) и уводил задачу в откат.
+    embed_agent: ureq::Agent,
 }
 
 impl LlmClient {
@@ -78,6 +82,10 @@ impl LlmClient {
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(5))
                 .timeout(Duration::from_secs(180))
+                .build(),
+            embed_agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(3))
+                .timeout(Duration::from_secs(10))
                 .build(),
         }
     }
@@ -178,7 +186,7 @@ impl LlmClient {
             return Ok(Some(vec![]));
         }
         let resp = self
-            .agent
+            .embed_agent
             .post(&format!("{}/v1/embed", self.base))
             .set("X-Agent-Token", &self.token)
             .send_json(serde_json::json!({ "texts": texts }));

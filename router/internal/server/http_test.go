@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -83,5 +85,36 @@ func TestGarbageBodies(t *testing.T) {
 		if w.Code == http.StatusOK {
 			t.Errorf("тело %q прошло как валидное", b)
 		}
+	}
+}
+
+// Пачка на тысячи текстов уходила наверх одним платным запросом. Ядро
+// индексирует по 16 записей, так что лимит своим не мешает.
+func TestHugeEmbedBatchRejected(t *testing.T) {
+	h := newTestServer("secret")
+	texts := make([]string, maxEmbedTexts+1)
+	for i := range texts {
+		texts[i] = "x"
+	}
+	body, err := json.Marshal(llm.EmbedRequest{Texts: texts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/embed", bytes.NewReader(body))
+	r.Header.Set("X-Agent-Token", "secret")
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("код %d, ждали 413: %s", w.Code, w.Body.String())
+	}
+
+	// Нормальная пачка доходит до роутера: без эмбеддера это 501, а не 413.
+	body, _ = json.Marshal(llm.EmbedRequest{Texts: []string{"привет"}})
+	w = httptest.NewRecorder()
+	r = httptest.NewRequest(http.MethodPost, "/v1/embed", bytes.NewReader(body))
+	r.Header.Set("X-Agent-Token", "secret")
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("код %d, ждали 501: %s", w.Code, w.Body.String())
 	}
 }

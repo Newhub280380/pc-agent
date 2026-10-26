@@ -253,15 +253,28 @@ impl Memory {
             .to_string()
     }
 
-    /// Записи без вектора — очередь на индексацию. Индексируем лениво и
-    /// пачками: запись в память не должна ждать сеть.
-    pub fn unembedded(&self, limit: usize) -> Result<Vec<MemoryItem>> {
+    /// Очередь на индексацию: записи без вектора и записи, чей вектор снят
+    /// другой моделью. `dim` — размерность текущей модели (0 = ещё неизвестна,
+    /// тогда берём только записи без вектора).
+    ///
+    /// Про размерность это не педантизм: смена эмбеддера (например, человек
+    /// добавил ключ шлюза к локальной модели) меняет длину вектора, а
+    /// [`Self::recall_semantic`] несовместимые векторы пропускает. Без
+    /// переиндексации старая память просто исчезала бы из смыслового поиска,
+    /// оставаясь в базе.
+    ///
+    /// `shelf` — полка текущей задачи: она идёт первой, иначе чужие записи с
+    /// высокой важностью забивают каждую пачку и память по задаче остаётся
+    /// неиндексированной ровно тогда, когда нужна.
+    pub fn unembedded(&self, shelf: &str, limit: usize, dim: usize) -> Result<Vec<MemoryItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, shelf, kind, title, body, summary, importance, uses, created_at, last_used
-             FROM memories WHERE embedding IS NULL ORDER BY importance DESC, id DESC LIMIT ?1",
+             FROM memories
+             WHERE embedding IS NULL OR (?2 > 0 AND length(embedding) <> ?2)
+             ORDER BY (shelf = ?3) DESC, importance DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64], row_to_item)?
+            .query_map(params![limit as i64, (dim * 4) as i64, shelf], row_to_item)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -328,14 +341,27 @@ impl Memory {
         limit: usize,
     ) -> Result<Vec<MemoryItem>> {
         let mut out = self.recall(shelf, query, limit)?;
-        let Some(qv) = query_vec else {
-            return Ok(out);
-        };
+        if let Some(qv) = query_vec {
+            self.fill_semantic(shelf, qv, &mut out, limit)?;
+        }
+        Ok(out)
+    }
+
+    /// Добор смыслом к тому, что уже нашли слова. Отдельный шаг нужен,
+    /// чтобы вызывающий снимал вектор запроса только когда слов не хватило:
+    /// иначе каждый шаг платит сетевым запросом за вектор, который не нужен.
+    pub fn fill_semantic(
+        &self,
+        shelf: &str,
+        query_vec: &[f32],
+        out: &mut Vec<MemoryItem>,
+        limit: usize,
+    ) -> Result<()> {
         if out.len() >= limit {
-            return Ok(out);
+            return Ok(());
         }
         let known: std::collections::HashSet<i64> = out.iter().map(|i| i.id).collect();
-        for it in self.recall_semantic(shelf, qv, limit)? {
+        for it in self.recall_semantic(shelf, query_vec, limit)? {
             if out.len() >= limit {
                 break;
             }
@@ -343,7 +369,7 @@ impl Memory {
                 out.push(it);
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     fn touch(&self, items: &[MemoryItem]) -> Result<()> {
@@ -530,7 +556,11 @@ fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryItem> {
 /// Прежние 0.75 на этой модели не пропускали вообще ничего, то есть смысловой
 /// слой молча не работал. Порог ставим в середину зазора и даём его
 /// переопределить `MEMORY_SEMANTIC_MIN` — другая модель даёт другой масштаб.
-fn semantic_min() -> f32 {
+///
+/// Значение берётся из окружения, поэтому `config.json` и `.env` доезжают сюда
+/// только через [`crate::config::Layers::export_core_env`] — без этого шага
+/// настройка человека молча игнорировалась бы.
+pub(crate) fn semantic_min() -> f32 {
     std::env::var("MEMORY_SEMANTIC_MIN")
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
@@ -677,11 +707,52 @@ mod tests {
         let id = m
             .remember("app:x", "fact", "ждёт вектора", "тело", "смысл", 0.9)
             .unwrap();
-        let pending = m.unembedded(10).unwrap();
+        let pending = m.unembedded("web:shop.kz", 10, 0).unwrap();
         assert!(pending.iter().any(|i| i.id == id));
         assert!(Memory::embed_text(&pending[0]).contains("ждёт вектора"));
         m.set_embedding(id, &[0.1, 0.2]).unwrap();
-        assert!(!m.unembedded(10).unwrap().iter().any(|i| i.id == id));
+        assert!(!m
+            .unembedded("web:shop.kz", 10, 0)
+            .unwrap()
+            .iter()
+            .any(|i| i.id == id));
+    }
+
+    /// Сменили модель — старые векторы другой длины должны вернуться в
+    /// очередь, иначе память тихо выпадает из смыслового поиска.
+    #[test]
+    fn foreign_dimension_returns_to_queue() {
+        let m = mem();
+        let id = m
+            .remember("app:x", "fact", "старый вектор", "тело", "смысл", 0.9)
+            .unwrap();
+        m.set_embedding(id, &[0.1, 0.2]).unwrap();
+        assert!(!m
+            .unembedded("app:x", 10, 2)
+            .unwrap()
+            .iter()
+            .any(|i| i.id == id));
+        assert!(m
+            .unembedded("app:x", 10, 3)
+            .unwrap()
+            .iter()
+            .any(|i| i.id == id));
+    }
+
+    /// Чужие полки с высокой важностью не должны забивать пачку: память по
+    /// текущей задаче нужна именно сейчас.
+    #[test]
+    fn current_shelf_goes_first_in_queue() {
+        let m = mem();
+        for i in 0..5 {
+            m.remember("app:other", "fact", &format!("чужое {i}"), "т", "с", 1.0)
+                .unwrap();
+        }
+        let mine = m
+            .remember("app:mine", "fact", "моё", "т", "с", 0.1)
+            .unwrap();
+        let batch = m.unembedded("app:mine", 2, 0).unwrap();
+        assert_eq!(batch[0].id, mine);
     }
 
     #[test]
