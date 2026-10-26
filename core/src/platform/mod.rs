@@ -30,6 +30,14 @@ pub struct Screenshot {
     pub width: i32,
     #[allow(dead_code)]
     pub height: i32,
+    /// Где левый верхний угол кадра на рабочем столе. На Windows снимок
+    /// покрывает весь виртуальный экран и начинается с SM_X/YVIRTUALSCREEN:
+    /// при мониторе слева или сверху это отрицательные числа, и координату
+    /// из кадра нельзя отдавать мыши без этого сдвига.
+    #[allow(dead_code)]
+    pub origin_x: i32,
+    #[allow(dead_code)]
+    pub origin_y: i32,
     pub png: Vec<u8>,
 }
 

@@ -32,6 +32,7 @@ mod sandbox;
 mod stage_bench;
 mod supervisor;
 mod text;
+mod vision;
 mod watchdog;
 
 use agent::{Agent, AgentCommand, AgentConfig, AgentEvent};
@@ -155,6 +156,7 @@ fn main() -> Result<()> {
         let stop = stop.clone();
         let ev_tx2 = ev_tx.clone();
         let ocr_lang = settings.ocr_lang.clone();
+        let vision_provider = settings.vision_provider.clone();
         std::thread::spawn(move || {
             let mut agent = Agent::new(
                 llm,
@@ -162,6 +164,7 @@ fn main() -> Result<()> {
                 adb,
                 AgentConfig {
                     ocr_lang: ocr_lang.clone(),
+                    vision_provider: vision_provider.clone(),
                     ..AgentConfig::default()
                 },
                 ev_tx2.clone(),

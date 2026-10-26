@@ -26,6 +26,15 @@ struct AnRect {
     score: f32,
 }
 
+// Левый верхний угол виртуального экрана: an_capture_screen снимает кадр
+// именно оттуда, а мышь работает в абсолютных координатах рабочего стола.
+#[link(name = "user32")]
+extern "system" {
+    fn GetSystemMetrics(index: i32) -> i32;
+}
+const SM_XVIRTUALSCREEN: i32 = 76;
+const SM_YVIRTUALSCREEN: i32 = 77;
+
 extern "C" {
     fn an_init() -> i32;
     fn an_shutdown();
@@ -133,6 +142,8 @@ pub fn capture_screen() -> Result<Screenshot> {
     Ok(Screenshot {
         width: f.0.width,
         height: f.0.height,
+        origin_x: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+        origin_y: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
         png,
     })
 }

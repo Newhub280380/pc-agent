@@ -82,6 +82,26 @@ impl LlmClient {
         }
     }
 
+    /// Кто подключён и кто принимает картинки. Нужно зрению: просить прицел
+    /// у провайдера без vision — гарантированная ошибка на каждом шаге.
+    pub fn providers(&self) -> Vec<(String, bool)> {
+        #[derive(Deserialize)]
+        struct Item {
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            vision: bool,
+        }
+        let got: Result<Vec<Item>, _> = self
+            .agent
+            .get(&format!("{}/v1/providers", self.base))
+            .set("X-Agent-Token", &self.token)
+            .call()
+            .and_then(|r| r.into_json::<Vec<Item>>().map_err(Into::into));
+        got.map(|v| v.into_iter().map(|i| (i.name, i.vision)).collect())
+            .unwrap_or_default()
+    }
+
     pub fn health(&self) -> bool {
         self.agent
             .get(&format!("{}/health", self.base))
@@ -96,6 +116,19 @@ impl LlmClient {
         json_mode: bool,
         temperature: f64,
     ) -> Result<CompleteResponse> {
+        self.complete_as("", messages, purpose, json_mode, temperature)
+    }
+
+    /// То же, но с жёстким выбором провайдера: прицел и визуальный судья
+    /// должны идти именно в vision-модель, а не туда, куда сейчас дешевле.
+    pub fn complete_as(
+        &self,
+        provider: &str,
+        messages: &[Message],
+        purpose: &str,
+        json_mode: bool,
+        temperature: f64,
+    ) -> Result<CompleteResponse> {
         let need_vision = messages.iter().any(|m| !m.images.is_empty());
         let req = CompleteRequest {
             messages,
@@ -103,7 +136,7 @@ impl LlmClient {
             max_tokens: 4096,
             json_mode,
             need_vision,
-            provider: String::new(),
+            provider: provider.to_string(),
             purpose: purpose.to_string(),
         };
         let resp = self

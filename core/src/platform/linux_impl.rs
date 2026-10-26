@@ -154,7 +154,14 @@ pub fn capture_screen() -> Result<Screenshot> {
         std::fs::read(&file).with_context(|| format!("{} не создал снимок", exe.display()))?;
     let _ = std::fs::remove_file(&file);
     let (width, height) = png_size(&png);
-    Ok(Screenshot { width, height, png })
+    // X11/Wayland отдают снимок корневого окна — его угол и есть (0,0).
+    Ok(Screenshot {
+        width,
+        height,
+        origin_x: 0,
+        origin_y: 0,
+        png,
+    })
 }
 
 /// Коды языков Windows («ru-RU») в имена моделей tesseract («rus»).

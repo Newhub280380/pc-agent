@@ -119,6 +119,9 @@ pub struct AgentConfig {
     /// true = спрашивать человека перед каждым необратимым действием.
     pub confirm_destructive: bool,
     pub ocr_lang: String,
+    /// Провайдер зрения (прицел и визуальный судья). «holo» по умолчанию,
+    /// «нет»/«off» — работать только по UI-дереву и OCR.
+    pub vision_provider: String,
 }
 
 impl Default for AgentConfig {
@@ -130,6 +133,7 @@ impl Default for AgentConfig {
             destructive_confidence: 0.85,
             confirm_destructive: true,
             ocr_lang: "ru-RU".into(),
+            vision_provider: "holo".into(),
         }
     }
 }
@@ -214,10 +218,18 @@ impl Agent {
         rx: Receiver<AgentCommand>,
         stop: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
+        // Глаза спрашиваем у роутера один раз на запуск: список провайдеров
+        // не меняется без перезапуска, а дёргать его на каждом шаге — лишняя
+        // задержка в цикле действий.
+        let eyes = crate::vision::Eyes::new(llm.clone(), &cfg.vision_provider, &llm.providers())
+            .map(Arc::new);
+        if let Some(e) = eyes.as_ref() {
+            log::info!("зрение: прицел через {}", e.provider());
+        }
         Self {
             llm,
             mem,
-            exec: Executor::new(adb),
+            exec: Executor::new(adb).with_eyes(eyes),
             cfg,
             tx,
             rx,
@@ -1367,10 +1379,26 @@ impl Agent {
     ) -> (verify::Verdict, String) {
         match self.perceive(phone_mode, false) {
             Ok(v) => {
-                let mut after = Evidence::from_prompt(&v.prompt);
+                // Только экран, без слов инструмента. Для «экран изменился»
+                // сравнивать можно лишь это: отчёт шага сам по себе всегда
+                // новый текст, и с ним любое действие выглядело бы удачным.
+                let screen_only = Evidence::from_prompt(&v.prompt);
+                let mut after = screen_only.clone();
                 // Вывод инструмента — тоже законное наблюдение (adb shell и т.п.).
                 after.add_tool_output(tool_output);
-                let verdict = verify::verify(expectation, before, &after);
+                let mut verdict = if *expectation == verify::Expectation::ScreenChanged {
+                    verify::verify(expectation, before, &screen_only)
+                } else {
+                    verify::verify(expectation, before, &after)
+                };
+                // Текст экрана не дал ответа — спрашиваем глаза. Это и есть
+                // случай Canvas/картинки, где подтверждения в дереве нет, а
+                // человек на скриншоте всё видит.
+                if matches!(verdict, verify::Verdict::Unknown(_)) {
+                    if let Some(better) = self.judge_by_sight(phone_mode, expectation) {
+                        verdict = better;
+                    }
+                }
                 let head: String = v
                     .prompt
                     .lines()
@@ -1388,6 +1416,35 @@ impl Agent {
                 }),
                 tool_output.to_string(),
             ),
+        }
+    }
+
+    /// Визуальный судья: снимаем кадр и спрашиваем глаза о факте. Зовём только
+    /// когда обычная проверка вернула «не знаю» — лишний vision-вызов на каждом
+    /// шаге стоит секунды и деньги. «Не знаю» судьи ничего не меняет: вердикт
+    /// остаётся прежним, успех не подделываем.
+    fn judge_by_sight(
+        &self,
+        phone_mode: bool,
+        expectation: &verify::Expectation,
+    ) -> Option<verify::Verdict> {
+        let eyes = self.exec.eyes.as_ref()?;
+        let question = verify::question_of(expectation)?;
+        let png = if phone_mode {
+            self.exec.adb.screenshot_png().ok()?
+        } else {
+            crate::platform::capture_screen().ok()?.png
+        };
+        match eyes.judge(&png, &question) {
+            crate::vision::Look::Yes => Some(verify::Verdict::Confirmed(format!(
+                "зрение ({}) подтверждает: {question}",
+                eyes.provider()
+            ))),
+            crate::vision::Look::No => Some(verify::Verdict::Refuted(format!(
+                "зрение ({}) не видит этого на экране: {question}",
+                eyes.provider()
+            ))),
+            crate::vision::Look::Unknown => None,
         }
     }
 
