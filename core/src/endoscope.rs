@@ -87,21 +87,54 @@ pub struct Endoscope {
     agent: ureq::Agent,
 }
 
-impl Endoscope {
-    /// Настройки из окружения: без `ENDOSCOPE_URL` эндоскопа просто нет, и
-    /// ядро работает как раньше. `ENDOSCOPE_RUN_ID` — прогон, который
-    /// эндоскоп завёл под эту задачу.
-    pub fn from_env() -> Option<Self> {
-        let base = std::env::var("ENDOSCOPE_URL").ok()?;
-        let base = base.trim().trim_end_matches('/').to_string();
-        let run_id = std::env::var("ENDOSCOPE_RUN_ID")
+/// Адрес эндоскопа по умолчанию: ловушка всегда локальная, и мутирующий
+/// POST он принимает только с localhost.
+const DEFAULT_URL: &str = "http://127.0.0.1:7098";
+
+/// Как эндоскоп настроен на этом запуске.
+pub enum Setup {
+    /// Ни адреса, ни прогона: ядро закрывает задачу своими правилами.
+    Off,
+    /// Адрес есть, прогона нет. Сверять нечего — и закрывать нельзя.
+    Broken(String),
+    Ready(Endoscope),
+}
+
+/// Настройки из окружения. `ENDOSCOPE_RUN_ID` ловушка эндоскопа выставляет
+/// дочернему процессу сама, поэтому под ней адрес указывать не нужно.
+pub fn setup() -> Setup {
+    let env = |k: &str| {
+        std::env::var(k)
             .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())?;
-        if base.is_empty() {
-            return None;
-        }
-        Some(Self {
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let url = env("ENDOSCOPE_URL");
+    match (url.clone(), env("ENDOSCOPE_RUN_ID")) {
+        (None, None) => Setup::Off,
+        (_, Some(run_id)) => Setup::Ready(Endoscope::new(
+            url.unwrap_or_else(|| DEFAULT_URL.to_string()),
+            run_id,
+        )),
+        (Some(_), None) => Setup::Broken(
+            "в окружении нет ENDOSCOPE_RUN_ID — агента надо запускать под прогоном эндоскопа"
+                .to_string(),
+        ),
+    }
+}
+
+/// Приговор независимой проверки по готовому отчёту.
+pub fn judge_report(report: &str) -> Verdict {
+    match setup() {
+        Setup::Off => Verdict::NotConfigured,
+        Setup::Broken(why) => Verdict::Unavailable(why),
+        Setup::Ready(e) => e.judge(report),
+    }
+}
+
+impl Endoscope {
+    fn new(base: String, run_id: String) -> Self {
+        Self {
             base,
             run_id,
             // Проверка не должна висеть дольше сторожа по зависанию.
@@ -109,7 +142,7 @@ impl Endoscope {
                 .timeout_connect(Duration::from_secs(3))
                 .timeout(Duration::from_secs(15))
                 .build(),
-        })
+        }
     }
 
     /// Отдать отчёт и получить приговор. Сам текст приговора эндоскоп
@@ -247,10 +280,9 @@ mod tests {
         });
         std::env::set_var("ENDOSCOPE_URL", format!("http://127.0.0.1:{port}/"));
         std::env::set_var("ENDOSCOPE_RUN_ID", "run-1");
-        let e = Endoscope::from_env().expect("эндоскоп настроен");
+        let verdict = judge_report("ИТОГ: скачал 50 файлов");
         std::env::remove_var("ENDOSCOPE_URL");
         std::env::remove_var("ENDOSCOPE_RUN_ID");
-        let verdict = e.judge("ИТОГ: скачал 50 файлов");
         assert_eq!(
             verdict,
             Verdict::Disproven("скачал 50 файлов".to_string()),
@@ -278,15 +310,37 @@ mod tests {
         assert!(!verdict.closes());
     }
 
-    /// Без настроек эндоскопа ядро работает как раньше.
+    /// Без настроек эндоскопа ядро работает как раньше. Адрес без прогона —
+    /// наоборот, шлагбаум закрыт: проверять нечем, значит не закрываем.
     #[test]
     fn missing_config_is_not_a_blocker() {
         std::env::remove_var("ENDOSCOPE_URL");
         std::env::remove_var("ENDOSCOPE_RUN_ID");
-        assert!(Endoscope::from_env().is_none());
-        // Адрес без прогона — тоже не настройка: сверять нечего.
+        assert!(matches!(setup(), Setup::Off));
+        assert!(judge_report("ИТОГ: сделано").closes());
         std::env::set_var("ENDOSCOPE_URL", "http://127.0.0.1:7098");
-        assert!(Endoscope::from_env().is_none());
+        let broken = setup();
         std::env::remove_var("ENDOSCOPE_URL");
+        match broken {
+            Setup::Broken(why) => assert!(why.contains("ENDOSCOPE_RUN_ID"), "{why}"),
+            _ => panic!("адрес без прогона должен закрывать шлагбаум"),
+        }
+    }
+
+    /// Под ловушкой эндоскопа агент получает только `ENDOSCOPE_RUN_ID` —
+    /// адрес подставляется локальный, настраивать руками нечего.
+    #[test]
+    fn run_under_harness_needs_no_url() {
+        std::env::remove_var("ENDOSCOPE_URL");
+        std::env::set_var("ENDOSCOPE_RUN_ID", "traced:20261026-100000-тест");
+        let got = setup();
+        std::env::remove_var("ENDOSCOPE_RUN_ID");
+        match got {
+            Setup::Ready(e) => {
+                assert_eq!(e.base, DEFAULT_URL);
+                assert_eq!(e.run_id, "traced:20261026-100000-тест");
+            }
+            _ => panic!("прогон есть — эндоскоп должен включиться"),
+        }
     }
 }

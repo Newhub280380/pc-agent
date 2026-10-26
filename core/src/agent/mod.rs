@@ -1305,10 +1305,7 @@ impl Agent {
         // ядро проверяет само, то есть своими же словами; эндоскоп сверяет
         // отчёт со своей записью прогона, на которую агент не влияет.
         let report = self.finish_report(graph, trace);
-        let verdict = match crate::endoscope::Endoscope::from_env() {
-            Some(e) => e.judge(&report),
-            None => crate::endoscope::Verdict::NotConfigured,
-        };
+        let verdict = crate::endoscope::judge_report(&report);
         if verdict.closes() {
             TaskReport::closed(report)
         } else {
