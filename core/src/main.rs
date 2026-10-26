@@ -348,6 +348,13 @@ fn headless(task: &str) -> Result<()> {
         AgentConfig {
             ocr_lang: settings.ocr_lang.clone(),
             vision_provider: settings.vision_provider.clone(),
+            // На бесплатной модели один шаг стоит 10-80 с, и в 45 минут
+            // многошаговая задача просто не укладывается. Срок задаётся
+            // снаружи: PCAGENT_MAX_MIN.
+            max_minutes: std::env::var("PCAGENT_MAX_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(AgentConfig::default().max_minutes),
             ..AgentConfig::default()
         },
         ev_tx,

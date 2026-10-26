@@ -146,6 +146,107 @@ pub struct Decision {
     pub question: String,
 }
 
+/// Привести имена действия и полей к словарю ядра. Бесплатные модели пишут
+/// то же самое своими словами: `click_xy` вместо `click_x_y`, `value`
+/// вместо `text`. Терять из-за этого шаг нельзя — значение модель уже
+/// сказала, мы только переименовываем ключ.
+fn normalize_action(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if !obj.contains_key("action") {
+        for k in ["action_name", "tool", "type", "act"] {
+            if let Some(v @ serde_json::Value::String(_)) = obj.remove(k) {
+                obj.insert("action".into(), v);
+                break;
+            }
+        }
+    }
+    if let Some(serde_json::Value::String(kind)) = obj.get("action").cloned() {
+        let k = kind.trim().to_lowercase().replace([' ', '-'], "_");
+        let fixed = match k.as_str() {
+            "click_xy" | "clickxy" | "click_coords" | "click_at" => "click_x_y",
+            "click" | "clickelement" | "click_on" => "click_element",
+            "type" | "typetext" | "type_in" | "input_text" | "write" => "type_text",
+            "open" | "open_page" | "goto" | "navigate" | "openurl" => "open_url",
+            "launch" | "run_app" | "start_app" | "launchapp" => "launch_app",
+            "press" | "hotkey" | "key" | "keypress" => "key_combo",
+            "done" | "node_done" | "step_done" => "subtask_done",
+            "complete" | "task_done" => "finish",
+            other => other,
+        };
+        obj.insert("action".into(), serde_json::Value::String(fixed.into()));
+    }
+    let needs = |obj: &serde_json::Map<String, serde_json::Value>, k: &str| !obj.contains_key(k);
+    let rename =
+        |obj: &mut serde_json::Map<String, serde_json::Value>, want: &str, from: &[&str]| {
+            if needs(obj, want) {
+                for k in from {
+                    if let Some(v) = obj.remove(*k) {
+                        obj.insert(want.into(), v);
+                        return;
+                    }
+                }
+            }
+        };
+    match obj.get("action").and_then(|v| v.as_str()).unwrap_or("") {
+        "type_text" | "adb_text" => rename(obj, "text", &["value", "content", "input", "keys"]),
+        "click_element" => rename(obj, "name", &["element", "target", "selector", "label"]),
+        "open_url" => rename(obj, "url", &["link", "address", "href"]),
+        "launch_app" => rename(obj, "path", &["app", "program", "command", "exe"]),
+        "key_combo" => rename(obj, "combo", &["keys", "key", "shortcut"]),
+        "focus_window" => rename(obj, "title_contains", &["title", "window"]),
+        "subtask_done" => rename(obj, "result", &["report", "summary", "text"]),
+        "finish" => rename(obj, "report", &["result", "summary", "text"]),
+        "ask_user" => rename(obj, "question", &["q", "text"]),
+        _ => {}
+    }
+}
+
+/// Разбор ответа модели с починкой типичных промахов формата. На
+/// бесплатных моделях каждый второй ответ приходил без поля `next`
+/// (действие лежало верхним уровнем или был только вопрос) — и шаг
+/// терялся вместе с минутой ожидания. Содержимое не придумываем:
+/// переносим то, что модель уже написала.
+pub fn decision_from_value(mut v: serde_json::Value) -> Result<Decision, serde_json::Error> {
+    if let Some(obj) = v.as_object_mut() {
+        if !obj.contains_key("next") {
+            let lifted = match obj.remove("action") {
+                // {"action":{"action":"click_element",...}}
+                Some(a @ serde_json::Value::Object(_)) => Some(a),
+                // {"action":"click_element","name":"login"} — действие
+                // размазано по верхнему уровню.
+                Some(serde_json::Value::String(kind)) => {
+                    let mut inner = serde_json::Map::new();
+                    inner.insert("action".into(), serde_json::Value::String(kind));
+                    for (k, val) in obj.iter() {
+                        if !matches!(
+                            k.as_str(),
+                            "observation" | "thought" | "confidence" | "question"
+                        ) {
+                            inner.insert(k.clone(), val.clone());
+                        }
+                    }
+                    Some(serde_json::Value::Object(inner))
+                }
+                _ => None,
+            };
+            let lifted = lifted.or_else(|| {
+                // Остался только вопрос — это ask_user, а не мусор.
+                let q = obj.get("question")?.as_str()?.trim().to_string();
+                if q.is_empty() {
+                    return None;
+                }
+                Some(serde_json::json!({"action": "ask_user", "question": q}))
+            });
+            if let Some(next) = lifted {
+                obj.insert("next".into(), next);
+            }
+        }
+    }
+    if let Some(next) = v.get_mut("next").and_then(|n| n.as_object_mut()) {
+        normalize_action(next);
+    }
+    serde_json::from_value(v)
+}
+
 impl Action {
     /// Необратимые действия: перед ними нужен более высокий порог уверенности
     /// и (по настройке) подтверждение человека.
@@ -237,5 +338,60 @@ mod tests {
             serde_json::from_str::<Action>(&j).unwrap(),
             Action::AdbSwipe { ms: 300, .. }
         ));
+    }
+
+    #[test]
+    fn flat_action_is_lifted_into_next() {
+        let v = serde_json::json!({
+            "observation":"страница входа",
+            "thought":"жму login",
+            "confidence":0.9,
+            "action":"click_element",
+            "name":"login"
+        });
+        let d = decision_from_value(v).expect("разбор");
+        assert_eq!(
+            d.next.short(),
+            Action::ClickElement {
+                name: "login".into(),
+                control_type: String::new()
+            }
+            .short()
+        );
+    }
+
+    #[test]
+    fn question_only_answer_becomes_ask_user() {
+        let v =
+            serde_json::json!({"thought":"не уверен","confidence":0.4,"question":"какой логин?"});
+        let d = decision_from_value(v).expect("разбор");
+        assert!(matches!(d.next, Action::AskUser { .. }), "{:?}", d.next);
+    }
+
+    #[test]
+    fn model_wording_is_normalized() {
+        let v = serde_json::json!({
+            "thought":"печатаю логин","confidence":0.9,
+            "next":{"action":"type","value":"zishel_demo_7120"}
+        });
+        let d = decision_from_value(v).expect("разбор");
+        match d.next {
+            Action::TypeText { text, .. } => assert_eq!(text, "zishel_demo_7120"),
+            other => panic!("не то действие: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_xy_alias_is_accepted() {
+        let v = serde_json::json!({
+            "thought":"жму","confidence":0.9,
+            "next":{"action":"click_xy","x":10,"y":20}
+        });
+        let d = decision_from_value(v).expect("разбор");
+        assert!(
+            matches!(d.next, Action::ClickXY { x: 10, y: 20, .. }),
+            "{:?}",
+            d.next
+        );
     }
 }

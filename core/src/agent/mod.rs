@@ -146,7 +146,7 @@ const MAX_ROLLBACK_STEPS: u32 = 8;
 /// и при этом отвечает «нет» на любое действие — тогда шаг не делается никогда,
 /// а задача упирается в лимит шагов, ничего не сделав. После лимита шаг идёт,
 /// а запрет остаётся в подсказках модели.
-const MAX_JEV_VETOES: u32 = 2;
+const MAX_JEV_VETOES: u32 = 1;
 
 const ACT_SYSTEM: &str = r#"Ты — автономный агент, управляющий компьютером Windows и телефоном Android как живой человек.
 Ты работаешь строго по циклу ReAct: Thought → Action → Observation. За один ответ — РОВНО ОДНО действие, не забегая вперёд.
@@ -155,8 +155,8 @@ const ACT_SYSTEM: &str = r#"Ты — автономный агент, управ
 1. Сначала ответь себе: чего хочет пользователь, какие есть риски, какие шаги нужны и почему именно этот шаг сейчас.
 2. Опирайся на «ПОСЛЕДНИЕ ШАГИ»: там твои прошлые Thought/Action/Observation. Не повторяй то, что уже не сработало.
 3. observation заполняй ТОЛЬКО тем, что реально есть в описании экрана. Запрещено придумывать пути к файлам, имена кнопок, ссылки и вывод команд. Если чего-то нет — так и напиши «этого на экране нет».
-4. confidence — честная оценка 0..1. Если ниже 0.8, НЕ действуй: верни action ask_user (или заполни поле question) и спроси у человека то, что мешает быть уверенным.
-5. Предпочитай click_element (по имени элемента) вместо click_xy — это надёжнее.
+4. confidence — честная оценка 0..1. Если ниже 0.8, НЕ действуй: верни action ask_user (или заполни поле question) и спроси у человека то, что мешает быть уверенным. Если человек уже ответил, что его рядом нет, больше не спрашивай — действуй сам.
+5. Предпочитай click_element (по имени элемента) вместо click_xy — это надёжнее. Если одинаковых элементов на экране несколько (два поля «username»: в форме входа и в форме регистрации), в name опиши цель так, чтобы её нельзя было спутать: «поле username в блоке Create Account».
 6. Если элемента нет — проверь: не нужно ли закрыть баннер/модалку, проскроллить, подождать загрузку, сменить окно.
 7. Если нужен код из SMS/приложения, 2FA или решение человека — action ask_user.
 8. Если не хватает инструмента или доступа (нет ADB, нет приложения, нет аккаунта) — action need_tool с конкретной просьбой. Не отказывайся от задачи.
@@ -221,6 +221,9 @@ pub struct Agent {
     /// Размерность векторов текущей модели: по ней видно, что эмбеддер
     /// сменился и старые векторы надо снять заново, а не терять их.
     embed_dim: std::sync::atomic::AtomicUsize,
+    /// Канал к человеку оборван (запуск из командной строки): больше не
+    /// спрашиваем ни уточнений, ни подтверждений — иначе шаг уходит в пустоту.
+    no_human: std::sync::atomic::AtomicBool,
 }
 
 impl Agent {
@@ -262,6 +265,7 @@ impl Agent {
             embed_off: std::sync::atomic::AtomicBool::new(false),
             embed_fails: std::sync::atomic::AtomicUsize::new(0),
             embed_dim: std::sync::atomic::AtomicUsize::new(0),
+            no_human: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -784,10 +788,15 @@ impl Agent {
                 }
             };
             let decision: Decision =
-                match extract_json(&resp.text).and_then(|v| Ok(serde_json::from_value(v)?)) {
+                match extract_json(&resp.text).and_then(|v| Ok(action::decision_from_value(v)?)) {
                     Ok(d) => d,
                     Err(e) => {
-                        self.log(format!("Модель вернула не то ({e}), переспрашиваю"));
+                        // Без куска ответа такой отказ нечем лечить: в
+                        // живом прогоне он повторялся сотнями строк.
+                        let raw: String = resp.text.chars().take(300).collect();
+                        self.log(format!(
+                            "Модель вернула не то ({e}), переспрашиваю. Ответ: {raw}"
+                        ));
                         failures.push(format!("ответ модели не разобран: {e}"));
                         continue;
                     }
@@ -809,18 +818,21 @@ impl Agent {
                     "goal": work.goal(),
                     "failures": failures,
                 });
+                // Отказ JEV останавливает только необратимое. На живом
+                // прогоне он отказывал почти на каждом шаге, и агент
+                // выбрасывал готовое решение модели — половина запросов
+                // уходила в пустоту, задача стояла. Сомнение в обратимом
+                // шаге — это подсказка, а не запрет.
                 match self.decisions.yes(&state, "Делать ли это действие сейчас?")
                 {
-                    Ok(false) if jev_vetoes < MAX_JEV_VETOES => {
+                    Ok(false) if decision.next.is_destructive() && jev_vetoes < MAX_JEV_VETOES => {
                         jev_vetoes += 1;
-                        self.log("JEV: действие сейчас не подходит, пропускаю");
-                        failures.push("jev: noul отказал в действии".into());
+                        self.log("JEV: необратимое действие сейчас не подходит, пропускаю");
+                        failures.push("jev: noul отказал в необратимом действии".into());
                         continue;
                     }
                     Ok(false) => {
-                        self.log(format!(
-                            "JEV отказал {jev_vetoes} раз подряд — делаю шаг, иначе задача стоит"
-                        ));
+                        self.log("JEV сомневается, но шаг обратимый — делаю");
                         jev_vetoes = 0;
                     }
                     Ok(true) => jev_vetoes = 0,
@@ -828,7 +840,9 @@ impl Agent {
                 }
             }
             match self.jev.ask(&act_str) {
-                crate::jev::JevVerdict::No if jev_vetoes < MAX_JEV_VETOES => {
+                crate::jev::JevVerdict::No
+                    if decision.next.is_destructive() && jev_vetoes < MAX_JEV_VETOES =>
+                {
                     jev_vetoes += 1;
                     self.log(format!(
                         "JEV: класс действия «{}» стабильно проваливается — пропускаю",
@@ -869,26 +883,35 @@ impl Agent {
                 decision.next,
                 Action::AskUser { .. } | Action::NeedTool { .. }
             );
+            let no_human = self.no_human.load(std::sync::atomic::Ordering::Relaxed);
             if let Gate::Clarify(q) = react::confidence_gate(
                 decision.confidence,
                 asks_human,
                 &decision.question,
                 &human_readable(&decision.next),
             ) {
-                self.log(format!(
-                    "Уверенность {:.0}% — уточняю у человека",
-                    decision.confidence.max(0.0) * 100.0
-                ));
-                let ans = self.ask_human(&q, false);
-                trace.push(Step {
-                    n: step,
-                    thought: decision.thought.clone(),
-                    action: format!("уточняющий вопрос: {q}"),
-                    observation: format!("человек ответил: {ans}"),
-                    confidence: decision.confidence,
-                    verified: None,
-                });
-                continue;
+                // Спрашивать некого — вопрос это просто потерянный шаг.
+                // Живой прогон так крутился: 70% уверенности, вопрос,
+                // «человека нет», снова вопрос.
+                if no_human && !asks_human {
+                    failures
+                        .push("спросить некого: действуй сам по тому, что видно на экране".into());
+                } else {
+                    self.log(format!(
+                        "Уверенность {:.0}% — уточняю у человека",
+                        decision.confidence.max(0.0) * 100.0
+                    ));
+                    let ans = self.ask_human(&q, false);
+                    trace.push(Step {
+                        n: step,
+                        thought: decision.thought.clone(),
+                        action: format!("уточняющий вопрос: {q}"),
+                        observation: format!("человек ответил: {ans}"),
+                        confidence: decision.confidence,
+                        verified: None,
+                    });
+                    continue;
+                }
             }
 
             // Куда агент пошёл — туда и смотрим на следующем шаге.
@@ -910,6 +933,15 @@ impl Agent {
                 failures.push(
                     "ты повторяешь одно и то же действие без результата — смени подход".into(),
                 );
+                // Клик по полю ввода не меняет картинку: курсор в кадре не
+                // виден, модель считает, что не попала, и жмёт снова. Так
+                // живой прогон простоял на поле «username» двадцать шагов.
+                if matches!(decision.next, Action::ClickElement { .. }) {
+                    failures.push(
+                        "по полю ввода уже кликнули — фокус в нём, клик ничего не меняет на картинке: печатай текст (type_text)"
+                            .into(),
+                    );
+                }
             }
 
             // --- ЗАЩИТА ОТ НЕОБРАТИМОГО ---
@@ -917,16 +949,33 @@ impl Agent {
                 && (decision.confidence < self.cfg.destructive_confidence
                     || self.cfg.confirm_destructive)
             {
-                let q = format!(
-                    "Подтверди необратимое действие: {}\n(уверенность модели {:.0}%)",
-                    act_str,
-                    decision.confidence * 100.0
+                // Без человека запуск программы без аргументов разрешаем:
+                // опасен не сам запуск, а аргументы (powershell -enc ...),
+                // которые модель может взять со страницы. Иначе прогон
+                // встаёт навсегда: «подтверди» → некому → «отменено».
+                let safe_launch = matches!(
+                    &decision.next,
+                    Action::LaunchApp { args, path }
+                        if args.trim().is_empty()
+                            && !path.contains(['&', '|', ';', '>', '`'])
                 );
-                let ans = self.ask_human(&q, false);
-                if !ans.trim().to_lowercase().starts_with(['д', 'y']) {
-                    self.log("Пользователь отменил действие");
-                    failures.push("пользователь отменил необратимое действие".into());
-                    continue;
+                if no_human && safe_launch {
+                    self.log("Подтверждать некому, аргументов нет — запускаю сам");
+                } else {
+                    let q = format!(
+                        "Подтверди необратимое действие: {}\n(уверенность модели {:.0}%)",
+                        act_str,
+                        decision.confidence * 100.0
+                    );
+                    let ans = self.ask_human(&q, false);
+                    if !ans.trim().to_lowercase().starts_with(['д', 'y']) {
+                        self.log("Пользователь отменил действие");
+                        failures.push(
+                        "необратимое действие не подтверждено: подтвердить некому — выбери путь без необратимого шага"
+                            .into(),
+                    );
+                        continue;
+                    }
                 }
             }
 
@@ -1740,6 +1789,8 @@ impl Agent {
                 // Ждать его бесконечно нельзя: так живой прогон вставал
                 // на уточняющем вопросе и не делал больше ни шага.
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.no_human
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     self.log("Ответить некому — работаю сам, без подсказки");
                     // Секрет (код из SMS, пароль) выдумывать нельзя: пустой
                     // ответ агент запишет как «нет кода». На обычный вопрос
@@ -1747,7 +1798,8 @@ impl Agent {
                     return if secret {
                         String::new()
                     } else {
-                        "человека рядом нет, подсказки не будет: решай сам и делай следующий шаг".into()
+                        "человека рядом нет, подсказки не будет: решай сам и делай следующий шаг"
+                            .into()
                     };
                 }
                 Err(_) => continue,
