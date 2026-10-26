@@ -1243,9 +1243,36 @@ impl Agent {
         let met = verify::criterion_observed(done_when, &ev);
         let seen = crate::text::truncate(&view.prompt, 160);
         if met {
-            (true, format!("критерий «{done_when}» виден: {seen}"))
+            return (true, format!("критерий «{done_when}» виден: {seen}"));
+        }
+        // В тексте экрана ответа нет. Это нормальный случай для картинок и
+        // холста: «70 фото в галерее» в дереве элементов не напишут. Зовём
+        // глаза. «Не вижу» и «не знаю» критерий не закрывают.
+        if let Some(why) = self.sight_confirms(phone_mode, done_when) {
+            return (true, why);
+        }
+        (false, format!("на экране нет критерия «{done_when}»"))
+    }
+
+    /// Спросить глаза про факт своими словами. Единственный путь, которым
+    /// критерий может закрыться не текстом экрана — и только на «да».
+    fn sight_confirms(&self, phone_mode: bool, claim: &str) -> Option<String> {
+        let eyes = self.exec.eyes.as_ref()?;
+        let claim = claim.trim();
+        if claim.is_empty() {
+            return None;
+        }
+        let png = if phone_mode {
+            self.exec.adb.screenshot_png().ok()?
         } else {
-            (false, format!("на экране нет критерия «{done_when}»"))
+            crate::platform::capture_screen().ok()?.png
+        };
+        match eyes.judge(&png, &format!("На экране выполнено: {claim}?")) {
+            crate::vision::Look::Yes => Some(format!(
+                "критерий «{claim}» подтверждён зрением ({})",
+                eyes.provider()
+            )),
+            crate::vision::Look::No | crate::vision::Look::Unknown => None,
         }
     }
 
@@ -1286,7 +1313,25 @@ impl Agent {
             Ok(view) => Evidence::from_prompt(&view.prompt),
             Err(_) => Evidence::default(),
         };
-        let unmet = crate::acceptance::unmet(criteria, &evidence);
+        let mut unmet = crate::acceptance::unmet(criteria, &evidence);
+        // То же, что на узлах: чего нет в тексте экрана, может быть видно
+        // глазами. Спрашиваем не больше трёх раз — vision-вызов не бесплатный.
+        if !unmet.is_empty() && !criteria.is_empty() {
+            let mut asked = 0;
+            unmet.retain(|c| {
+                if asked >= 3 {
+                    return true;
+                }
+                asked += 1;
+                match self.sight_confirms(phone_mode, c) {
+                    Some(why) => {
+                        self.log(why);
+                        false
+                    }
+                    None => true,
+                }
+            });
+        }
         if !unmet.is_empty() {
             return TaskReport::open(format!(
                 "Задача не закрыта: {}\n\n{}",
