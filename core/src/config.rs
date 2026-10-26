@@ -125,6 +125,15 @@ fn canonical_key(k: &str) -> String {
     }
 }
 
+/// Ключи, которые читаются через `std::env` в разных местах ядра: порог
+/// смысловой памяти, выбор солвера, таймаут зависания и ключ быстрых решений.
+pub const CORE_ENV_KEYS: [&str; 4] = [
+    "MEMORY_SEMANTIC_MIN",
+    "PCAGENT_OPTIMIZER",
+    "PCAGENT_HANG_SEC",
+    "OPENROUTER_API_KEY",
+];
+
 impl Layers {
     pub fn load(paths: &Paths) -> Result<Self> {
         let mut json = BTreeMap::new();
@@ -169,6 +178,17 @@ impl Layers {
             .get(key)
             .map(|v| (v.clone(), Source::DotEnv))
             .filter(|(v, _)| !v.is_empty())
+    }
+
+    /// Настройки, которые ядро читает прямо из окружения. Без этого шага
+    /// значение из `config.json`/`.env` молча не доезжало: работал зашитый
+    /// дефолт, хотя человек настройку вписал.
+    pub fn export_core_env(&self) {
+        for key in CORE_ENV_KEYS {
+            if let Some(v) = self.get(key) {
+                std::env::set_var(key, v);
+            }
+        }
     }
 
     /// Значения из config.json для дочернего роутера: он читает только
@@ -938,6 +958,40 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("битый JSON"), "{err}");
+    }
+
+    /// Порог смысловой памяти человек пишет в `.env`/`config.json`, а ядро
+    /// читает его из окружения. Без экспорта работал зашитый дефолт.
+    #[test]
+    fn core_settings_reach_process_env() {
+        let dir = tmp("coreenv");
+        std::fs::write(
+            dir.join(".env"),
+            "MEMORY_SEMANTIC_MIN=0.11
+",
+        )
+        .unwrap();
+        std::env::remove_var("MEMORY_SEMANTIC_MIN");
+        Layers::load(&paths_in(&dir)).unwrap().export_core_env();
+        assert_eq!(std::env::var("MEMORY_SEMANTIC_MIN").as_deref(), Ok("0.11"));
+        assert!((crate::memory::semantic_min() - 0.11).abs() < 1e-6);
+
+        // config.json старше окружения и `.env` — порядок не должен поехать.
+        let dir2 = tmp("coreenv2");
+        std::fs::write(
+            dir2.join(".env"),
+            "MEMORY_SEMANTIC_MIN=0.11
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir2.join("config.json"),
+            "{\"MEMORY_SEMANTIC_MIN\": \"0.44\"}",
+        )
+        .unwrap();
+        Layers::load(&paths_in(&dir2)).unwrap().export_core_env();
+        assert_eq!(std::env::var("MEMORY_SEMANTIC_MIN").as_deref(), Ok("0.44"));
+        std::env::remove_var("MEMORY_SEMANTIC_MIN");
     }
 
     #[test]

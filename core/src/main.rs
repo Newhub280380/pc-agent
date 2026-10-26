@@ -95,6 +95,8 @@ fn main() -> Result<()> {
     for line in layers.describe(&paths.searched) {
         log::info!("{line}");
     }
+    // Настройки ядра, которые читаются из окружения, доезжают только так.
+    layers.export_core_env();
     let settings = config::Settings::load(&layers)?;
     let _router = match supervisor::Router::start(
         &paths.router_exe,
@@ -400,6 +402,7 @@ fn selfcheck(report: Option<&str>) -> Result<()> {
     for line in layers.describe(&paths.searched) {
         step("config", Ok(line));
     }
+    layers.export_core_env();
     let settings = config::Settings::load(&layers)?;
     let router = supervisor::Router::start(
         &paths.router_exe,

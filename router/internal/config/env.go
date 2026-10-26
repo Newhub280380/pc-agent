@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -293,13 +294,17 @@ var embedDefaults = map[string]string{
 // пустой Embedder, и ядро остаётся на полнотекстовом поиске.
 func resolveEmbedder(get func(string) string, providers []Provider) Embedder {
 	if base := get("EMBED_BASE_URL"); base != "" {
+		base = strings.TrimRight(base, "/")
 		return Embedder{
-			BaseURL: strings.TrimRight(base, "/"),
-			APIKey:  firstNonEmpty(get("EMBED_API_KEY"), get("OPENAI_API_KEY"), get("OPENROUTER_API_KEY"), get("LLM_API_KEY")),
+			BaseURL: base,
+			APIKey:  firstNonEmpty(get("EMBED_API_KEY"), keyForHost(base, providers)),
 			Model:   firstNonEmpty(get("EMBED_MODEL"), "text-embedding-3-small"),
 		}
 	}
-	for _, want := range []string{"openai", "openrouter", "local"} {
+	// Порядок важен: OpenRouter стоит последним, иначе добавленный для чата
+	// ключ менял бы уже работающий локальный эмбеддер — и всю уже снятую
+	// память пришлось бы индексировать заново (другая размерность вектора).
+	for _, want := range []string{"openai", "local", "openrouter"} {
 		for _, p := range providers {
 			if p.Name != want || p.Kind != "openai" {
 				continue
@@ -312,6 +317,31 @@ func resolveEmbedder(get func(string) string, providers []Provider) Embedder {
 		}
 	}
 	return Embedder{}
+}
+
+// keyForHost — ключ для явного EMBED_BASE_URL берём только у того провайдера,
+// чей адрес совпадает. Чужой ключ в Authorization — это не только 401 и молча
+// выключенная смысловая память, а прямая передача секрета постороннему
+// сервису. Не совпало — ждём EMBED_API_KEY.
+func keyForHost(base string, providers []Provider) string {
+	want := hostOf(base)
+	if want == "" {
+		return ""
+	}
+	for _, p := range providers {
+		if hostOf(p.BaseURL) == want && p.APIKey != "" {
+			return p.APIKey
+		}
+	}
+	return ""
+}
+
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Host)
 }
 
 func fileExists(path string) bool {
