@@ -276,6 +276,8 @@ impl Memory {
 
     /// Поиск по смыслу внутри полки: косинусная близость к вектору запроса.
     /// Записи без вектора просто не участвуют — их найдёт FTS5.
+    ///
+    /// Отсечка — [`semantic_min`].
     pub fn recall_semantic(
         &self,
         shelf: &str,
@@ -307,7 +309,7 @@ impl Memory {
                 let sim = cosine(&v, query);
                 // Порог: без него «ближайшая» запись находится всегда, даже
                 // когда на полке нет ничего по теме.
-                (sim >= 0.75).then_some((sim, it))
+                (sim >= semantic_min()).then_some((sim, it))
             })
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -521,6 +523,21 @@ fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryItem> {
     })
 }
 
+/// Минимальная косинусная близость, при которой запись считается «по теме».
+///
+/// Замер на живом `text-embedding-3-small` (роутер → OpenRouter/OpenAI), пары
+/// «запись памяти ↔ цель задачи»: по теме 0.40–0.62, мимо темы 0.13–0.23.
+/// Прежние 0.75 на этой модели не пропускали вообще ничего, то есть смысловой
+/// слой молча не работал. Порог ставим в середину зазора и даём его
+/// переопределить `MEMORY_SEMANTIC_MIN` — другая модель даёт другой масштаб.
+fn semantic_min() -> f32 {
+    std::env::var("MEMORY_SEMANTIC_MIN")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| (0.0..=1.0).contains(v))
+        .unwrap_or(0.32)
+}
+
 /// Вектор в BLOB: f32 little-endian. Свой формат, а не JSON, потому что
 /// 1536 чисел текстом — это 10 КБ на запись вместо 6 КБ и парсинг на каждом
 /// сравнении.
@@ -616,6 +633,28 @@ mod tests {
             .recall_hybrid("web:shop.kz", "купить", Some(&near), 5)
             .unwrap();
         assert_eq!(hybrid.len(), 1);
+    }
+
+    /// Живой `text-embedding-3-small` даёт по теме около 0.4–0.6, а не 0.9.
+    /// С прежним порогом 0.75 смысловой слой не находил ничего никогда.
+    #[test]
+    fn real_model_similarity_is_not_cut_off() {
+        let m = mem();
+        let id = m
+            .remember("web:shop.kz", "ui_hint", "Оформить заказ", "внизу", "", 0.6)
+            .unwrap();
+        m.set_embedding(id, &[1.0, 0.0, 0.0]).unwrap();
+        // cos = 0.45 — ровно тот масштаб, что показывает живая модель.
+        let q = [0.45, 0.893, 0.0];
+        assert!((cosine(&q, &[1.0, 0.0, 0.0]) - 0.45).abs() < 0.01);
+        assert_eq!(m.recall_semantic("web:shop.kz", &q, 5).unwrap().len(), 1);
+
+        // А мимо темы (0.2) по-прежнему не проходит.
+        let far = [0.2, 0.98, 0.0];
+        assert!(m
+            .recall_semantic("web:shop.kz", &far, 5)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

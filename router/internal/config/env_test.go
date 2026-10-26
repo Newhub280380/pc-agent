@@ -309,9 +309,21 @@ func TestEmbedderFromOpenAIKeyAndExplicitEnv(t *testing.T) {
 		t.Fatalf("эмбеддер не подхватил ключ OpenAI: %+v", cfg.Embed)
 	}
 
-	// Чужой шлюз без /embeddings эмбеддером становиться не должен: иначе
-	// каждая запись памяти ловила бы 404.
+	// OpenRouter /embeddings проверен живым запросом, поэтому один его ключ
+	// уже включает смысловую память.
 	cfg, err = Load(writeEnv(t, "OPENROUTER_API_KEY=sk-or\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embed.BaseURL != "https://openrouter.ai/api/v1" ||
+		cfg.Embed.Model != "openai/text-embedding-3-small" ||
+		cfg.Embed.APIKey != "sk-or" {
+		t.Fatalf("эмбеддер не подхватил ключ OpenRouter: %+v", cfg.Embed)
+	}
+
+	// Шлюз без проверенного /embeddings эмбеддером становиться не должен:
+	// иначе каждая запись памяти ловила бы 404.
+	cfg, err = Load(writeEnv(t, "XAI_API_KEY=sk-x\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -283,8 +283,9 @@ func Load(envPath string) (*Config, error) {
 // /embeddings реально есть и проверен. Угадывать за остальных нельзя: шлюз
 // без этого метода отдал бы 404 на каждой записи памяти.
 var embedDefaults = map[string]string{
-	"openai": "text-embedding-3-small",
-	"local":  "nomic-embed-text",
+	"openai":     "text-embedding-3-small",
+	"openrouter": "openai/text-embedding-3-small",
+	"local":      "nomic-embed-text",
 }
 
 // resolveEmbedder: сначала явные EMBED_*, иначе берём уже настроенный
@@ -294,11 +295,11 @@ func resolveEmbedder(get func(string) string, providers []Provider) Embedder {
 	if base := get("EMBED_BASE_URL"); base != "" {
 		return Embedder{
 			BaseURL: strings.TrimRight(base, "/"),
-			APIKey:  firstNonEmpty(get("EMBED_API_KEY"), get("OPENAI_API_KEY"), get("LLM_API_KEY")),
+			APIKey:  firstNonEmpty(get("EMBED_API_KEY"), get("OPENAI_API_KEY"), get("OPENROUTER_API_KEY"), get("LLM_API_KEY")),
 			Model:   firstNonEmpty(get("EMBED_MODEL"), "text-embedding-3-small"),
 		}
 	}
-	for _, want := range []string{"openai", "local"} {
+	for _, want := range []string{"openai", "openrouter", "local"} {
 		for _, p := range providers {
 			if p.Name != want || p.Kind != "openai" {
 				continue
