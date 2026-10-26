@@ -2,10 +2,21 @@ name: build
 
 # Настоящая проверка Windows-сборки: C++/WinRT, UI Automation и GUI
 # существуют только под Windows, поэтому linux-джоб проверяет лишь логику ядра.
+# Раньше тут стояло `push: branches: ["**"]` вместе с `pull_request`:
+# каждый пуш в ветку с PR считался дважды, а windows-минуты у GitHub идут
+# с коэффициентом 2. Поэтому пуши проверяем только на main, ветки — через PR.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
+
+# Новый пуш в ту же ветку отменяет предыдущий прогон: доделывать сборку
+# устаревшего коммита смысла нет, а минуты она тратит.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   windows:
@@ -16,6 +27,11 @@ jobs:
         with:
           go-version: "1.25"
       - uses: dtolnay/rust-toolchain@stable
+      # Кэш зависимостей и собранного Z3: без него каждый прогон собирал
+      # солвер с нуля (это и есть основная часть сорока минут).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
       # bindgen внутри z3-sys читает заголовки через libclang. На windows-latest
       # его нет, а Z3 теперь собирается внутрь ядра, а не пропускается фичей.
       - name: LLVM для bindgen
@@ -91,6 +107,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
