@@ -111,11 +111,18 @@ pub fn setup() -> Setup {
     };
     let url = env("ENDOSCOPE_URL");
     match (url.clone(), env("ENDOSCOPE_RUN_ID")) {
+        (None, None) if env("ENDOSCOPE_REQUIRED").is_some() => Setup::Broken(
+            "ENDOSCOPE_REQUIRED задан, а прогона нет: запуск мимо ловушки задачу не закрывает"
+                .to_string(),
+        ),
         (None, None) => Setup::Off,
-        (_, Some(run_id)) => Setup::Ready(Endoscope::new(
-            url.unwrap_or_else(|| DEFAULT_URL.to_string()),
-            run_id,
-        )),
+        (_, Some(run_id)) => {
+            let base = url.unwrap_or_else(|| DEFAULT_URL.to_string());
+            if let Some(why) = insecure_hop(&base) {
+                return Setup::Broken(why);
+            }
+            Setup::Ready(Endoscope::new(base, run_id))
+        }
         (Some(_), None) => Setup::Broken(
             "в окружении нет ENDOSCOPE_RUN_ID — агента надо запускать под прогоном эндоскопа"
                 .to_string(),
@@ -130,6 +137,34 @@ pub fn judge_report(report: &str) -> Verdict {
         Setup::Broken(why) => Verdict::Unavailable(why),
         Setup::Ready(e) => e.judge(report),
     }
+}
+
+/// Приговор по открытому HTTP подделывается кем угодно по пути: достаточно
+/// ответить «готово», и шлагбаум поднимется. Для локальной ловушки это не
+/// важно (трафик не выходит из машины), для удалённого эндоскопа — важно.
+fn insecure_hop(base: &str) -> Option<String> {
+    let rest = base.strip_prefix("http://")?;
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    let local = host == "localhost"
+        || host == "::1"
+        || host == "[::1]"
+        || host.starts_with("127.")
+        || host.is_empty();
+    if local {
+        return None;
+    }
+    Some(format!(
+        "эндоскоп на {host} доступен только по http: приговор по открытому каналу можно подделать, укажи https"
+    ))
 }
 
 impl Endoscope {
@@ -324,6 +359,39 @@ mod tests {
         match broken {
             Setup::Broken(why) => assert!(why.contains("ENDOSCOPE_RUN_ID"), "{why}"),
             _ => panic!("адрес без прогона должен закрывать шлагбаум"),
+        }
+    }
+
+    /// Удалённый эндоскоп по открытому каналу не считается проверкой:
+    /// «готово» на этом пути подделывает любой посредник.
+    #[test]
+    fn remote_plaintext_is_not_a_checker() {
+        assert!(insecure_hop("http://127.0.0.1:7098").is_none());
+        assert!(insecure_hop("http://localhost:7098").is_none());
+        assert!(insecure_hop("https://endo.example:7098").is_none());
+        let why = insecure_hop("http://100.115.202.74:7098").expect("чужой хост по http");
+        assert!(why.contains("https"), "{why}");
+
+        std::env::set_var("ENDOSCOPE_URL", "http://100.115.202.74:7098");
+        std::env::set_var("ENDOSCOPE_RUN_ID", "run-9");
+        let got = setup();
+        std::env::remove_var("ENDOSCOPE_URL");
+        std::env::remove_var("ENDOSCOPE_RUN_ID");
+        assert!(matches!(got, Setup::Broken(_)), "шлагбаум должен закрыться");
+    }
+
+    /// Запуск мимо ловушки закрывает задачи своими правилами — так и задумано,
+    /// но на машине, где проверка обязательна, это включается одним ключом.
+    #[test]
+    fn required_flag_blocks_untraced_runs() {
+        std::env::remove_var("ENDOSCOPE_URL");
+        std::env::remove_var("ENDOSCOPE_RUN_ID");
+        std::env::set_var("ENDOSCOPE_REQUIRED", "1");
+        let got = setup();
+        std::env::remove_var("ENDOSCOPE_REQUIRED");
+        match got {
+            Setup::Broken(why) => assert!(why.contains("мимо ловушки"), "{why}"),
+            _ => panic!("с ENDOSCOPE_REQUIRED запуск без прогона не закрывает задачу"),
         }
     }
 
