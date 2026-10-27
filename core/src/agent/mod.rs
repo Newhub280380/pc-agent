@@ -1194,8 +1194,7 @@ impl Agent {
                                 n.state,
                                 crate::agent::graph::NodeState::Pending
                                     | crate::agent::graph::NodeState::Running
-                            )
-                                && !n.done_when.trim().is_empty()
+                            ) && !n.done_when.trim().is_empty()
                         })
                         .map(|n| (n.id.clone(), n.done_when.clone()))
                         .collect();
@@ -1206,7 +1205,9 @@ impl Agent {
                         let (met, why) = if seen {
                             (
                                 true,
-                                format!("критерий «{done_when}» был виден на экране в этом прогоне"),
+                                format!(
+                                    "критерий «{done_when}» был виден на экране в этом прогоне"
+                                ),
                             )
                         } else {
                             self.criterion_on_screen(phone_mode, &done_when)
