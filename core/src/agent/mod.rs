@@ -1180,6 +1180,47 @@ impl Agent {
                 Ok(Outcome::Finished(report)) => {
                     // Отчёт не является сертификатом. Если решение уже доказано,
                     // наружу уходит отчёт по узлам, а не текст модели.
+                    //
+                    // Сначала закрываем узлы, чей критерий виден (сейчас или
+                    // раньше в этом прогоне): на живом прогоне агент делал всё
+                    // дело и писал finish, не отчитавшись по промежуточному
+                    // узлу — узел висел открытым, finish отклонялся, и прогон
+                    // упирался в лимит шагов при фактически сделанной работе.
+                    let open: Vec<(String, String)> = graph
+                        .nodes
+                        .iter()
+                        .filter(|n| {
+                            matches!(
+                                n.state,
+                                crate::agent::graph::NodeState::Pending
+                                    | crate::agent::graph::NodeState::Running
+                            )
+                                && !n.done_when.trim().is_empty()
+                        })
+                        .map(|n| (n.id.clone(), n.done_when.clone()))
+                        .collect();
+                    for (id, done_when) in open {
+                        let seen = seen_screens
+                            .iter()
+                            .any(|ev| verify::criterion_observed(&done_when, ev));
+                        let (met, why) = if seen {
+                            (
+                                true,
+                                format!("критерий «{done_when}» был виден на экране в этом прогоне"),
+                            )
+                        } else {
+                            self.criterion_on_screen(phone_mode, &done_when)
+                        };
+                        if met
+                            && crate::logic::allow_node_done(&graph, &id, true)
+                                == crate::logic::Verdict::Ok
+                        {
+                            self.log(format!("Узел {id} закрыт по экрану при finish: {why}"));
+                            graph.mark_done(&id, &why);
+                            observed.insert(id.clone(), true);
+                            self.send_plan(&graph);
+                        }
+                    }
                     match crate::logic::check_solution(&graph, &observed) {
                         crate::logic::Verdict::Ok => {
                             self.log(
