@@ -541,6 +541,11 @@ impl Agent {
         let mut need_replan = false;
         let mut pending_lesson: Option<String> = None;
         let mut phone_mode = looks_like_phone_task(task);
+        // Что экран уже показывал. Критерий вида «открыта страница входа»
+        // верен в момент, когда его видели: на живом прогоне агент
+        // регистрировался, уходил на главную — и узел «страница входа»
+        // уже нельзя было закрыть, задача крутилась до лимита.
+        let mut seen_screens: Vec<Evidence> = vec![];
         // Экран на старте отката: закрываем откат только если он изменился.
         let mut rollback_origin: HashMap<String, Evidence> = HashMap::new();
         if phone_mode {
@@ -660,8 +665,17 @@ impl Agent {
                         &format!("Нужен телефон по ADB: {e}\nПодключи кабелем, разреши отладку и напиши «готово» (или «пк», чтобы работать на компьютере)"),
                         false,
                     );
-                    if ans.to_lowercase().contains("пк") {
+                    if ans.to_lowercase().contains("пк")
+                        || self.no_human.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        // Подключить кабель некому: вечный вопрос в пустоту
+                        // съедал весь прогон. Работаем на компьютере.
+                        self.log("Телефон подключить некому — работаю на компьютере");
                         phone_mode = false;
+                        failures.push(
+                            "телефона нет и подключить его некому: решай задачу на компьютере, действия adb_* не работают"
+                                .into(),
+                        );
                     }
                     continue;
                 }
@@ -674,6 +688,10 @@ impl Agent {
             let ctx = view.ctx.clone();
             let shelf = Memory::shelf_for(&ctx);
             let ev_before = Evidence::from_prompt(&view.prompt);
+            if seen_screens.len() >= 80 {
+                seen_screens.remove(0);
+            }
+            seen_screens.push(ev_before.clone());
             if let Work::Rollback { id, .. } = &work {
                 rollback_origin
                     .entry(id.clone())
@@ -1107,7 +1125,18 @@ impl Agent {
                             // Слова subtask_done не закрывают узел. Сначала
                             // свежий экран, потом Z3: критерий наблюдён и
                             // зависимости уже выполнены.
-                            let (met, why) = self.criterion_on_screen(phone_mode, done_when);
+                            let (mut met, mut why) =
+                                self.criterion_on_screen(phone_mode, done_when);
+                            if !met
+                                && seen_screens
+                                    .iter()
+                                    .any(|ev| verify::criterion_observed(done_when, ev))
+                            {
+                                met = true;
+                                why = format!(
+                                    "критерий «{done_when}» был виден на экране раньше в этом прогоне"
+                                );
+                            }
                             let verdict = crate::logic::allow_node_done(&graph, id, met);
                             let ok = verdict == crate::logic::Verdict::Ok;
                             if ok {
