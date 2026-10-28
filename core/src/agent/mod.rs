@@ -635,9 +635,9 @@ impl Agent {
                                 }
                             }
                         }
-                        return Ok(
-                            self.close_if_proven(&graph, &trace, &observed, &criteria, phone_mode)
-                        );
+                        return Ok(self.close_if_proven(
+                            task, &graph, &trace, &observed, &criteria, phone_mode,
+                        ));
                     }
                 },
             };
@@ -1227,8 +1227,9 @@ impl Agent {
                             self.log(
                                 "Задача закрыта: Z3 подтвердил решение, текст finish не использован как доказательство",
                             );
-                            let proven = self
-                                .close_if_proven(&graph, &trace, &observed, &criteria, phone_mode);
+                            let proven = self.close_if_proven(
+                                task, &graph, &trace, &observed, &criteria, phone_mode,
+                            );
                             let m = self.mem_lock();
                             let note = crate::text::truncate(&proven.text, 400);
                             m.remember(
@@ -1461,6 +1462,7 @@ impl Agent {
 
     fn close_if_proven(
         &self,
+        task: &str,
         graph: &TaskGraph,
         trace: &Trace,
         observed: &HashMap<String, bool>,
@@ -1508,7 +1510,11 @@ impl Agent {
         // ядро проверяет само, то есть своими же словами; эндоскоп сверяет
         // отчёт со своей записью прогона, на которую агент не влияет.
         let report = self.finish_report(graph, trace);
-        let verdict = crate::endoscope::judge_report(&report);
+        // Эндоскопу уходит не тот же текст, что человеку: в trace живут только
+        // последние десять шагов, и на длинной задаче ранние заявления просто
+        // не доезжали до сверки — проверять было нечего, а статус выглядел
+        // нормальным. Поэтому для проверки собираем все заявления по узлам.
+        let verdict = crate::endoscope::judge_report(&self.claims_report(task, graph, trace));
         if verdict.closes() {
             TaskReport::closed(report)
         } else {
@@ -1902,6 +1908,37 @@ impl Agent {
                 s.push_str(&format!("- {}: {}\n", n.goal, n.note));
             }
         }
+        s.push_str(&trace.render());
+        s
+    }
+
+    /// Отчёт для независимой проверки: цель задачи и все заявления по узлам
+    /// (что считалось сделанным, по какому критерию и чем подтверждено), а не
+    /// только хвост трассы. Эндоскоп сверяет каждое заявление со своей
+    /// записью, поэтому потерянное заявление = непроверенное заявление.
+    fn claims_report(&self, task: &str, graph: &TaskGraph, trace: &Trace) -> String {
+        let (done, total) = graph.progress();
+        let mut s = format!("ЗАДАЧА: {task}\nЗакрыто {done}/{total} узлов графа.\nЗАЯВЛЕНИЯ:\n");
+        for n in graph.nodes.iter().take(80) {
+            let mark = match n.state {
+                graph::NodeState::Done => "сделано",
+                graph::NodeState::Failed => "не вышло",
+                graph::NodeState::Skipped => "пропущено",
+                graph::NodeState::RolledBack => "откатано",
+                graph::NodeState::Pending | graph::NodeState::Running => "не делалось",
+            };
+            s.push_str(&format!(
+                "- [{mark}] {} | критерий: {} | подтверждение: {}\n",
+                crate::text::truncate(&n.goal, 160),
+                crate::text::truncate(&n.done_when, 160),
+                crate::text::truncate(&n.note, 240),
+            ));
+        }
+        s.push_str(&format!(
+            "Шагов в памяти: {}, из них подтверждённых: {}.\n",
+            trace.len(),
+            trace.verified_count()
+        ));
         s.push_str(&trace.render());
         s
     }
