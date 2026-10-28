@@ -43,48 +43,65 @@ pub fn mask_secrets(s: &str) -> String {
         }
         true
     }
+    const QUOTES: [char; 3] = ['"', '\'', '`'];
     let mut out = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         // Значение после ключа: password": "hunter2" → заглушка.
-        let key = KEYS.iter().find(|k| key_at(&chars, i, k));
-        if let Some(key) = key {
+        if let Some(key) = KEYS.iter().find(|k| key_at(&chars, i, k)) {
             let len = key.chars().count();
-            out.extend(&chars[i..i + len]);
-            i += len;
-            let mut j = i;
-            let mut quote = None;
-            while j < chars.len() && (chars[j].is_whitespace() || "\":='`".contains(chars[j])) {
-                if "\"'`".contains(chars[j]) {
-                    quote = Some(chars[j]);
-                }
-                out.push(chars[j]);
+            let mut j = i + len;
+            // Кавычка, закрывающая имя поля, и пробелы до разделителя.
+            if chars.get(j).is_some_and(|c| QUOTES.contains(c)) {
                 j += 1;
             }
-            if j > i && j < chars.len() && Some(chars[j]) != quote {
-                // В кавычках секрет может быть из нескольких слов — затираем
-                // всё до закрывающей кавычки, а не первое слово.
-                match quote {
-                    Some(q) if !chars[j].is_whitespace() => {
-                        while j < chars.len() && chars[j] != q {
-                            j += 1;
-                        }
-                        out.push_str("***");
-                    }
-                    None if !chars[j].is_whitespace() => {
-                        while j < chars.len()
-                            && !chars[j].is_whitespace()
-                            && !"\",'}`".contains(chars[j])
-                        {
-                            j += 1;
-                        }
-                        out.push_str("***");
-                    }
-                    _ => {}
-                }
+            while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+                j += 1;
             }
-            i = j;
+            let has_value = chars.get(j).is_some_and(|c| *c == ':' || *c == '=');
+            if has_value {
+                j += 1;
+                while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+                    j += 1;
+                }
+                // Всё до начала значения — имя поля и разделитель, его видно.
+                out.extend(&chars[i..j]);
+                match chars.get(j) {
+                    // Значение в кавычках: внутри может быть и пробел,
+                    // и экранированная кавычка — затираем до закрывающей.
+                    Some(q) if QUOTES.contains(q) => {
+                        let q = *q;
+                        out.push(q);
+                        let mut m = j + 1;
+                        while m < chars.len() && chars[m] != q {
+                            m += if chars[m] == '\\' { 2 } else { 1 };
+                        }
+                        if m > j + 1 {
+                            out.push_str("***");
+                        }
+                        i = m.min(chars.len());
+                    }
+                    // Голое значение: до пробела, запятой или кавычки
+                    // следующего поля, иначе затрём разделители в журнале.
+                    Some(_) => {
+                        let mut m = j;
+                        while chars.get(m).is_some_and(|c| {
+                            !c.is_whitespace() && !",;}]".contains(*c) && !QUOTES.contains(c)
+                        }) {
+                            m += 1;
+                        }
+                        if m > j {
+                            out.push_str("***");
+                        }
+                        i = m;
+                    }
+                    None => i = j,
+                }
+                continue;
+            }
+            out.extend(&chars[i..i + len]);
+            i += len;
             continue;
         }
         // Длинная цифровая последовательность — это код или номер.
@@ -135,6 +152,16 @@ mod tests {
     #[test]
     fn odd_case_does_not_panic_and_multiword_value_is_masked() {
         assert_eq!(mask_secrets("İcode"), "İcode");
+        // Голое значение не должно съедать границу следующего поля.
+        let bare = mask_secrets("{\"password\": hunter2, \"next\": \"click\"}");
+        assert!(!bare.contains("hunter2"), "{bare}");
+        assert!(bare.contains(", \"next\""), "{bare}");
+        // Экранированная кавычка внутри значения не открывает хвост пароля.
+        let esc = mask_secrets("{\"password\":\"first\\\"secret suffix\"}");
+        assert!(!esc.contains("suffix"), "{esc}");
+        // Значение с пробелом в начале тоже затирается.
+        let lead = mask_secrets("{\"password\": \"  topsecret\"}");
+        assert!(!lead.contains("topsecret"), "{lead}");
         let m = mask_secrets("{\"password\": \"correct horse battery staple\"}");
         assert!(!m.contains("horse"), "{m}");
         assert!(!m.contains("staple"), "{m}");
