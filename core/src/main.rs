@@ -124,32 +124,7 @@ fn main() -> Result<()> {
     let llm = llm::LlmClient::new(&settings.router_url, &settings.router_token);
     let mem = Arc::new(Mutex::new(memory::Memory::open(&paths.memory_db)?));
     let mut adb = android::Adb::new(settings.adb_path.clone());
-    // Телефон подключаем на старте, а не в середине задачи: если он не
-    // отвечает, человек узнает об этом сразу, а не на 20-м шаге.
-    if let Some(ip) = settings.adb_wifi.as_deref() {
-        match adb.connect_wifi(ip.split(':').next().unwrap_or(ip)) {
-            Ok(()) => log::info!("телефон подключён по Wi-Fi: {ip}"),
-            Err(e) => log::warn!("ADB по Wi-Fi не поднялся: {e}"),
-        }
-    } else if adb.available() {
-        match adb.devices() {
-            Ok(list) if !list.is_empty() => {
-                // При нескольких телефонах adb требует -s, иначе любая команда
-                // падает с "more than one device". Берём первый и пишем в лог,
-                // какой именно, чтобы человек мог задать ADB_SERIAL явно.
-                if let Some(serial) = settings
-                    .adb_serial
-                    .as_deref()
-                    .or(list.first().map(|s| s.as_str()))
-                {
-                    adb.select(serial);
-                }
-                log::info!("ADB-устройства: {list:?}");
-            }
-            Ok(_) => log::info!("ADB есть, но телефон не подключён"),
-            Err(e) => log::warn!("ADB: {e}"),
-        }
-    }
+    connect_phone(&mut adb, &settings);
 
     let (ev_tx, ev_rx) = channel::<AgentEvent>();
     let (cmd_tx, cmd_rx) = channel::<AgentCommand>();
@@ -315,6 +290,35 @@ fn run_gui(app: gui::AppState) -> Result<()> {
     anyhow::bail!("GUI: {why}")
 }
 
+/// Подключение телефона на старте, а не в середине задачи: если он не
+/// отвечает, человек узнает об этом сразу, а не на 20-м шаге.
+fn connect_phone(adb: &mut android::Adb, settings: &config::Settings) {
+    if let Some(ip) = settings.adb_wifi.as_deref() {
+        match adb.connect_wifi(ip.split(':').next().unwrap_or(ip)) {
+            Ok(()) => log::info!("телефон подключён по Wi-Fi: {ip}"),
+            Err(e) => log::warn!("ADB по Wi-Fi не поднялся: {e}"),
+        }
+    } else if adb.available() {
+        match adb.devices() {
+            Ok(list) if !list.is_empty() => {
+                // При нескольких телефонах adb требует -s, иначе любая команда
+                // падает с "more than one device". Берём первый и пишем в лог,
+                // какой именно, чтобы человек мог задать ADB_SERIAL явно.
+                if let Some(serial) = settings
+                    .adb_serial
+                    .as_deref()
+                    .or(list.first().map(|s| s.as_str()))
+                {
+                    adb.select(serial);
+                }
+                log::info!("ADB-устройства: {list:?}");
+            }
+            Ok(_) => log::info!("ADB есть, но телефон не подключён"),
+            Err(e) => log::warn!("ADB: {e}"),
+        }
+    }
+}
+
 /// Один прогон без окна. Печатает отчёт в stdout и выходит с кодом 1, если
 /// задача не закрыта: иначе «готово» нельзя отличить от падения в скриптах.
 fn headless(task: &str) -> Result<()> {
@@ -337,7 +341,10 @@ fn headless(task: &str) -> Result<()> {
 
     let llm = llm::LlmClient::new(&settings.router_url, &settings.router_token);
     let mem = Arc::new(Mutex::new(memory::Memory::open(&paths.memory_db)?));
-    let adb = android::Adb::new(settings.adb_path.clone());
+    let mut adb = android::Adb::new(settings.adb_path.clone());
+    // Телефон подключаем и здесь: иначе прогон из скрипта видел «устройства
+    // нет» при настроенном adb_wifi и уходил решать задачу на компьютере.
+    connect_phone(&mut adb, &settings);
     let (ev_tx, ev_rx) = channel::<AgentEvent>();
     let (cmd_tx, cmd_rx) = channel::<AgentCommand>();
     let stop = Arc::new(AtomicBool::new(false));
