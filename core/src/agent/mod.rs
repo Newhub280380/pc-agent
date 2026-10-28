@@ -147,6 +147,10 @@ const MAX_ROLLBACK_STEPS: u32 = 8;
 /// а задача упирается в лимит шагов, ничего не сделав. После лимита шаг идёт,
 /// а запрет остаётся в подсказках модели.
 const MAX_JEV_VETOES: u32 = 1;
+/// Сколько вопросов человеку терпим, когда отвечать некому. Третий такой
+/// вопрос означает, что без человека задача не закрывается: дальше шаги
+/// тратятся впустую до лимита.
+const MAX_ASKS_NO_HUMAN: u32 = 2;
 
 const ACT_SYSTEM: &str = r#"Ты — автономный агент, управляющий компьютером Windows и телефоном Android как живой человек.
 Ты работаешь строго по циклу ReAct: Thought → Action → Observation. За один ответ — РОВНО ОДНО действие, не забегая вперёд.
@@ -536,6 +540,7 @@ impl Agent {
         // «нет» на всё (так живой прогон встал: ни одного действия за 120
         // шагов), поэтому запрет ограничен — советчик, а не стоп-кран.
         let mut jev_vetoes: u32 = 0;
+        let mut asks_no_human: u32 = 0;
         let mut rollback_queue: Vec<(String, String)> = vec![];
         let mut rollback_steps: u32 = 0;
         let mut need_replan = false;
@@ -811,7 +816,10 @@ impl Agent {
                     Err(e) => {
                         // Без куска ответа такой отказ нечем лечить: в
                         // живом прогоне он повторялся сотнями строк.
-                        let raw: String = resp.text.chars().take(300).collect();
+                        let raw: String = crate::text::mask_secrets(&resp.text)
+                            .chars()
+                            .take(300)
+                            .collect();
                         self.log(format!(
                             "Модель вернула не то ({e}), переспрашиваю. Ответ: {raw}"
                         ));
@@ -902,6 +910,33 @@ impl Agent {
                 Action::AskUser { .. } | Action::NeedTool { .. }
             );
             let no_human = self.no_human.load(std::sync::atomic::Ordering::Relaxed);
+            // Канал вопросов закрыт: заданный вопрос вернётся заготовкой
+            // «решай сам», и модель может спрашивать снова и снова. Пара
+            // попыток — подсказка, дальше задача честно не закрыта.
+            if no_human && asks_human {
+                asks_no_human += 1;
+                let what = decision.question.trim();
+                let what = if what.is_empty() {
+                    human_readable(&decision.next)
+                } else {
+                    what.to_string()
+                };
+                if asks_no_human > MAX_ASKS_NO_HUMAN {
+                    self.log(format!(
+                        "Агент снова просит человека ({what}), а ответить некому — задача не закрыта"
+                    ));
+                    return Ok(TaskReport::open(format!(
+                        "Нужен человек, а отвечать некому: {what}. {}",
+                        self.finish_report(&graph, &trace)
+                    )));
+                }
+                self.log(format!("Спросить некого ({what}) — работаю по экрану"));
+                failures.push(
+                    "ответить на вопрос некому: сделай шаг сам по тому, что видно на экране, или заверши задачу"
+                        .into(),
+                );
+                continue;
+            }
             if let Gate::Clarify(q) = react::confidence_gate(
                 decision.confidence,
                 asks_human,
@@ -971,11 +1006,13 @@ impl Agent {
                 // опасен не сам запуск, а аргументы (powershell -enc ...),
                 // которые модель может взять со страницы. Иначе прогон
                 // встаёт навсегда: «подтверди» → некому → «отменено».
+                // Список известных программ, а не «любой путь без аргументов»:
+                // иначе агент запустит скачанный со страницы exe сам и без
+                // спроса.
                 let safe_launch = matches!(
                     &decision.next,
                     Action::LaunchApp { args, path }
-                        if args.trim().is_empty()
-                            && !path.contains(['&', '|', ';', '>', '`'])
+                        if args.trim().is_empty() && is_known_app(path)
                 );
                 if no_human && safe_launch {
                     self.log("Подтверждать некому, аргументов нет — запускаю сам");
@@ -1186,40 +1223,58 @@ impl Agent {
                     // дело и писал finish, не отчитавшись по промежуточному
                     // узлу — узел висел открытым, finish отклонялся, и прогон
                     // упирался в лимит шагов при фактически сделанной работе.
-                    let open: Vec<(String, String)> = graph
-                        .nodes
-                        .iter()
-                        .filter(|n| {
-                            matches!(
-                                n.state,
-                                crate::agent::graph::NodeState::Pending
-                                    | crate::agent::graph::NodeState::Running
-                            ) && !n.done_when.trim().is_empty()
-                        })
-                        .map(|n| (n.id.clone(), n.done_when.clone()))
-                        .collect();
-                    for (id, done_when) in open {
-                        let seen = seen_screens
+                    // Проходов несколько: узел с зависимостью может стоять в
+                    // графе раньше своей предпосылки, и за один проход
+                    // allow_node_done отклонит его, а назад цикл не вернётся.
+                    let mut checked: HashMap<String, (bool, String)> = HashMap::new();
+                    loop {
+                        let open: Vec<(String, String)> = graph
+                            .nodes
                             .iter()
-                            .any(|ev| verify::criterion_observed(&done_when, ev));
-                        let (met, why) = if seen {
-                            (
-                                true,
-                                format!(
-                                    "критерий «{done_when}» был виден на экране в этом прогоне"
-                                ),
-                            )
-                        } else {
-                            self.criterion_on_screen(phone_mode, &done_when)
-                        };
-                        if met
-                            && crate::logic::allow_node_done(&graph, &id, true)
-                                == crate::logic::Verdict::Ok
-                        {
-                            self.log(format!("Узел {id} закрыт по экрану при finish: {why}"));
-                            graph.mark_done(&id, &why);
-                            observed.insert(id.clone(), true);
-                            self.send_plan(&graph);
+                            .filter(|n| {
+                                matches!(
+                                    n.state,
+                                    crate::agent::graph::NodeState::Pending
+                                        | crate::agent::graph::NodeState::Running
+                                ) && !n.done_when.trim().is_empty()
+                            })
+                            .map(|n| (n.id.clone(), n.done_when.clone()))
+                            .collect();
+                        let mut closed_any = false;
+                        for (id, done_when) in open {
+                            // Экран смотрим один раз на узел: он не меняется
+                            // от того, что мы закрыли соседний узел.
+                            let (met, why) = checked
+                                .entry(id.clone())
+                                .or_insert_with(|| {
+                                    let seen = seen_screens
+                                        .iter()
+                                        .any(|ev| verify::criterion_observed(&done_when, ev));
+                                    if seen {
+                                        (
+                                            true,
+                                            format!(
+                                                "критерий «{done_when}» был виден на экране в этом прогоне"
+                                            ),
+                                        )
+                                    } else {
+                                        self.criterion_on_screen(phone_mode, &done_when)
+                                    }
+                                })
+                                .clone();
+                            if met
+                                && crate::logic::allow_node_done(&graph, &id, true)
+                                    == crate::logic::Verdict::Ok
+                            {
+                                self.log(format!("Узел {id} закрыт по экрану при finish: {why}"));
+                                graph.mark_done(&id, &why);
+                                observed.insert(id.clone(), true);
+                                self.send_plan(&graph);
+                                closed_any = true;
+                            }
+                        }
+                        if !closed_any {
+                            break;
                         }
                     }
                     match crate::logic::check_solution(&graph, &observed) {
@@ -1978,6 +2033,38 @@ fn looks_like_phone_task(task: &str) -> bool {
     .any(|k| t.contains(k))
 }
 
+/// Можно ли запускать программу без подтверждения, когда человека нет.
+///
+/// Разрешены только известные программы по имени (браузер, проводник,
+/// редактор): скачанный со страницы установщик агент сам не запустит, даже
+/// если спросить разрешение некому.
+fn is_known_app(path: &str) -> bool {
+    const KNOWN: [&str; 14] = [
+        "firefox",
+        "chrome",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+        "msedge",
+        "explorer",
+        "nautilus",
+        "notepad",
+        "gedit",
+        "xdg-open",
+        "calc",
+        "mspaint",
+        "eog",
+    ];
+    let p = path.trim().to_lowercase();
+    // Путь к файлу на диске (загрузки, временные папки) не разрешаем:
+    // сверяем только короткое имя команды.
+    if p.is_empty() || p.contains(['/', '\\', '&', '|', ';', '>', '`', ' ']) {
+        return false;
+    }
+    let name = p.strip_suffix(".exe").unwrap_or(&p);
+    KNOWN.contains(&name)
+}
+
 fn human_readable(a: &Action) -> String {
     match a {
         Action::ClickElement { name, .. } => format!("клик по «{name}»"),
@@ -2076,6 +2163,18 @@ mod tests {
         assert!(looks_like_phone_task("Открой CapCut на телефоне"));
         assert!(looks_like_phone_task("зайди в тикток"));
         assert!(!looks_like_phone_task("настрой рекламу в Ads Manager"));
+    }
+
+    /// Без человека запуск программы разрешён только для известных имён:
+    /// скачанный со страницы установщик агент не должен запускать сам.
+    #[test]
+    fn only_known_apps_launch_without_a_human() {
+        assert!(is_known_app("firefox"));
+        assert!(is_known_app("Notepad.exe"));
+        assert!(!is_known_app("C:\\Users\\a\\Downloads\\setup.exe"));
+        assert!(!is_known_app("/tmp/payload"));
+        assert!(!is_known_app("powershell"));
+        assert!(!is_known_app(""));
     }
 
     /// Шаг может «пройти», но проверка его опровергнуть — и раньше такое
