@@ -63,13 +63,23 @@ fn trim_cause(line: &str) -> String {
 /// поэтому порядок по-прежнему можно доказать.
 pub fn replan_remaining(graph: &TaskGraph, cause: &Cause) -> Result<TaskGraph, String> {
     let mut g = graph.clone();
-    let had_failed = g.nodes.iter().any(|n| n.state == NodeState::Failed);
+    // Возвращаем в работу только те, кого ещё не возвращали слишком часто:
+    // иначе три отказа подряд обнуляли попытки, узел брался с тем же
+    // критерием и тем же способом, и так до лимита шагов.
+    let had_failed = g
+        .nodes
+        .iter()
+        .any(|n| n.state == NodeState::Failed && n.rounds < crate::agent::graph::MAX_NODE_ROUNDS);
     if had_failed {
         for n in &mut g.nodes {
-            if n.state == NodeState::Failed {
+            if n.state == NodeState::Failed && n.rounds < crate::agent::graph::MAX_NODE_ROUNDS {
                 n.state = NodeState::Pending;
                 n.attempts = 0;
-                n.note = format!("повтор после сбоя: {}", cause.summary);
+                n.rounds += 1;
+                n.note = format!(
+                    "повтор {} после сбоя: {} — прежний способ не сработал, попробуй другой",
+                    n.rounds, cause.summary
+                );
             }
         }
         for n in &mut g.nodes {
@@ -162,5 +172,63 @@ mod tests {
             logic::check_solution(&done, &observed),
             Verdict::Ok
         ));
+    }
+    #[test]
+    fn node_is_not_reopened_forever() {
+        let mut g = TaskGraph::linear(
+            "установить",
+            &[
+                ("скачать".into(), "файл в загрузках".into()),
+                ("установить".into(), "ярлык на столе".into()),
+            ],
+        );
+        g.validate().expect("исходный план");
+        let cause = Cause {
+            summary: "не подтверждено наблюдением".into(),
+        };
+        // Каждый круг: попытки кончились — переплан вернул узел в работу.
+        for round in 1..=crate::agent::graph::MAX_NODE_ROUNDS {
+            for _ in 0..crate::agent::graph::MAX_NODE_ATTEMPTS {
+                g.mark_attempt_failed("n1", "не подтверждено наблюдением");
+            }
+            g = replan_remaining(&g, &cause).expect("остаток плана");
+            assert_eq!(
+                g.nodes.iter().find(|n| n.id == "n1").unwrap().rounds,
+                round,
+                "круг должен считаться"
+            );
+        }
+        // Круги исчерпаны: узел остаётся провалившимся, а не идёт по новой.
+        for _ in 0..crate::agent::graph::MAX_NODE_ATTEMPTS {
+            g.mark_attempt_failed("n1", "не подтверждено наблюдением");
+        }
+        let after = replan_remaining(&g, &cause).expect("остаток плана");
+        assert_eq!(
+            after.nodes.iter().find(|n| n.id == "n1").unwrap().state,
+            NodeState::Failed,
+            "бесконечный повтор того же способа запрещён"
+        );
+        assert!(after
+            .nodes
+            .iter()
+            .any(|n| n.id == "n2"
+                && (n.state == NodeState::Skipped || n.state == NodeState::Pending)));
+    }
+
+    #[test]
+    fn replan_note_tells_model_to_change_approach() {
+        let mut g = TaskGraph::linear("дело", &[("шаг".into(), "видно окно".into())]);
+        for _ in 0..crate::agent::graph::MAX_NODE_ATTEMPTS {
+            g.mark_attempt_failed("n1", "не подтверждено наблюдением");
+        }
+        let next = replan_remaining(
+            &g,
+            &Cause {
+                summary: "не подтверждено наблюдением".into(),
+            },
+        )
+        .expect("остаток");
+        let note = &next.nodes.iter().find(|n| n.id == "n1").unwrap().note;
+        assert!(note.contains("другой"), "{note}");
     }
 }

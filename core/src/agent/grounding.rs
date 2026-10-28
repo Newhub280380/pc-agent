@@ -39,17 +39,29 @@ impl Evidence {
     /// структурам — иначе проверка «знает больше» модели и врёт в её пользу.
     pub fn from_prompt(prompt: &str) -> Self {
         let mut ev = Evidence::default();
+        // Строку «- a | b» нельзя считать элементом по одному наличию «|»:
+        // в OCR палка встречается сплошь (шапка Hacker News «new | past |
+        // comments»), и тогда дерево выглядело непустым там, где его нет.
+        // Поэтому идём по заголовкам разделов промпта.
+        let mut in_elements = false;
         for raw in prompt.lines() {
             let line = raw.trim();
+            if line.starts_with("ЭЛЕМЕНТЫ") {
+                in_elements = true;
+                continue;
+            }
+            if line.starts_with("ТЕКСТ НА ЭКРАНЕ") || line.starts_with("ЭКРАН ") {
+                in_elements = false;
+            }
             if let Some(rest) = line.strip_prefix("- ") {
                 match rest.split_once('|') {
-                    Some((name, tail)) => {
+                    Some((name, tail)) if in_elements => {
                         ev.elements.push(name.trim().to_lowercase());
                         // Хвост тоже сохраняем: там тип элемента и координаты,
                         // на них модель иногда ссылается.
                         ev.texts.push(tail.trim().to_lowercase());
                     }
-                    None => ev.texts.push(rest.trim().to_lowercase()),
+                    _ => ev.texts.push(rest.trim().to_lowercase()),
                 }
                 continue;
             }
@@ -230,6 +242,22 @@ fn quoted(text: &str) -> Vec<String> {
 ///
 /// `task` — формулировка пользователя: то, что он сам назвал, агент не выдумал.
 /// `check_fs` — разрешено ли трогать диск (в тестах и на чужой машине не нужно).
+/// Хост и путь без схемы, «www.», параметров и хвостового слэша.
+fn url_core(u: &str) -> String {
+    let low = u.trim().to_lowercase();
+    let no_scheme = low
+        .strip_prefix("https://")
+        .or_else(|| low.strip_prefix("http://"))
+        .unwrap_or(&low);
+    let no_www = no_scheme.strip_prefix("www.").unwrap_or(no_scheme);
+    let cut = no_www
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(no_www)
+        .trim_end_matches('/');
+    cut.to_string()
+}
+
 pub fn check_claims(text: &str, ev: &Evidence, task: &str, check_fs: bool) -> Vec<Violation> {
     let task_low = task.to_lowercase();
     let mut out = Vec::new();
@@ -255,14 +283,38 @@ pub fn check_claims(text: &str, ev: &Evidence, task: &str, check_fs: bool) -> Ve
                     claim,
                 });
             }
-            ClaimKind::Url => out.push(Violation {
-                why: "ссылка не встречается ни в задаче, ни на экране".into(),
-                claim,
-            }),
-            ClaimKind::Element => out.push(Violation {
-                why: "такого элемента нет в UI-дереве и в тексте экрана".into(),
-                claim,
-            }),
+            ClaimKind::Url => {
+                // Адрес сравниваем по сути, а не по буквам: браузер сам
+                // дописывает «?goto=news», OCR теряет «https://», и верный
+                // переход выглядел выдумкой. Хост+путь должны найтись.
+                let core = url_core(&claim.value);
+                // «https://» без хоста — не заявление, а обрывок текста
+                // модели. Ругаться на него значит ронять верный шаг.
+                if !core.contains('.') {
+                    continue;
+                }
+                if task_low.contains(&core) || ev.mentions(&core) {
+                    continue;
+                }
+                out.push(Violation {
+                    why: "ссылка не встречается ни в задаче, ни на экране".into(),
+                    claim,
+                })
+            }
+            ClaimKind::Element => {
+                // Пустое UI-дерево — это не доказательство отсутствия элемента.
+                // На Linux у Chrome дерева нет вообще, а OCR мелкую ссылку
+                // («login» в углу HN) не читает: так живой прогон вставал на
+                // единственном верном шаге. Прицел по такому элементу делает
+                // зрение, а результат всё равно проверит self-verify.
+                if ev.elements.is_empty() {
+                    continue;
+                }
+                out.push(Violation {
+                    why: "такого элемента нет в UI-дереве и в тексте экрана".into(),
+                    claim,
+                })
+            }
         }
     }
     out
@@ -408,5 +460,70 @@ mod tests {
         let _ = check_claims("нажимаю «неполная кавычка", &ev, "", false);
         let _ = extract_claims("\"\"\"'''«»«");
         let _ = extract_claims(&"«".repeat(5000));
+    }
+
+    #[test]
+    fn element_claim_is_allowed_when_there_is_no_ui_tree() {
+        // Chrome на Linux не отдаёт дерево, OCR мелкую ссылку не видит.
+        let ev = Evidence {
+            window_title: "hacker news".into(),
+            elements: vec![],
+            texts: vec!["hacker news".into(), "new | past | comments".into()],
+        };
+        let v = check_claims("нажимаю «login»", &ev, "создай аккаунт", false);
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn element_claim_is_still_checked_when_tree_exists() {
+        let ev = Evidence {
+            window_title: "окно".into(),
+            elements: vec!["файл".into(), "правка".into()],
+            texts: vec![],
+        };
+        let v = check_claims("нажимаю «login»", &ev, "создай аккаунт", false);
+        assert_eq!(v.len(), 1, "{v:?}");
+    }
+
+    #[test]
+    fn ocr_pipes_are_not_a_ui_tree() {
+        let ev = Evidence::from_prompt(
+            "ЭКРАН 1920x1080. Активное окно: \"Hacker News\"\nТЕКСТ НА ЭКРАНЕ (OCR):\n- new | past | comments | ask\n",
+        );
+        assert!(ev.elements.is_empty(), "{:?}", ev.elements);
+    }
+
+    #[test]
+    fn url_claim_ignores_query_and_scheme() {
+        let ev = Evidence::default();
+        let v = check_claims(
+            "перехожу на https://news.ycombinator.com/login?goto=news",
+            &ev,
+            "зайди на страницу https://news.ycombinator.com/login",
+            false,
+        );
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn foreign_url_is_still_a_violation() {
+        let v = check_claims(
+            "перехожу на https://example.com/pay",
+            &Evidence::default(),
+            "зайди на страницу https://news.ycombinator.com/login",
+            false,
+        );
+        assert_eq!(v.len(), 1, "{v:?}");
+    }
+
+    #[test]
+    fn bare_scheme_is_not_a_claim() {
+        let v = check_claims(
+            "открываю https://",
+            &Evidence::default(),
+            "зайди на сайт",
+            false,
+        );
+        assert!(v.is_empty(), "{v:?}");
     }
 }

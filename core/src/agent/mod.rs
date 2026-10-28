@@ -142,6 +142,12 @@ impl Default for AgentConfig {
 /// бесконечно ковырять его хуже, чем честно сказать «откатить не смог».
 const MAX_ROLLBACK_STEPS: u32 = 8;
 
+/// Сколько запретов JEV подряд терпим. Фильтр вероятностный: он бывает не прав
+/// и при этом отвечает «нет» на любое действие — тогда шаг не делается никогда,
+/// а задача упирается в лимит шагов, ничего не сделав. После лимита шаг идёт,
+/// а запрет остаётся в подсказках модели.
+const MAX_JEV_VETOES: u32 = 1;
+
 const ACT_SYSTEM: &str = r#"Ты — автономный агент, управляющий компьютером Windows и телефоном Android как живой человек.
 Ты работаешь строго по циклу ReAct: Thought → Action → Observation. За один ответ — РОВНО ОДНО действие, не забегая вперёд.
 
@@ -149,8 +155,8 @@ const ACT_SYSTEM: &str = r#"Ты — автономный агент, управ
 1. Сначала ответь себе: чего хочет пользователь, какие есть риски, какие шаги нужны и почему именно этот шаг сейчас.
 2. Опирайся на «ПОСЛЕДНИЕ ШАГИ»: там твои прошлые Thought/Action/Observation. Не повторяй то, что уже не сработало.
 3. observation заполняй ТОЛЬКО тем, что реально есть в описании экрана. Запрещено придумывать пути к файлам, имена кнопок, ссылки и вывод команд. Если чего-то нет — так и напиши «этого на экране нет».
-4. confidence — честная оценка 0..1. Если ниже 0.8, НЕ действуй: верни action ask_user (или заполни поле question) и спроси у человека то, что мешает быть уверенным.
-5. Предпочитай click_element (по имени элемента) вместо click_xy — это надёжнее.
+4. confidence — честная оценка 0..1. Если ниже 0.8, НЕ действуй: верни action ask_user (или заполни поле question) и спроси у человека то, что мешает быть уверенным. Если человек уже ответил, что его рядом нет, больше не спрашивай — действуй сам.
+5. Предпочитай click_element (по имени элемента) вместо click_xy — это надёжнее. Если одинаковых элементов на экране несколько (два поля «username»: в форме входа и в форме регистрации), в name опиши цель так, чтобы её нельзя было спутать: «поле username в блоке Create Account».
 6. Если элемента нет — проверь: не нужно ли закрыть баннер/модалку, проскроллить, подождать загрузку, сменить окно.
 7. Если нужен код из SMS/приложения, 2FA или решение человека — action ask_user.
 8. Если не хватает инструмента или доступа (нет ADB, нет приложения, нет аккаунта) — action need_tool с конкретной просьбой. Не отказывайся от задачи.
@@ -215,6 +221,9 @@ pub struct Agent {
     /// Размерность векторов текущей модели: по ней видно, что эмбеддер
     /// сменился и старые векторы надо снять заново, а не терять их.
     embed_dim: std::sync::atomic::AtomicUsize,
+    /// Канал к человеку оборван (запуск из командной строки): больше не
+    /// спрашиваем ни уточнений, ни подтверждений — иначе шаг уходит в пустоту.
+    no_human: std::sync::atomic::AtomicBool,
 }
 
 impl Agent {
@@ -256,6 +265,7 @@ impl Agent {
             embed_off: std::sync::atomic::AtomicBool::new(false),
             embed_fails: std::sync::atomic::AtomicUsize::new(0),
             embed_dim: std::sync::atomic::AtomicUsize::new(0),
+            no_human: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -522,11 +532,20 @@ impl Agent {
             .map(|s| s.observed.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
         let mut failures: Vec<String> = vec![];
+        // Сколько раз подряд внешний JEV запретил действие. Он может отвечать
+        // «нет» на всё (так живой прогон встал: ни одного действия за 120
+        // шагов), поэтому запрет ограничен — советчик, а не стоп-кран.
+        let mut jev_vetoes: u32 = 0;
         let mut rollback_queue: Vec<(String, String)> = vec![];
         let mut rollback_steps: u32 = 0;
         let mut need_replan = false;
         let mut pending_lesson: Option<String> = None;
         let mut phone_mode = looks_like_phone_task(task);
+        // Что экран уже показывал. Критерий вида «открыта страница входа»
+        // верен в момент, когда его видели: на живом прогоне агент
+        // регистрировался, уходил на главную — и узел «страница входа»
+        // уже нельзя было закрыть, задача крутилась до лимита.
+        let mut seen_screens: Vec<Evidence> = vec![];
         // Экран на старте отката: закрываем откат только если он изменился.
         let mut rollback_origin: HashMap<String, Evidence> = HashMap::new();
         if phone_mode {
@@ -646,8 +665,17 @@ impl Agent {
                         &format!("Нужен телефон по ADB: {e}\nПодключи кабелем, разреши отладку и напиши «готово» (или «пк», чтобы работать на компьютере)"),
                         false,
                     );
-                    if ans.to_lowercase().contains("пк") {
+                    if ans.to_lowercase().contains("пк")
+                        || self.no_human.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        // Подключить кабель некому: вечный вопрос в пустоту
+                        // съедал весь прогон. Работаем на компьютере.
+                        self.log("Телефон подключить некому — работаю на компьютере");
                         phone_mode = false;
+                        failures.push(
+                            "телефона нет и подключить его некому: решай задачу на компьютере, действия adb_* не работают"
+                                .into(),
+                        );
                     }
                     continue;
                 }
@@ -660,6 +688,10 @@ impl Agent {
             let ctx = view.ctx.clone();
             let shelf = Memory::shelf_for(&ctx);
             let ev_before = Evidence::from_prompt(&view.prompt);
+            if seen_screens.len() >= 80 {
+                seen_screens.remove(0);
+            }
+            seen_screens.push(ev_before.clone());
             if let Work::Rollback { id, .. } = &work {
                 rollback_origin
                     .entry(id.clone())
@@ -774,10 +806,15 @@ impl Agent {
                 }
             };
             let decision: Decision =
-                match extract_json(&resp.text).and_then(|v| Ok(serde_json::from_value(v)?)) {
+                match extract_json(&resp.text).and_then(|v| Ok(action::decision_from_value(v)?)) {
                     Ok(d) => d,
                     Err(e) => {
-                        self.log(format!("Модель вернула не то ({e}), переспрашиваю"));
+                        // Без куска ответа такой отказ нечем лечить: в
+                        // живом прогоне он повторялся сотнями строк.
+                        let raw: String = resp.text.chars().take(300).collect();
+                        self.log(format!(
+                            "Модель вернула не то ({e}), переспрашиваю. Ответ: {raw}"
+                        ));
                         failures.push(format!("ответ модели не разобран: {e}"));
                         continue;
                     }
@@ -799,19 +836,32 @@ impl Agent {
                     "goal": work.goal(),
                     "failures": failures,
                 });
+                // Отказ JEV останавливает только необратимое. На живом
+                // прогоне он отказывал почти на каждом шаге, и агент
+                // выбрасывал готовое решение модели — половина запросов
+                // уходила в пустоту, задача стояла. Сомнение в обратимом
+                // шаге — это подсказка, а не запрет.
                 match self.decisions.yes(&state, "Делать ли это действие сейчас?")
                 {
-                    Ok(false) => {
-                        self.log("JEV: действие сейчас не подходит, пропускаю");
-                        failures.push("jev: noul отказал в действии".into());
+                    Ok(false) if decision.next.is_destructive() && jev_vetoes < MAX_JEV_VETOES => {
+                        jev_vetoes += 1;
+                        self.log("JEV: необратимое действие сейчас не подходит, пропускаю");
+                        failures.push("jev: noul отказал в необратимом действии".into());
                         continue;
                     }
-                    Ok(true) => {}
+                    Ok(false) => {
+                        self.log("JEV сомневается, но шаг обратимый — делаю");
+                        jev_vetoes = 0;
+                    }
+                    Ok(true) => jev_vetoes = 0,
                     Err(e) => self.warn_jev(&e.to_string()),
                 }
             }
             match self.jev.ask(&act_str) {
-                crate::jev::JevVerdict::No => {
+                crate::jev::JevVerdict::No
+                    if decision.next.is_destructive() && jev_vetoes < MAX_JEV_VETOES =>
+                {
+                    jev_vetoes += 1;
                     self.log(format!(
                         "JEV: класс действия «{}» стабильно проваливается — пропускаю",
                         act_str
@@ -851,26 +901,35 @@ impl Agent {
                 decision.next,
                 Action::AskUser { .. } | Action::NeedTool { .. }
             );
+            let no_human = self.no_human.load(std::sync::atomic::Ordering::Relaxed);
             if let Gate::Clarify(q) = react::confidence_gate(
                 decision.confidence,
                 asks_human,
                 &decision.question,
                 &human_readable(&decision.next),
             ) {
-                self.log(format!(
-                    "Уверенность {:.0}% — уточняю у человека",
-                    decision.confidence.max(0.0) * 100.0
-                ));
-                let ans = self.ask_human(&q, false);
-                trace.push(Step {
-                    n: step,
-                    thought: decision.thought.clone(),
-                    action: format!("уточняющий вопрос: {q}"),
-                    observation: format!("человек ответил: {ans}"),
-                    confidence: decision.confidence,
-                    verified: None,
-                });
-                continue;
+                // Спрашивать некого — вопрос это просто потерянный шаг.
+                // Живой прогон так крутился: 70% уверенности, вопрос,
+                // «человека нет», снова вопрос.
+                if no_human && !asks_human {
+                    failures
+                        .push("спросить некого: действуй сам по тому, что видно на экране".into());
+                } else {
+                    self.log(format!(
+                        "Уверенность {:.0}% — уточняю у человека",
+                        decision.confidence.max(0.0) * 100.0
+                    ));
+                    let ans = self.ask_human(&q, false);
+                    trace.push(Step {
+                        n: step,
+                        thought: decision.thought.clone(),
+                        action: format!("уточняющий вопрос: {q}"),
+                        observation: format!("человек ответил: {ans}"),
+                        confidence: decision.confidence,
+                        verified: None,
+                    });
+                    continue;
+                }
             }
 
             // Куда агент пошёл — туда и смотрим на следующем шаге.
@@ -892,6 +951,15 @@ impl Agent {
                 failures.push(
                     "ты повторяешь одно и то же действие без результата — смени подход".into(),
                 );
+                // Клик по полю ввода не меняет картинку: курсор в кадре не
+                // виден, модель считает, что не попала, и жмёт снова. Так
+                // живой прогон простоял на поле «username» двадцать шагов.
+                if matches!(decision.next, Action::ClickElement { .. }) {
+                    failures.push(
+                        "по полю ввода уже кликнули — фокус в нём, клик ничего не меняет на картинке: печатай текст (type_text)"
+                            .into(),
+                    );
+                }
             }
 
             // --- ЗАЩИТА ОТ НЕОБРАТИМОГО ---
@@ -899,16 +967,33 @@ impl Agent {
                 && (decision.confidence < self.cfg.destructive_confidence
                     || self.cfg.confirm_destructive)
             {
-                let q = format!(
-                    "Подтверди необратимое действие: {}\n(уверенность модели {:.0}%)",
-                    act_str,
-                    decision.confidence * 100.0
+                // Без человека запуск программы без аргументов разрешаем:
+                // опасен не сам запуск, а аргументы (powershell -enc ...),
+                // которые модель может взять со страницы. Иначе прогон
+                // встаёт навсегда: «подтверди» → некому → «отменено».
+                let safe_launch = matches!(
+                    &decision.next,
+                    Action::LaunchApp { args, path }
+                        if args.trim().is_empty()
+                            && !path.contains(['&', '|', ';', '>', '`'])
                 );
-                let ans = self.ask_human(&q, false);
-                if !ans.trim().to_lowercase().starts_with(['д', 'y']) {
-                    self.log("Пользователь отменил действие");
-                    failures.push("пользователь отменил необратимое действие".into());
-                    continue;
+                if no_human && safe_launch {
+                    self.log("Подтверждать некому, аргументов нет — запускаю сам");
+                } else {
+                    let q = format!(
+                        "Подтверди необратимое действие: {}\n(уверенность модели {:.0}%)",
+                        act_str,
+                        decision.confidence * 100.0
+                    );
+                    let ans = self.ask_human(&q, false);
+                    if !ans.trim().to_lowercase().starts_with(['д', 'y']) {
+                        self.log("Пользователь отменил действие");
+                        failures.push(
+                        "необратимое действие не подтверждено: подтвердить некому — выбери путь без необратимого шага"
+                            .into(),
+                    );
+                        continue;
+                    }
                 }
             }
 
@@ -1040,7 +1125,18 @@ impl Agent {
                             // Слова subtask_done не закрывают узел. Сначала
                             // свежий экран, потом Z3: критерий наблюдён и
                             // зависимости уже выполнены.
-                            let (met, why) = self.criterion_on_screen(phone_mode, done_when);
+                            let (mut met, mut why) =
+                                self.criterion_on_screen(phone_mode, done_when);
+                            if !met
+                                && seen_screens
+                                    .iter()
+                                    .any(|ev| verify::criterion_observed(done_when, ev))
+                            {
+                                met = true;
+                                why = format!(
+                                    "критерий «{done_when}» был виден на экране раньше в этом прогоне"
+                                );
+                            }
                             let verdict = crate::logic::allow_node_done(&graph, id, met);
                             let ok = verdict == crate::logic::Verdict::Ok;
                             if ok {
@@ -1084,6 +1180,48 @@ impl Agent {
                 Ok(Outcome::Finished(report)) => {
                     // Отчёт не является сертификатом. Если решение уже доказано,
                     // наружу уходит отчёт по узлам, а не текст модели.
+                    //
+                    // Сначала закрываем узлы, чей критерий виден (сейчас или
+                    // раньше в этом прогоне): на живом прогоне агент делал всё
+                    // дело и писал finish, не отчитавшись по промежуточному
+                    // узлу — узел висел открытым, finish отклонялся, и прогон
+                    // упирался в лимит шагов при фактически сделанной работе.
+                    let open: Vec<(String, String)> = graph
+                        .nodes
+                        .iter()
+                        .filter(|n| {
+                            matches!(
+                                n.state,
+                                crate::agent::graph::NodeState::Pending
+                                    | crate::agent::graph::NodeState::Running
+                            ) && !n.done_when.trim().is_empty()
+                        })
+                        .map(|n| (n.id.clone(), n.done_when.clone()))
+                        .collect();
+                    for (id, done_when) in open {
+                        let seen = seen_screens
+                            .iter()
+                            .any(|ev| verify::criterion_observed(&done_when, ev));
+                        let (met, why) = if seen {
+                            (
+                                true,
+                                format!(
+                                    "критерий «{done_when}» был виден на экране в этом прогоне"
+                                ),
+                            )
+                        } else {
+                            self.criterion_on_screen(phone_mode, &done_when)
+                        };
+                        if met
+                            && crate::logic::allow_node_done(&graph, &id, true)
+                                == crate::logic::Verdict::Ok
+                        {
+                            self.log(format!("Узел {id} закрыт по экрану при finish: {why}"));
+                            graph.mark_done(&id, &why);
+                            observed.insert(id.clone(), true);
+                            self.send_plan(&graph);
+                        }
+                    }
                     match crate::logic::check_solution(&graph, &observed) {
                         crate::logic::Verdict::Ok => {
                             self.log(
@@ -1456,7 +1594,14 @@ impl Agent {
         ));
         let cause = crate::failure::analyze(screen, why);
         match crate::failure::replan_remaining(graph, &cause) {
-            Ok(g) => self.accept_replan(graph, observed, g, failures),
+            Ok(g) => {
+                self.accept_replan(graph, observed, g, failures);
+                // accept_replan чистит подсказки, но историю отказа узла
+                // терять нельзя: без неё модель заходит тем же путём.
+                failures.push(format!(
+                    "узел {id} уже не подтвердился: {why}. Тот же способ не повторяй"
+                ));
+            }
             Err(e) => {
                 self.log(format!("Локальный переплан не вышел: {e}"));
                 if let Ok(g) = planner::replan(&self.llm, graph, screen, failures) {
@@ -1711,6 +1856,23 @@ impl Agent {
                     return String::new();
                 }
                 Ok(AgentCommand::Start(_)) | Ok(AgentCommand::Resume { .. }) => {}
+                // Канал оборван — человека в этом запуске нет вообще.
+                // Ждать его бесконечно нельзя: так живой прогон вставал
+                // на уточняющем вопросе и не делал больше ни шага.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.no_human
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.log("Ответить некому — работаю сам, без подсказки");
+                    // Секрет (код из SMS, пароль) выдумывать нельзя: пустой
+                    // ответ агент запишет как «нет кода». На обычный вопрос
+                    // отвечаем честно: человека нет, решай сам.
+                    return if secret {
+                        String::new()
+                    } else {
+                        "человека рядом нет, подсказки не будет: решай сам и делай следующий шаг"
+                            .into()
+                    };
+                }
                 Err(_) => continue,
             }
         }
