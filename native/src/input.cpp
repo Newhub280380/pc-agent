@@ -78,11 +78,34 @@ void human_move(int x0, int y0, int x1, int y1, int duration_ms) {
   }
 }
 
+// Навигационные и редакторские клавиши — «расширенные» (E0-префикс на
+// физической клавиатуре). Без KEYEVENTF_EXTENDEDKEY SendInput отдаёт их
+// как цифровой блок (VK_LEFT ≡ Num4 и т. д.): приложения видят Numpad-стрелку,
+// и Shift+стрелка не выделяет текст, а просто двигает курсор
+// (vercel-labs/agent-desktop#513). Ctrl/Alt/Shift правые тоже extended,
+// но мы шлём левые.
+bool is_extended_vk(WORD vk) {
+  switch (vk) {
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+    case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+    case VK_INSERT: case VK_DELETE: case VK_DIVIDE: case VK_NUMLOCK:
+    case VK_SNAPSHOT: case VK_RWIN: case VK_LWIN: case VK_APPS:
+    case VK_RCONTROL: case VK_RMENU:
+      return true;
+    default:
+      return false;
+  }
+}
+
 void tap_vk(WORD vk, bool up) {
   INPUT in{};
   in.type = INPUT_KEYBOARD;
   in.ki.wVk = vk;
+  // Скан-код обязателен: часть приложений (игры, Java/Swing, RDP-клиент)
+  // читает именно его, а с wScan=0 клавиша для них «пустая».
+  in.ki.wScan = (WORD)::MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
   in.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+  if (is_extended_vk(vk)) in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
   ::SendInput(1, &in, sizeof(INPUT));
 }
 
@@ -99,23 +122,72 @@ void send_unicode(wchar_t ch) {
   ::SendInput(2, in, sizeof(INPUT));
 }
 
-WORD vk_from_name(const std::string& n) {
+// Результат разбора одного имени клавиши: VK плюс модификаторы, которые
+// это имя подразумевает само (`(` = Shift+9 на US-раскладке).
+struct KeySpec {
+  WORD vk = 0;
+  bool shift = false, ctrl = false, alt = false;
+};
+
+// Символ -> VK через текущую раскладку. VkKeyScanW отдаёт в младшем байте VK,
+// в старшем — нужные модификаторы (1=Shift, 2=Ctrl, 4=Alt). -1 = символа в
+// раскладке нет (например, кириллица на US) — тогда клавиша недоступна как
+// комбинация; для текста есть type_text с KEYEVENTF_UNICODE.
+bool vk_from_char(wchar_t ch, KeySpec* out) {
+  SHORT r = ::VkKeyScanW(ch);
+  if (r == -1) return false;
+  out->vk = (WORD)(r & 0xFF);
+  const int mods = (r >> 8) & 0xFF;
+  out->shift = (mods & 1) != 0;
+  out->ctrl = (mods & 2) != 0;
+  out->alt = (mods & 4) != 0;
+  return out->vk != 0;
+}
+
+bool vk_from_name(const std::string& n, KeySpec* out) {
+  *out = KeySpec{};
   if (n.size() == 1) {
-    char c = (char)toupper(n[0]);
-    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return (WORD)c;
+    char c = (char)toupper((unsigned char)n[0]);
+    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) { out->vk = (WORD)c; return true; }
+    // Любой одиночный ASCII-символ: `;`, `\`, `(`, `'`, `,`, `-`, `=`, `/` …
+    // Раньше всё это было «неизвестная клавиша» (ср. agent-desktop#513), и
+    // в приложения без UIA-дерева (PyCharm/Swing) двоеточие было не набрать.
+    return vk_from_char((wchar_t)(unsigned char)n[0], out);
   }
   static const struct { const char* k; WORD v; } table[] = {
-    {"ctrl", VK_CONTROL}, {"control", VK_CONTROL}, {"alt", VK_MENU},
-    {"shift", VK_SHIFT}, {"win", VK_LWIN}, {"enter", VK_RETURN}, {"return", VK_RETURN},
+    {"ctrl", VK_CONTROL}, {"control", VK_CONTROL}, {"alt", VK_MENU}, {"menu", VK_MENU},
+    {"shift", VK_SHIFT}, {"win", VK_LWIN}, {"super", VK_LWIN}, {"cmd", VK_LWIN}, {"meta", VK_LWIN},
+    {"enter", VK_RETURN}, {"return", VK_RETURN},
     {"tab", VK_TAB}, {"esc", VK_ESCAPE}, {"escape", VK_ESCAPE}, {"space", VK_SPACE},
-    {"backspace", VK_BACK}, {"delete", VK_DELETE}, {"home", VK_HOME}, {"end", VK_END},
-    {"pageup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"up", VK_UP}, {"down", VK_DOWN},
-    {"left", VK_LEFT}, {"right", VK_RIGHT}, {"insert", VK_INSERT}, {"printscreen", VK_SNAPSHOT},
+    {"backspace", VK_BACK}, {"delete", VK_DELETE}, {"del", VK_DELETE}, {"forwarddelete", VK_DELETE},
+    {"home", VK_HOME}, {"end", VK_END},
+    {"pageup", VK_PRIOR}, {"pgup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"pgdn", VK_NEXT},
+    {"up", VK_UP}, {"down", VK_DOWN}, {"left", VK_LEFT}, {"right", VK_RIGHT},
+    {"arrowup", VK_UP}, {"arrowdown", VK_DOWN}, {"arrowleft", VK_LEFT}, {"arrowright", VK_RIGHT},
+    {"insert", VK_INSERT}, {"ins", VK_INSERT}, {"printscreen", VK_SNAPSHOT}, {"prtsc", VK_SNAPSHOT},
+    {"capslock", VK_CAPITAL}, {"numlock", VK_NUMLOCK}, {"scrolllock", VK_SCROLL}, {"pause", VK_PAUSE},
+    {"apps", VK_APPS}, {"contextmenu", VK_APPS},
+    // Знаки препинания по именам — тот же словарь, что у macOS-адаптера
+    // agent-desktop, чтобы один и тот же план работал на обеих платформах.
+    {"comma", VK_OEM_COMMA}, {"period", VK_OEM_PERIOD}, {"dot", VK_OEM_PERIOD},
+    {"semicolon", VK_OEM_1}, {"quote", VK_OEM_7}, {"apostrophe", VK_OEM_7},
+    {"slash", VK_OEM_2}, {"backslash", VK_OEM_5}, {"minus", VK_OEM_MINUS}, {"dash", VK_OEM_MINUS},
+    {"equal", VK_OEM_PLUS}, {"equals", VK_OEM_PLUS}, {"plus", VK_OEM_PLUS},
+    {"leftbracket", VK_OEM_4}, {"bracketleft", VK_OEM_4}, {"rightbracket", VK_OEM_6}, {"bracketright", VK_OEM_6},
+    {"grave", VK_OEM_3}, {"backquote", VK_OEM_3}, {"tilde", VK_OEM_3},
     {"f1", VK_F1}, {"f2", VK_F2}, {"f3", VK_F3}, {"f4", VK_F4}, {"f5", VK_F5}, {"f6", VK_F6},
     {"f7", VK_F7}, {"f8", VK_F8}, {"f9", VK_F9}, {"f10", VK_F10}, {"f11", VK_F11}, {"f12", VK_F12},
+    {"f13", VK_F13}, {"f14", VK_F14}, {"f15", VK_F15}, {"f16", VK_F16},
+    {"numpad0", VK_NUMPAD0}, {"numpad1", VK_NUMPAD1}, {"numpad2", VK_NUMPAD2}, {"numpad3", VK_NUMPAD3},
+    {"numpad4", VK_NUMPAD4}, {"numpad5", VK_NUMPAD5}, {"numpad6", VK_NUMPAD6}, {"numpad7", VK_NUMPAD7},
+    {"numpad8", VK_NUMPAD8}, {"numpad9", VK_NUMPAD9},
+    {"multiply", VK_MULTIPLY}, {"add", VK_ADD}, {"subtract", VK_SUBTRACT}, {"decimal", VK_DECIMAL}, {"divide", VK_DIVIDE},
+    {"volumeup", VK_VOLUME_UP}, {"volumedown", VK_VOLUME_DOWN}, {"volumemute", VK_VOLUME_MUTE},
   };
-  for (auto& e : table) if (n == e.k) return e.v;
-  return 0;
+  for (auto& e : table) if (n == e.k) { out->vk = e.v; return true; }
+  // Имя вида "plus" уже обработано; символ "+" как разделитель не приходит
+  // сюда вовсе — an_key_combo принимает его как "plus".
+  return false;
 }
 
 }  // namespace
@@ -204,22 +276,61 @@ extern "C" int32_t an_type_text_human(const char* utf8, int32_t wpm) {
 
 extern "C" int32_t an_key_combo(const char* combo) {
   std::string s = combo ? combo : "";
-  std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-  std::vector<WORD> keys;
-  size_t pos = 0;
-  while (pos <= s.size()) {
-    size_t plus = s.find('+', pos);
-    std::string part = s.substr(pos, plus == std::string::npos ? std::string::npos : plus - pos);
-    if (!part.empty()) {
-      WORD vk = vk_from_name(part);
-      if (!vk) { an_set_error("неизвестная клавиша: " + part); return -1; }
-      keys.push_back(vk);
+  // Пробелы вокруг «+» и регистр — не ошибка модели.
+  s.erase(std::remove_if(s.begin(), s.end(), [](unsigned char c) { return c == ' ' || c == '\t'; }), s.end());
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)::tolower(c); });
+  if (s.empty()) { an_set_error("пустая комбинация клавиш"); return -1; }
+
+  // Разбор по «+», но сам «+» как клавиша тоже допустим: "ctrl++" и "shift+="
+  // раньше распадались на пустые части и падали. Правило: пустая часть,
+  // за которой стоит ещё один «+», — это клавиша «+».
+  std::vector<std::string> parts;
+  {
+    std::string cur;
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (s[i] == '+') {
+        if (cur.empty() && i + 1 < s.size() && s[i + 1] == '+') { parts.push_back("+"); ++i; continue; }
+        if (cur.empty() && i + 1 == s.size()) { parts.push_back("+"); break; }
+        if (!cur.empty()) { parts.push_back(cur); cur.clear(); }
+        continue;
+      }
+      cur += s[i];
     }
-    if (plus == std::string::npos) break;
-    pos = plus + 1;
+    if (!cur.empty()) parts.push_back(cur);
   }
-  for (WORD k : keys) { tap_vk(k, false); sleep_ms(rnd(15, 45)); }
+  if (parts.empty()) { an_set_error("пустая комбинация клавиш"); return -1; }
+
+  // Модификаторы отдельно от основных клавиш: порядок в строке у модели
+  // бывает любой ("a+ctrl"), а нажимать нужно модификаторы первыми.
+  bool shift = false, ctrl = false, alt = false, win = false;
+  std::vector<WORD> keys;
+  for (const std::string& part : parts) {
+    KeySpec ks;
+    if (!vk_from_name(part, &ks)) { an_set_error("неизвестная клавиша: " + part); return -1; }
+    switch (ks.vk) {
+      case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: shift = true; continue;
+      case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: ctrl = true; continue;
+      case VK_MENU: case VK_LMENU: case VK_RMENU: alt = true; continue;
+      case VK_LWIN: case VK_RWIN: win = true; continue;
+      default: break;
+    }
+    // Символ требует своих модификаторов ("(" = Shift+9): добавляем их к
+    // явным — иначе уходит "9". Ctrl/Alt из VkKeyScan (AltGr-раскладки)
+    // тоже честно нажимаем, иначе символа не будет.
+    shift |= ks.shift; ctrl |= ks.ctrl; alt |= ks.alt;
+    keys.push_back(ks.vk);
+  }
+
+  std::vector<WORD> order;
+  if (ctrl) order.push_back(VK_CONTROL);
+  if (alt) order.push_back(VK_MENU);
+  if (shift) order.push_back(VK_SHIFT);
+  if (win) order.push_back(VK_LWIN);
+  order.insert(order.end(), keys.begin(), keys.end());
+  if (order.empty()) { an_set_error("в комбинации только модификаторы: " + s); return -1; }
+
+  for (WORD k : order) { tap_vk(k, false); sleep_ms(rnd(15, 45)); }
   sleep_ms(rnd(30, 80));
-  for (auto it = keys.rbegin(); it != keys.rend(); ++it) { tap_vk(*it, true); sleep_ms(rnd(10, 30)); }
+  for (auto it = order.rbegin(); it != order.rend(); ++it) { tap_vk(*it, true); sleep_ms(rnd(10, 30)); }
   return 0;
 }
