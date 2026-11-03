@@ -69,6 +69,15 @@ impl Store {
         Ok(Self { root })
     }
 
+    /// Хранилище, которое заведомо нельзя открыть: save/load вернут ошибку
+    /// ввода-вывода, а не паникуют. Нужен агенту, когда ни %APPDATA%, ни
+    /// %TEMP% не пишутся — лучше работать без отката, чем не стартовать.
+    pub fn unavailable() -> Self {
+        Self {
+            root: PathBuf::from("\0pcagent-checkpoints-unavailable"),
+        }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

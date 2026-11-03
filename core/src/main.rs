@@ -78,6 +78,22 @@ fn main() -> Result<()> {
         return headless(&task);
     }
 
+    // В релизе это windows-подсистема: stderr никуда не ведёт, и любой `?`
+    // в main раньше заканчивался тихим исчезновением процесса. Теперь
+    // причина уходит в лог и в MessageBox.
+    match run_app() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::error!("агент не запустился: {e:#}");
+            gui::error_dialog(&format!(
+                "Агент не запустился.\n\n{e:#}\n\nПодробности в логе %LOCALAPPDATA%\\PCAgent\\logs."
+            ));
+            Err(e)
+        }
+    }
+}
+
+fn run_app() -> Result<()> {
     let paths = config::Paths::resolve()?;
     init_logging(&paths.logs);
 
@@ -117,12 +133,29 @@ fn main() -> Result<()> {
         }
     };
 
+    // Native-слой (COM/UIA) поднимаем ПОСЛЕ окна согласия и ДО главного
+    // окна — но UIA теперь живёт в потоке агента (см. platform::init), так
+    // что здесь только DPI и COM для главного потока. Ошибка не фатальна.
     if let Err(e) = platform::init() {
         log::error!("native-слой недоступен: {e}");
     }
 
     let llm = llm::LlmClient::new(&settings.router_url, &settings.router_token);
-    let mem = Arc::new(Mutex::new(memory::Memory::open(&paths.memory_db)?));
+    // Память: если основной файл не открывается (заблокирован зомби-процессом,
+    // папка в OneDrive только для чтения, повреждён WAL) — агент раньше умирал
+    // здесь с `?` без окна. Теперь уходим на временную базу и говорим об этом.
+    let mem = match memory::Memory::open(&paths.memory_db) {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!(
+                "память {} не открылась: {e}; работаю на временной базе",
+                paths.memory_db.display()
+            );
+            let tmp = std::env::temp_dir().join("pcagent-memory-fallback.db");
+            memory::Memory::open(&tmp)?
+        }
+    };
+    let mem = Arc::new(Mutex::new(mem));
     let mut adb = android::Adb::new(settings.adb_path.clone());
     connect_phone(&mut adb, &settings);
 
@@ -237,11 +270,33 @@ fn main() -> Result<()> {
 fn run_gui(app: gui::AppState) -> Result<()> {
     let pending = Arc::new(Mutex::new(Some(app)));
     let mut last: Option<String> = None;
-    for renderer in [eframe::Renderer::Glow, eframe::Renderer::Wgpu] {
+    // Порядок рендереров: сначала wgpu (DX12 есть на любой Windows 10/11,
+    // включая программный WARP), потом glow. Раньше было наоборот, и это
+    // и было «запустился и сразу умер»: glow без OpenGL 2.0+ ICD не
+    // возвращает Err, а ПАНИКУЕТ внутри glutin
+    // (`config_iterator.next().expect(...)`), а в релизе panic = "abort" —
+    // процесс исчезает до того, как цикл доберётся до второго рендерера.
+    // Переопределение: PCAGENT_RENDERER=glow|wgpu.
+    let order: Vec<eframe::Renderer> = match std::env::var("PCAGENT_RENDERER")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "glow" => vec![eframe::Renderer::Glow, eframe::Renderer::Wgpu],
+        "wgpu" => vec![eframe::Renderer::Wgpu],
+        _ => vec![eframe::Renderer::Wgpu, eframe::Renderer::Glow],
+    };
+    for renderer in order {
         let opts = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_inner_size([1100.0, 680.0])
-                .with_min_inner_size([820.0, 520.0]),
+                .with_min_inner_size([820.0, 520.0])
+                // Drag&drop нам не нужен, а winit ради него вызывает
+                // OleInitialize и паникует на RPC_E_CHANGED_MODE, если COM
+                // в этом потоке уже поднят в другом режиме (наш native-слой
+                // и UIA инициализируют COM раньше окна).
+                .with_drag_and_drop(false),
             renderer,
             // DX12 первым: на машинах без видеокарты Windows всё равно даёт
             // программный адаптер WARP, а Vulkan/GL там просто отсутствуют.
@@ -257,23 +312,34 @@ fn run_gui(app: gui::AppState) -> Result<()> {
             ..Default::default()
         };
         let slot = pending.clone();
-        let res = eframe::run_native(
-            "PC Agent",
-            opts,
-            Box::new(move |_cc| {
-                let app = slot
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take()
-                    .ok_or("окно агента уже было создано")?;
-                Ok(Box::new(app) as Box<dyn eframe::App>)
-            }),
-        );
+        // Паника внутри рендерера (glutin/egui_glow/wgpu-hal) — это не
+        // «ошибка окна», а смерть процесса при panic=abort. Ловим её здесь
+        // и превращаем в обычный Err, чтобы сработал откат на следующий
+        // рендерер и нативный MessageBox с причиной.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eframe::run_native(
+                "PC Agent",
+                opts,
+                Box::new(move |_cc| {
+                    let app = slot
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .ok_or("окно агента уже было создано")?;
+                    Ok(Box::new(app) as Box<dyn eframe::App>)
+                }),
+            )
+        }));
+        let res: std::result::Result<(), String> = match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(payload) => Err(format!("паника рендерера: {}", panic_message(&payload))),
+        };
         match res {
             Ok(()) => return Ok(()),
             Err(e) => {
                 log::error!("GUI на {renderer:?} не поднялась: {e}");
-                last = Some(e.to_string());
+                last = Some(e);
                 // Состояние уже забрали в умершее окно — повторять нечем.
                 if pending.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
                     break;
@@ -642,7 +708,7 @@ fn init_logging(dir: &std::path::Path) {
     if let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
     {
         // wgpu/naga на info вываливают в лог весь сгенерированный HLSL —
         // это десятки КБ на каждый запуск и лог агента становится нечитаемым.
@@ -654,6 +720,47 @@ fn init_logging(dir: &std::path::Path) {
         .init();
     } else {
         env_logger::init();
+    }
+    install_panic_hook(path);
+}
+
+/// Паника в GUI-сборке раньше была невидимой: консоли нет, окна ещё нет,
+/// а panic=abort убивал процесс до записи в лог. Хук пишет место и текст
+/// паники в тот же файл лога, что и всё остальное, — иначе «запустился и
+/// сразу умер» нечем диагностировать.
+fn install_panic_hook(log_path: std::path::PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = panic_message(info.payload());
+        let where_ = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "?".into());
+        let line = format!(
+            "{} PANIC at {where_}: {msg}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+        log::error!("{}", line.trim_end());
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+        previous(info);
+    }));
+}
+
+/// Текст из payload паники: &str или String, иначе «неизвестно».
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "неизвестная паника".into()
     }
 }
 

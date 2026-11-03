@@ -242,6 +242,8 @@ fn parse_tsv(tsv: &str) -> Vec<UiElement> {
                     h,
                     cx: 0,
                     cy: 0,
+                    text: String::new(),
+                    has_text: false,
                 });
             }
         }

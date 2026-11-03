@@ -190,33 +190,56 @@ pub fn consent_dialog(text: &str) -> bool {
     let flag = accepted.clone();
     let body = text.to_string();
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([620.0, 420.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([620.0, 420.0])
+            // См. run_gui: без drag&drop winit не трогает OleInitialize.
+            .with_drag_and_drop(false),
+        // Тот же рендерер, что и у главного окна: wgpu/DX12 есть везде,
+        // glow без OpenGL-драйвера паникует внутри glutin.
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            supported_backends: eframe::wgpu::util::backend_bits_from_env().unwrap_or(
+                eframe::wgpu::Backends::DX12
+                    | eframe::wgpu::Backends::VULKAN
+                    | eframe::wgpu::Backends::GL,
+            ),
+            power_preference: eframe::wgpu::PowerPreference::None,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let res = eframe::run_simple_native("PC Agent — доступ", opts, move |ctx, _| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Разреши агенту работать на этом компьютере");
-            ui.add_space(8.0);
-            ui.label(&body);
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if ui.button("Разрешить и запустить").clicked() {
-                    flag.store(true, Ordering::Relaxed);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if ui.button("Выход").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_simple_native("PC Agent — доступ", opts, move |ctx, _| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Разреши агенту работать на этом компьютере");
+                ui.add_space(8.0);
+                ui.label(&body);
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Разрешить и запустить").clicked() {
+                        flag.store(true, Ordering::Relaxed);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.button("Выход").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
             });
-        });
-    });
-    // Если egui не поднялся (нет GPU/сессии), спрашиваем нативным окном:
-    // иначе первый запуск молча закончился бы отказом в доступе.
-    if let Err(e) = res {
-        log::error!("окно согласия не открылось: {e}");
-        return confirm_native("PC Agent — доступ", &text_for_fallback);
+        })
+    }));
+    // Если egui не поднялся (нет GPU/сессии) или запаниковал, спрашиваем
+    // нативным окном: иначе первый запуск молча закончился бы отказом.
+    match res {
+        Ok(Ok(())) => accepted.load(Ordering::Relaxed),
+        Ok(Err(e)) => {
+            log::error!("окно согласия не открылось: {e}");
+            confirm_native("PC Agent — доступ", &text_for_fallback)
+        }
+        Err(_) => {
+            log::error!("окно согласия упало с паникой рендерера");
+            confirm_native("PC Agent — доступ", &text_for_fallback)
+        }
     }
-    accepted.load(Ordering::Relaxed)
 }
 
 /// Окно ошибки без egui: используется как раз тогда, когда egui и не завёлся.

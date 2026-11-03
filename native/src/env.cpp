@@ -2,27 +2,48 @@
 #include "common.hpp"
 #include "../include/agent_native.h"
 #include <shellscalingapi.h>
+#include <mutex>
 
 int32_t uia_init();
 void uia_shutdown();
 
+namespace {
+// Инициализация процесса — один раз, не по потокам. an_init теперь зовут
+// и GUI-поток, и selfcheck, и тесты; повторный вызов не должен ронять
+// счётчик COM или дважды трогать DPI.
+std::once_flag g_init_once;
+bool g_com_owned = false;
+}  // namespace
+
 extern "C" int32_t an_init(void) {
-  // Apartment-threaded COM: требование UIA и WIC.
-  HRESULT hr = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-  if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) { an_set_error("CoInitializeEx failed"); return -1; }
+  std::call_once(g_init_once, [] {
+    // Per-Monitor-V2 DPI: без этого на 150% масштабе Windows врёт координаты —
+    // скриншот приходит растянутым, а клики уезжают на десятки пикселей.
+    // Это одна из главных причин, почему «бот кликает мимо» у конкурентов.
+    // Вызов НЕ фатален: если DPI awareness уже выставлен (манифестом или
+    // winit), функция вернёт FALSE/ERROR_ACCESS_DENIED — это ожидаемо.
+    ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-  // Per-Monitor-V2 DPI: без этого на 150% масштабе Windows врёт координаты —
-  // скриншот приходит растянутым, а клики уезжают на десятки пикселей.
-  // Это одна из главных причин, почему «бот кликает мимо» у конкурентов.
-  ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    // COM для ВЫЗЫВАЮЩЕГО потока. Режим — тот, что уже есть в потоке, если
+    // он есть: раньше тут был жёсткий APARTMENTTHREADED, а winit в том же
+    // GUI-потоке зовёт OleInitialize и паникует на RPC_E_CHANGED_MODE, когда
+    // режимы расходятся. RPC_E_CHANGED_MODE здесь — не ошибка: COM уже
+    // поднят кем-то другим, и снимать его при shutdown должны не мы.
+    HRESULT hr = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    g_com_owned = SUCCEEDED(hr);
+  });
 
-  uia_init();  // не фатально: без UIA работаем на зрении
+  // UIA — лениво и по потокам (см. uia.cpp); здесь только проверяем, что
+  // он доступен, и не делаем это фатальным: без UIA работаем на зрении.
+  uia_init();
   return 0;
 }
 
 extern "C" void an_shutdown(void) {
   uia_shutdown();
-  ::CoUninitialize();
+  // CoUninitialize только за свой CoInitializeEx: лишний вызов обрушивает
+  // апартамент winit/egui и ронял процесс при закрытии окна.
+  if (g_com_owned) { ::CoUninitialize(); g_com_owned = false; }
 }
 
 extern "C" int32_t an_foreground_window(uint64_t* hwnd, char** out_title) {

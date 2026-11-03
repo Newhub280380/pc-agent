@@ -61,6 +61,14 @@ pub struct UiElement {
     pub cx: i32,
     #[serde(default)]
     pub cy: i32,
+    /// Содержимое поля ввода или документа (ValuePattern/TextPattern).
+    /// Пусто у кнопок и прочих не-текстовых элементов.
+    #[serde(default)]
+    pub text: String,
+    /// Элемент умеет отдавать текст через accessibility. `false` при
+    /// пустом `text` означает «текст недоступен», а не «документ пуст».
+    #[serde(default)]
+    pub has_text: bool,
 }
 
 impl UiElement {

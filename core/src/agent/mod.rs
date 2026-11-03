@@ -263,7 +263,13 @@ impl Agent {
                 .or_else(|_| {
                     crate::checkpoint::Store::open(std::env::temp_dir().join("pcagent-checkpoints"))
                 })
-                .expect("каталог чекпоинтов"),
+                .unwrap_or_else(|e| {
+                    // Паника в потоке агента на старте раньше молча убивала
+                    // приложение. Без каталога чекпоинтов работать можно —
+                    // не будет только отката, о чём и предупреждаем.
+                    log::error!("каталог чекпоинтов недоступен: {e}; откат по снимкам выключен");
+                    crate::checkpoint::Store::unavailable()
+                }),
             hang: hang_limit(),
             jev_warned: false,
             embed_off: std::sync::atomic::AtomicBool::new(false),

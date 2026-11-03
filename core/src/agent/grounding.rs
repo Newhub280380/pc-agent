@@ -50,7 +50,10 @@ impl Evidence {
                 in_elements = true;
                 continue;
             }
-            if line.starts_with("ТЕКСТ НА ЭКРАНЕ") || line.starts_with("ЭКРАН ") {
+            if line.starts_with("ТЕКСТ НА ЭКРАНЕ")
+                || line.starts_with("ЭКРАН ")
+                || line.starts_with("СОДЕРЖИМОЕ ПОЛЕЙ")
+            {
                 in_elements = false;
             }
             if let Some(rest) = line.strip_prefix("- ") {

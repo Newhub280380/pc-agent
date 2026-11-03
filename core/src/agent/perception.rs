@@ -47,6 +47,37 @@ impl Observation {
                     e.h
                 ));
             }
+            // Содержимое полей и документов — отдельным блоком, а не в строке
+            // элемента: текст Word-документа в 4 КБ в таблице не читается.
+            // Пустой документ и документ без доступа к тексту различаем явно:
+            // иначе модель не может понять, напечаталось ли что-то вообще.
+            let textual: Vec<&UiElement> = self
+                .elements
+                .iter()
+                .filter(|e| e.kind == "edit" || e.kind == "document")
+                .collect();
+            if !textual.is_empty() {
+                s.push_str("СОДЕРЖИМОЕ ПОЛЕЙ И ДОКУМЕНТОВ:\n");
+                for e in textual.iter().take(12) {
+                    let label = if e.name.is_empty() {
+                        e.kind.clone()
+                    } else {
+                        crate::text::truncate(&e.name, 50)
+                    };
+                    if !e.text.is_empty() {
+                        s.push_str(&format!(
+                            "- [{label}]: «{}»\n",
+                            crate::text::truncate(&e.text, 1500)
+                        ));
+                    } else if e.has_text {
+                        s.push_str(&format!("- [{label}]: (пусто)\n"));
+                    } else if e.kind == "document" {
+                        s.push_str(&format!(
+                            "- [{label}]: текст недоступен через accessibility — проверяй по скриншоту/OCR\n"
+                        ));
+                    }
+                }
+            }
         }
         if !self.ocr_lines.is_empty() {
             s.push_str("ТЕКСТ НА ЭКРАНЕ (OCR):\n");

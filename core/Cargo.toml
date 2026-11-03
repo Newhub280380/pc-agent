@@ -61,5 +61,9 @@ cc = "1"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# НЕ abort: с abort любая паника внутри glutin/wgpu/winit убивала процесс
+# до того, как run_gui успевал откатиться на другой рендерер или показать
+# MessageBox — это и выглядело как «запустился и сразу умер». С unwind
+# паника ловится catch_unwind, попадает в лог и в окно ошибки.
+panic = "unwind"
 strip = true
