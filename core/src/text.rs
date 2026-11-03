@@ -84,10 +84,12 @@ pub fn mask_secrets(s: &str) -> String {
                     }
                     // Голое значение: до пробела, запятой или кавычки
                     // следующего поля, иначе затрём разделители в журнале.
+                    // Точка с запятой в список не входит: в `abc;def` она
+                    // бывает частью самого секрета, и хвост утёк бы в лог.
                     Some(_) => {
                         let mut m = j;
                         while chars.get(m).is_some_and(|c| {
-                            !c.is_whitespace() && !",;}]".contains(*c) && !QUOTES.contains(c)
+                            !c.is_whitespace() && !",}]".contains(*c) && !QUOTES.contains(c)
                         }) {
                             m += 1;
                         }
@@ -162,6 +164,8 @@ mod tests {
         // Значение с пробелом в начале тоже затирается.
         let lead = mask_secrets("{\"password\": \"  topsecret\"}");
         assert!(!lead.contains("topsecret"), "{lead}");
+        // Точка с запятой может быть внутри секрета — хвост не оставляем.
+        assert_eq!(mask_secrets("password=abc;def"), "password=***");
         let m = mask_secrets("{\"password\": \"correct horse battery staple\"}");
         assert!(!m.contains("horse"), "{m}");
         assert!(!m.contains("staple"), "{m}");
