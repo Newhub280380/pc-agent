@@ -79,8 +79,19 @@ fn parse_triage(raw: &str) -> Option<String> {
 /// Построение графа. Ошибка формата не должна ронять задачу: повторяем запрос,
 /// добавляя в промпт причину отказа. Если валидный граф так и не получен —
 /// вызывающий (agent::run_task) переходит на линейный план из одной цели.
-pub fn make_graph(llm: &LlmClient, task: &str, memory_hints: &str) -> Result<TaskGraph> {
+pub fn make_graph(
+    llm: &LlmClient,
+    task: &str,
+    memory_hints: &str,
+    intent: &str,
+) -> Result<TaskGraph> {
     let mut user = format!("ЗАДАЧА ПОЛЬЗОВАТЕЛЯ: {task}\n");
+    let intent = intent_section(intent);
+    if !intent.is_empty() {
+        // Контракт намерения важнее формулировки задачи: задача могла быть
+        // уточнена и поправлена в диалоге слоя намерения.
+        user.push_str(&format!("\n{intent}\n"));
+    }
     if !memory_hints.trim().is_empty() {
         // Прошлый опыт в планировщик — иначе агент каждый раз заново
         // «открывает», что на этом сайте есть баннер кук.
@@ -102,6 +113,17 @@ pub fn make_graph(llm: &LlmClient, task: &str, memory_hints: &str) -> Result<Tas
         )?;
         parse_graph(&resp.text, task)
     })
+}
+
+/// Блок контракта намерения для промптов планировщика: пустая строка,
+/// если слой намерения выключен или не дал брифа.
+fn intent_section(intent: &str) -> String {
+    let intent = intent.trim();
+    if intent.is_empty() {
+        String::new()
+    } else {
+        format!("\n{intent}\n")
+    }
 }
 
 /// Разбор и валидация ответа модели. Вынесено отдельно, чтобы тестировать
@@ -128,9 +150,12 @@ pub fn replan(
     graph: &TaskGraph,
     screen: &str,
     failures: &[String],
+    intent: &str,
 ) -> Result<TaskGraph> {
+    let intent = intent_section(intent);
     let user = format!(
-        "{}\n\nТЕКУЩИЙ ЭКРАН:\n{}\n\nПОСЛЕДНИЕ ОШИБКИ:\n- {}",
+        "{}{}\n\nТЕКУЩИЙ ЭКРАН:\n{}\n\nПОСЛЕДНИЕ ОШИБКИ:\n- {}",
+        intent,
         graph.to_prompt(),
         screen,
         failures.join("\n- ")
