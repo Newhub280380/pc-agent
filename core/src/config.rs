@@ -128,12 +128,13 @@ fn canonical_key(k: &str) -> String {
 /// Ключи, которые читаются через `std::env` в разных местах ядра: порог
 /// смысловой памяти, адрес и прогон эндоскопа, выбор солвера, таймаут
 /// зависания и ключ быстрых решений.
-pub const CORE_ENV_KEYS: [&str; 6] = [
+pub const CORE_ENV_KEYS: [&str; 7] = [
     "MEMORY_SEMANTIC_MIN",
     "ENDOSCOPE_URL",
     "ENDOSCOPE_RUN_ID",
     "PCAGENT_OPTIMIZER",
     "PCAGENT_HANG_SEC",
+    "PCAGENT_INTENT",
     "OPENROUTER_API_KEY",
 ];
 
@@ -667,6 +668,9 @@ UPDATE_MANIFEST_URL=
 PCAGENT_OPTIMIZER=minizinc
 # Через сколько секунд без пульса считать шаг зависшим
 PCAGENT_HANG_SEC=30
+# Слой намерения: auto — уточнять цель перед планом, confirm — ещё и
+# показывать понимание на подтверждение, off — старый путь без него
+PCAGENT_INTENT=auto
 "#
     )
 }

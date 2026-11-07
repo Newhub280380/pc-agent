@@ -21,6 +21,7 @@ mod failure;
 #[cfg(test)]
 mod fuzz;
 mod gui;
+mod intent;
 mod jev;
 mod llm;
 mod logic;

@@ -167,9 +167,10 @@ const ACT_SYSTEM: &str = r#"Ты — автономный агент, управ
 9. Важные факты о сайте/приложении сохраняй через action remember.
 10. subtask_done — только когда критерий «ГОТОВО КОГДА» буквально виден на экране (фраза в кавычках или число из сравнения). Слова отчёта узел не закрывают.
 11. finish задачу не завершает. Она закроется сама, когда каждый нужный узел подтверждён проверкой экрана. Отчёт «готово» без этого будет отклонён.
+12. Если в начале шага есть блок «НАМЕРЕНИЕ СЕССИИ» — это исходная цель человека, зафиксированная до плана. Она важнее текущего узла. Поле drift оставляй пустым, когда действие служит этой цели; заполни одной фразой, только если шаг заметно уводит от неё.
 
 Отвечай СТРОГО JSON:
-{"observation":"что вижу на экране (только факты оттуда)","thought":"рассуждение: цель, риски, почему этот шаг","confidence":0.0-1.0,"question":"уточняющий вопрос, если confidence<0.8, иначе пусто","next":{"action":"click_element","name":"Войти"}}
+{"observation":"что вижу на экране (только факты оттуда)","thought":"рассуждение: цель, риски, почему этот шаг","confidence":0.0-1.0,"question":"уточняющий вопрос, если confidence<0.8, иначе пусто","drift":"","next":{"action":"click_element","name":"Войти"}}
 
 Доступные action: click_element{name,control_type}, click_xy{x,y,button,double}, type_text{text,press_enter},
 key_combo{combo}, scroll{clicks,horizontal}, drag{x1,y1,x2,y2}, open_url{url}, launch_app{path,args},
@@ -228,6 +229,11 @@ pub struct Agent {
     /// Канал к человеку оборван (запуск из командной строки): больше не
     /// спрашиваем ни уточнений, ни подтверждений — иначе шаг уходит в пустоту.
     no_human: std::sync::atomic::AtomicBool,
+    /// Контракт намерения текущей задачи (слой intent): цель, сущности,
+    /// ограничения и критерии, зафиксированные ДО плана. Видна планировщику
+    /// и на каждом шаге, чтобы модель не «забывала» исходную цель в длинном
+    /// контексте экрана. Пусто, когда слой выключен или задача — продолжение.
+    intent_block: String,
 }
 
 impl Agent {
@@ -276,6 +282,7 @@ impl Agent {
             embed_fails: std::sync::atomic::AtomicUsize::new(0),
             embed_dim: std::sync::atomic::AtomicUsize::new(0),
             no_human: std::sync::atomic::AtomicBool::new(false),
+            intent_block: String::new(),
         }
     }
 
@@ -413,6 +420,9 @@ impl Agent {
     }
 
     fn finish_task(&mut self, task_id: &str, result: Result<TaskReport>) -> Result<TaskReport> {
+        // Контракт намерения живёт ровно одну задачу: следующая начинается
+        // со своего слоя намерения, а не с чужого брифа.
+        self.intent_block.clear();
         if let Ok(m) = self.mem.lock() {
             // Остановка человеком — не «успех». Закрытие пишем только когда
             // Z3 принял решение; отчёт модели такого статуса не даёт.
@@ -454,10 +464,28 @@ impl Agent {
             None
         };
 
-        // 0. Человек мог просто поздороваться или спросить — тогда отвечаем
-        // словами, а не двигаем мышью по случайному плану.
+        // 0. Слой намерения: прежде чем планировать и кликать, агент понимает,
+        //    что человек хочет на самом деле, и не выходит из этого понимания,
+        //    пока намерение не раскрыто на всю глубину. Разговор (приветствие,
+        //    вопрос о агенте) закрывается ответом и в задачу не превращается.
+        self.intent_block.clear();
         if resumed.is_none() {
-            if let Some(reply) = planner::chat_reply(&self.llm, task) {
+            let mode = crate::intent::Mode::from_env();
+            if mode.enabled() {
+                match self.intent_gate(task, mode) {
+                    Ok(Some(report)) => return Ok(report),
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Намерение не разобралось (сеть/модель) — не роняем
+                        // задачу: старый путь (триаж + план без брифа).
+                        self.log(format!("Слой намерения недоступен ({e:#}), иду без него"));
+                        if let Some(reply) = planner::chat_reply(&self.llm, task) {
+                            self.log(reply.clone());
+                            return Ok(TaskReport::chat(reply));
+                        }
+                    }
+                }
+            } else if let Some(reply) = planner::chat_reply(&self.llm, task) {
                 self.log(reply.clone());
                 return Ok(TaskReport::chat(reply));
             }
@@ -484,7 +512,7 @@ impl Agent {
         let mut graph = if let Some(snap) = &resumed {
             snap.graph.clone()
         } else {
-            match planner::make_graph(&self.llm, task, &hints) {
+            match planner::make_graph(&self.llm, task, &hints, &self.intent_block) {
                 Ok(g) => g,
                 Err(e) => {
                     self.log(format!(
@@ -632,7 +660,13 @@ impl Agent {
                         if need_replan {
                             need_replan = false;
                             let screen = trace.render();
-                            match planner::replan(&self.llm, &graph, &screen, &failures) {
+                            match planner::replan(
+                                &self.llm,
+                                &graph,
+                                &screen,
+                                &failures,
+                                &self.intent_block,
+                            ) {
                                 Ok(g) => {
                                     self.log("Перепланировал остаток графа");
                                     graph = g;
@@ -769,6 +803,11 @@ impl Agent {
                     view.prompt
                 ),
             };
+            // Намерение сессии видно на каждом шаге: в длинном контексте
+            // экрана модель иначе «забывает» исходную цель человека.
+            if !self.intent_block.is_empty() {
+                prompt.push_str(&format!("\n{}\n", self.intent_block));
+            }
             if !digest.is_empty() {
                 prompt.push_str(&format!("\nЧТО Я УЖЕ ЗНАЮ ПРО {shelf}: {digest}\n"));
             }
@@ -835,6 +874,17 @@ impl Agent {
                 };
             let _ = self.tx.send(AgentEvent::Thought(decision.thought.clone()));
             let act_str = decision.next.short();
+
+            // Модель сама отмечает, если шаг уводит от намерения сессии.
+            // Это не запрет (шаг ещё пройдёт все проверки), а сигнал в лог
+            // и подсказка на следующий шаг.
+            let drift = decision.drift.trim();
+            if !drift.is_empty() {
+                self.log(format!("Шаг уходит от намерения: {drift}"));
+                failures.push(format!(
+                    "действие уводит от исходного намерения ({drift}): держись цели сессии"
+                ));
+            }
 
             // --- ЛОГИКА: политика Z3 + вероятностный JEV ДО действия ---
             if let crate::logic::Verdict::Violation(why) =
@@ -1426,9 +1476,13 @@ impl Agent {
                                 }
                                 Err(e2) => {
                                     self.log(format!("Локальный переплан не вышел: {e2}"));
-                                    if let Ok(g) =
-                                        planner::replan(&self.llm, &graph, &screen, &failures)
-                                    {
+                                    if let Ok(g) = planner::replan(
+                                        &self.llm,
+                                        &graph,
+                                        &screen,
+                                        &failures,
+                                        &self.intent_block,
+                                    ) {
                                         self.accept_replan(
                                             &mut graph,
                                             &mut observed,
@@ -1671,7 +1725,9 @@ impl Agent {
             }
             Err(e) => {
                 self.log(format!("Локальный переплан не вышел: {e}"));
-                if let Ok(g) = planner::replan(&self.llm, graph, screen, failures) {
+                if let Ok(g) =
+                    planner::replan(&self.llm, graph, screen, failures, &self.intent_block)
+                {
                     self.accept_replan(graph, observed, g, failures);
                 }
             }
@@ -1902,6 +1958,62 @@ impl Agent {
             prompt,
             screenshot_png,
         })
+    }
+
+    /// Слой намерения: до плана агент понимает, что человек хочет на самом
+    /// деле, и не выходит из этого понимания, пока намерение не раскрыто
+    /// на всю глубину — блокирующие пробелы становятся вопросами человеку,
+    /// а не догадками модели. Возвращает Some(report), если задача закрылась
+    /// разговором (chat) или остановкой; при None `self.intent_block` уже
+    /// заполнен контрактом для планировщика и шагов.
+    fn intent_gate(&mut self, task: &str, mode: crate::intent::Mode) -> Result<Option<TaskReport>> {
+        let mut session = crate::intent::Session::new(self.llm.clone(), mode);
+        let mut step = session.push(task)?;
+        for _ in 0..crate::intent::MAX_TURNS {
+            // Вопросы и подтверждение — один и тот же ход: спросить человека
+            // и отдать ответ в сессию. Разница только в обёртке текста.
+            let ask = match &step {
+                crate::intent::Step::Ask(q) => Some(q.clone()),
+                crate::intent::Step::Confirm(summary) => Some(format!(
+                    "Понял намерение так:\n{summary}\n\nВерно? Ответь «да» или напиши поправку."
+                )),
+                _ => None,
+            };
+            match ask {
+                Some(q) => {
+                    self.log(format!("Уточняю намерение: {q}"));
+                    let ans = self.ask_human(&q, false);
+                    if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(Some(TaskReport::open("Остановлено пользователем")));
+                    }
+                    step = if self.no_human.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Человека нет: не крутимся в вопросах, фиксируем
+                        // пробелы как допущения и идём в работу.
+                        session.proceed()
+                    } else {
+                        session.answer(&ans)?
+                    };
+                }
+                None => match step {
+                    crate::intent::Step::Chat(reply) => {
+                        self.log(reply.clone());
+                        return Ok(Some(TaskReport::chat(reply)));
+                    }
+                    crate::intent::Step::Run => {
+                        self.intent_block = session.brief_text();
+                        if !self.intent_block.is_empty() {
+                            self.log("Намерение зафиксировано, строю план");
+                        }
+                        return Ok(None);
+                    }
+                    crate::intent::Step::Ask(_) | crate::intent::Step::Confirm(_) => unreachable!(),
+                },
+            }
+        }
+        // Ходов не хватило (не должно случаться: сессия сама ограничивает
+        // вопросы) — идём с тем, что успели понять.
+        self.intent_block = session.brief_text();
+        Ok(None)
     }
 
     /// Блокирующий запрос к человеку. Именно это закрывает 2FA и SMS-коды:
