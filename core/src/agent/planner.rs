@@ -80,6 +80,11 @@ fn parse_triage(raw: &str) -> Option<String> {
 /// добавляя в промпт причину отказа. Если валидный граф так и не получен —
 /// вызывающий (agent::run_task) переходит на линейный план из одной цели.
 pub fn make_graph(llm: &LlmClient, task: &str, memory_hints: &str) -> Result<TaskGraph> {
+    // Для пяти доказанных маршрутов модель не участвует в решении: каталог
+    // операторов + Z3 задают порядок, а исполнение проверяется экраном.
+    if let Some(graph) = crate::proof::plan(task) {
+        return Ok(graph);
+    }
     let mut user = format!("ЗАДАЧА ПОЛЬЗОВАТЕЛЯ: {task}\n");
     if !memory_hints.trim().is_empty() {
         // Прошлый опыт в планировщик — иначе агент каждый раз заново

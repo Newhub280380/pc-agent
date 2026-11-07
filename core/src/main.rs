@@ -27,6 +27,7 @@ mod logic;
 mod memory;
 mod optimize;
 mod platform;
+mod proof;
 mod radar;
 mod retry;
 mod sandbox;

@@ -243,12 +243,14 @@ where
     done
 }
 
-fn with_solver<T>(f: impl FnOnce(&Context, &Solver) -> T) -> T {
+pub(crate) fn with_solver<T>(f: impl FnOnce(&Context, &Solver) -> T) -> T {
     // У Z3 свой глобальный аллокатор. Параллельные контексты из `cargo test`
     // на части сборок падают, поэтому доказательства идут по одному.
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let cfg = Config::new();
+    let mut cfg = Config::new();
+    // Планировщик операторов читает модель Z3; обычным проверкам это не мешает.
+    cfg.set_model_generation(true);
     let ctx = Context::new(&cfg);
     let solver = Solver::new(&ctx);
     f(&ctx, &solver)
