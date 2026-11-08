@@ -712,15 +712,11 @@ fn requested_reel_count(task: &str) -> usize {
         .collect();
     let count = tokens.iter().enumerate().find_map(|(index, token)| {
         if token.chars().all(|c| c.is_ascii_digit())
-            && tokens
-                .iter()
-                .skip(index + 1)
-                .take(3)
-                .any(|next| {
-                    ["ролик", "рилс", "reel", "видео", "публикац", "пост"]
-                        .iter()
-                        .any(|stem| next.starts_with(stem) || next.contains(stem))
-                })
+            && tokens.iter().skip(index + 1).take(3).any(|next| {
+                ["ролик", "рилс", "reel", "видео", "публикац", "пост"]
+                    .iter()
+                    .any(|stem| next.starts_with(stem) || next.contains(stem))
+            })
         {
             Some(token.parse::<usize>().unwrap_or(12))
         } else {
@@ -845,14 +841,8 @@ mod tests {
             classify("изучи аккаунт Instagram и последние рилс"),
             Some(TaskKind::InstagramResearch)
         );
-        assert_eq!(
-            classify("проанализируй ролик"),
-            None
-        );
-        assert_eq!(
-            classify("проанализируй ролик с камеры"),
-            None
-        );
+        assert_eq!(classify("проанализируй ролик"), None);
+        assert_eq!(classify("проанализируй ролик с камеры"), None);
         assert_eq!(
             classify("проанализируй ролик в instagram"),
             Some(TaskKind::InstagramResearch)
