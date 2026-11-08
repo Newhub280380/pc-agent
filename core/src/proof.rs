@@ -531,8 +531,7 @@ pub fn classify(task: &str) -> Option<TaskKind> {
     let metrics = stem_hit(&tokens, &["метрик", "insight", "статистик", "охват"]);
     let account = stem_hit(&tokens, &["аккаунт", "профил", "страниц"]);
     let research_action = stem_hit(&tokens, &["изуч", "анализ", "разбер", "исслед"]);
-    let research_subject =
-        instagram || stem_hit(&tokens, &["аккаунт", "профил", "ролик", "рилс", "reel"]);
+    let research_subject = instagram || stem_hit(&tokens, &["рилс", "reel"]);
     let render = stem_hit(
         &tokens,
         &["ролик", "видео", "рендер", "render", "swap", "лица"],
@@ -831,6 +830,14 @@ mod tests {
         );
         assert_eq!(
             classify("проанализируй ролик"),
+            None
+        );
+        assert_eq!(
+            classify("проанализируй ролик с камеры"),
+            None
+        );
+        assert_eq!(
+            classify("проанализируй ролик в instagram"),
             Some(TaskKind::InstagramResearch)
         );
         assert_eq!(classify("исследуй новые методы"), None);
