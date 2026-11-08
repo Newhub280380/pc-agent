@@ -211,7 +211,7 @@ impl Gate {
         )
     }
 
-    fn close(&self, route_id: &str, report: &str) -> Value {
+    fn close(&mut self, route_id: &str, report: &str) -> Value {
         let Some((graph, observed)) = self.routes.get(route_id) else {
             return refusal(format!("неизвестный маршрут {route_id}"));
         };
@@ -223,9 +223,12 @@ impl Gate {
         self.close_after_proof(route_id, &verdict)
     }
 
-    fn close_after_proof(&self, route_id: &str, verdict: &endoscope::Verdict) -> Value {
+    fn close_after_proof(&mut self, route_id: &str, verdict: &endoscope::Verdict) -> Value {
         match close_endoscope_verdict(verdict) {
-            Ok(()) => tool_result(json!({"status":"closed","route_id":route_id}), false),
+            Ok(()) => {
+                self.routes.remove(route_id);
+                tool_result(json!({"status":"closed","route_id":route_id}), false)
+            }
             Err(reason) => refusal(reason),
         }
     }
@@ -607,6 +610,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("эндоскоп не настроен"));
+
+        let response = gate.close_after_proof(&route_id, &endoscope::Verdict::Proven);
+        assert_eq!(response["isError"], false);
+        assert_eq!(response_text(&response)["status"], "closed");
+        assert!(!gate.routes.contains_key(&route_id));
+
+        let later = gate.close(&route_id, "готово");
+        assert_eq!(later["isError"], true);
+        assert!(response_text(&later)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("неизвестный маршрут"));
     }
 
     #[test]
