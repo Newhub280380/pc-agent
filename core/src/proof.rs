@@ -13,6 +13,7 @@ use z3::ast::{Ast, Bool, Int};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     InstagramPost,
+    InstagramResearch,
     MetricsSnapshot,
     DirectInbox,
     RenderReel,
@@ -23,6 +24,7 @@ impl TaskKind {
     fn name(self) -> &'static str {
         match self {
             Self::InstagramPost => "instagram_post",
+            Self::InstagramResearch => "instagram_research",
             Self::MetricsSnapshot => "metrics_snapshot",
             Self::DirectInbox => "direct_inbox",
             Self::RenderReel => "render_reel",
@@ -33,6 +35,7 @@ impl TaskKind {
     fn goal_fact(self) -> &'static str {
         match self {
             Self::InstagramPost => "goal:instagram_post",
+            Self::InstagramResearch => "goal:instagram_research",
             Self::MetricsSnapshot => "goal:metrics_snapshot",
             Self::DirectInbox => "goal:direct_inbox",
             Self::RenderReel => "goal:render_reel",
@@ -44,6 +47,11 @@ impl TaskKind {
         let base = vec!["env:pc", "env:browser"];
         match self {
             Self::InstagramPost | Self::MetricsSnapshot | Self::DirectInbox => {
+                let mut facts = base;
+                facts.push("env:instagram_account");
+                facts
+            }
+            Self::InstagramResearch => {
                 let mut facts = base;
                 facts.push("env:instagram_account");
                 facts
@@ -61,6 +69,78 @@ impl TaskKind {
             }
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        self.name()
+    }
+
+    /// Внешние предпосылки, которые маршрут не может получить сам.
+    pub fn needs(self) -> Vec<(&'static str, &'static str)> {
+        let mut needs = vec![
+            (
+                "env:pc",
+                "Доступен компьютер, на котором выполняется задача",
+            ),
+            (
+                "env:browser",
+                "Доступен браузер для работы с веб-интерфейсом",
+            ),
+        ];
+        match self {
+            Self::InstagramPost => {
+                needs.extend([
+                    (
+                        "env:instagram_account",
+                        "Доступна авторизованная сессия нужного аккаунта Instagram",
+                    ),
+                    ("env:media_file", "Предоставлен медиафайл для публикации"),
+                ]);
+            }
+            Self::InstagramResearch => needs.push((
+                "env:instagram_account",
+                "Доступна авторизованная сессия исследуемого аккаунта Instagram",
+            )),
+            Self::MetricsSnapshot | Self::DirectInbox => needs.push((
+                "env:instagram_account",
+                "Доступна авторизованная сессия нужного аккаунта Instagram",
+            )),
+            Self::RenderReel => {
+                needs.extend([
+                    (
+                        "env:storage",
+                        "Доступно хранилище для исходников и результата",
+                    ),
+                    (
+                        "env:media_file",
+                        "Предоставлены исходные видео, фото и субтитры",
+                    ),
+                ]);
+            }
+            Self::DeployCrm => {
+                needs.extend([
+                    ("env:git", "Доступен Git и нужный репозиторий CRM"),
+                    (
+                        "env:vercel",
+                        "Есть доступ к Vercel, включая авторизованный токен",
+                    ),
+                ]);
+            }
+        }
+        needs
+    }
+}
+
+#[derive(Debug)]
+pub enum Routing {
+    Route {
+        kind: TaskKind,
+        graph: TaskGraph,
+    },
+    Missing {
+        kind: TaskKind,
+        missing: Vec<String>,
+    },
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +242,30 @@ const CATALOG: &[Operator] = &[
         time_min: 3,
         cost: 2,
         risk: 40,
+    },
+    Operator {
+        kind: TaskKind::InstagramResearch,
+        id: "research_open_profile",
+        goal: "Открыть профиль Instagram для исследования",
+        done_when: "на экране виден профиль исследуемого аккаунта Instagram",
+        requires: &[],
+        produces: &["research:profile"],
+        rollback: "закрыть профиль Instagram",
+        time_min: 2,
+        cost: 1,
+        risk: 5,
+    },
+    Operator {
+        kind: TaskKind::InstagramResearch,
+        id: "research_list_reels",
+        goal: "Открыть список последних роликов профиля",
+        done_when: "на экране виден список запрошенных последних роликов",
+        requires: &["research:profile"],
+        produces: &["research:reels", "goal:instagram_research"],
+        rollback: "вернуться в профиль Instagram",
+        time_min: 2,
+        cost: 1,
+        risk: 5,
     },
     // --- Метрики: закрываются сохранённым срезом чисел, не словами «посмотрел».
     Operator {
@@ -413,7 +517,7 @@ fn exact_hit(tokens: &[&str], words: &[&str]) -> bool {
         .any(|tok| words.iter().copied().any(|word| tok == word))
 }
 
-/// Классифицирует задачу в один из пяти доказанных маршрутов. Всё остальное —
+/// Классифицирует задачу в один из известных доказанных маршрутов. Всё остальное —
 /// `None`, и планировщик уходит к обычной LLM-схеме. Маршрут детерминированный,
 /// поэтому сюда попадает только задача с явными признаками нужного домена.
 pub fn classify(task: &str) -> Option<TaskKind> {
@@ -426,6 +530,9 @@ pub fn classify(task: &str) -> Option<TaskKind> {
     let direct = stem_hit(&tokens, &["директ", "личк"]) || exact_hit(&tokens, &["direct", "dm"]);
     let metrics = stem_hit(&tokens, &["метрик", "insight", "статистик", "охват"]);
     let account = stem_hit(&tokens, &["аккаунт", "профил", "страниц"]);
+    let research_action = stem_hit(&tokens, &["изуч", "анализ", "разбер", "исслед"]);
+    let research_subject =
+        instagram || stem_hit(&tokens, &["аккаунт", "профил", "ролик", "рилс", "reel"]);
     let render = stem_hit(
         &tokens,
         &["ролик", "видео", "рендер", "render", "swap", "лица"],
@@ -442,6 +549,9 @@ pub fn classify(task: &str) -> Option<TaskKind> {
     }
     if metrics && (instagram || account) {
         return Some(TaskKind::MetricsSnapshot);
+    }
+    if research_action && research_subject {
+        return Some(TaskKind::InstagramResearch);
     }
     if render && render_action {
         return Some(TaskKind::RenderReel);
@@ -462,6 +572,13 @@ pub fn classify(task: &str) -> Option<TaskKind> {
 /// вне каталога, дальше работает обычный LLM-планировщик.
 pub fn plan(task: &str) -> Option<TaskGraph> {
     let kind = classify(task)?;
+    if kind == TaskKind::InstagramResearch {
+        return None;
+    }
+    plan_kind(task, kind)
+}
+
+fn plan_kind(task: &str, kind: TaskKind) -> Option<TaskGraph> {
     let ops: Vec<Operator> = CATALOG
         .iter()
         .copied()
@@ -509,6 +626,92 @@ pub fn plan(task: &str) -> Option<TaskGraph> {
     };
     graph.validate().ok()?;
     Some(graph)
+}
+
+/// Строит маршрут только при наличии всех внешних предпосылок.
+pub fn route(task: &str, have: &[String]) -> Routing {
+    let Some(kind) = classify(task) else {
+        return Routing::Unknown;
+    };
+    let missing: Vec<String> = kind
+        .needs()
+        .into_iter()
+        .filter(|(fact, _)| !have.iter().any(|provided| provided == fact))
+        .map(|(_, description)| description.to_string())
+        .collect();
+    if !missing.is_empty() {
+        return Routing::Missing { kind, missing };
+    }
+    let graph = if kind == TaskKind::InstagramResearch {
+        build_research_plan(task)
+    } else {
+        plan(task)
+    };
+    match graph {
+        Some(graph) => Routing::Route { kind, graph },
+        None => Routing::Unknown,
+    }
+}
+
+fn build_research_plan(task: &str) -> Option<TaskGraph> {
+    let mut graph = plan_kind(task, TaskKind::InstagramResearch)?;
+    let reel_count = requested_reel_count(task);
+    let list_index = graph
+        .nodes
+        .iter()
+        .position(|node| node.id == "research_list_reels")?;
+    graph.nodes[list_index].goal = format!("Показать последние ролики профиля (N={reel_count})");
+    graph.nodes[list_index].done_when =
+        format!("на экране виден список последних роликов профиля (N={reel_count})");
+
+    let reel_ids: Vec<String> = (1..=reel_count).map(|i| format!("reel_{i}")).collect();
+    let reels = reel_ids.iter().enumerate().map(|(i, id)| Node {
+        id: id.clone(),
+        goal: format!("Досмотреть ролик №{} до конца и сохранить расшифровку", i + 1),
+        done_when: "«просмотрен целиком, включая последнюю минуту»; виден конец ролика: «таймкод равен длительности»; «расшифровка ролика сохранена»".to_string(),
+        deps: vec!["research_list_reels".to_string()],
+        rollback: String::new(),
+        state: NodeState::Pending,
+        note: String::new(),
+        attempts: 0,
+        rounds: 0,
+        time_min: 1,
+        cost: 1,
+        risk: 5,
+        variants: Vec::new(),
+        chosen: String::new(),
+    });
+    for (offset, reel) in reels.enumerate() {
+        graph.nodes.insert(list_index + 1 + offset, reel);
+    }
+    graph.nodes.push(Node {
+        id: "research_summary".to_string(),
+        goal: format!("Составить выводы по последним роликам (N={reel_count})"),
+        done_when: "в отчёте выполнено «у каждого вывода указан номер ролика и таймкод»"
+            .to_string(),
+        deps: reel_ids,
+        rollback: String::new(),
+        state: NodeState::Pending,
+        note: String::new(),
+        attempts: 0,
+        rounds: 0,
+        time_min: 3,
+        cost: 1,
+        risk: 5,
+        variants: Vec::new(),
+        chosen: String::new(),
+    });
+    graph.validate().ok()?;
+    Some(graph)
+}
+
+fn requested_reel_count(task: &str) -> usize {
+    let digits: String = task
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse::<usize>().unwrap_or(10).clamp(1, 12)
 }
 
 fn solve_order(ops: &[Operator], initial: &[&str], goal: &str) -> Option<Vec<usize>> {
@@ -578,6 +781,24 @@ fn solve_order(ops: &[Operator], initial: &[&str], goal: &str) -> Option<Vec<usi
 mod tests {
     use super::*;
 
+    fn task_for(kind: TaskKind) -> &'static str {
+        match kind {
+            TaskKind::InstagramPost => "сделай пост в instagram",
+            TaskKind::InstagramResearch => "исследуй аккаунт instagram",
+            TaskKind::MetricsSnapshot => "сними метрики instagram",
+            TaskKind::DirectInbox => "прочитай директ instagram",
+            TaskKind::RenderReel => "отрендери ролик с заменой лица",
+            TaskKind::DeployCrm => "задеплой crm на vercel",
+        }
+    }
+
+    fn have_for(kind: TaskKind) -> Vec<String> {
+        kind.needs()
+            .into_iter()
+            .map(|(fact, _)| fact.to_string())
+            .collect()
+    }
+
     #[test]
     fn classify_known_tasks() {
         assert_eq!(
@@ -604,6 +825,91 @@ mod tests {
         assert_eq!(classify("постоянно проверяй crm"), None);
         assert_eq!(classify("сделай пост"), None);
         assert_eq!(classify("сделай видео для сайта"), None);
+        assert_eq!(
+            classify("изучи аккаунт Instagram и последние рилс"),
+            Some(TaskKind::InstagramResearch)
+        );
+        assert_eq!(
+            classify("проанализируй ролик"),
+            Some(TaskKind::InstagramResearch)
+        );
+        assert_eq!(classify("исследуй новые методы"), None);
+        assert_eq!(classify("разбери файл отчёта"), None);
+    }
+
+    #[test]
+    fn routing_requires_every_declared_fact_for_each_kind() {
+        for kind in [
+            TaskKind::InstagramPost,
+            TaskKind::InstagramResearch,
+            TaskKind::MetricsSnapshot,
+            TaskKind::DirectInbox,
+            TaskKind::RenderReel,
+            TaskKind::DeployCrm,
+        ] {
+            let have = have_for(kind);
+            match route(task_for(kind), &have) {
+                Routing::Route {
+                    kind: actual,
+                    mut graph,
+                } => {
+                    assert_eq!(actual, kind);
+                    assert!(graph.validate().is_ok());
+                }
+                other => panic!("ожидался маршрут {kind:?}, получено {other:?}"),
+            }
+
+            match route(task_for(kind), &[]) {
+                Routing::Missing {
+                    kind: actual,
+                    missing,
+                } => {
+                    assert_eq!(actual, kind);
+                    assert_eq!(missing.len(), kind.needs().len());
+                }
+                other => panic!("ожидались недостающие предпосылки {kind:?}: {other:?}"),
+            }
+        }
+        assert!(matches!(route("придумай слоган", &[]), Routing::Unknown));
+    }
+
+    #[test]
+    fn research_route_has_capped_full_watch_steps_and_summary_dependencies() {
+        let kind = TaskKind::InstagramResearch;
+        let have = have_for(kind);
+        let Routing::Route { mut graph, .. } = route("исследуй последние 20 reels", &have)
+        else {
+            panic!("ожидался маршрут исследования");
+        };
+        let reels: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.id.starts_with("reel_"))
+            .collect();
+        assert_eq!(reels.len(), 12);
+        assert!(reels.iter().all(|node| {
+            node.done_when.contains("включая последнюю минуту")
+                && node.done_when.contains("таймкод равен длительности")
+                && node.done_when.contains("расшифровка ролика сохранена")
+        }));
+        let summary = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "research_summary")
+            .unwrap();
+        assert_eq!(summary.deps.len(), 12);
+        assert!(reels.iter().all(|reel| summary.deps.contains(&reel.id)));
+        assert!(summary
+            .done_when
+            .contains("у каждого вывода указан номер ролика и таймкод"));
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn research_reel_count_defaults_to_ten_and_caps_at_twelve() {
+        assert_eq!(requested_reel_count("исследуй reels Instagram"), 10);
+        assert_eq!(requested_reel_count("исследуй 3 reels Instagram"), 3);
+        assert_eq!(requested_reel_count("исследуй 99 reels Instagram"), 12);
     }
 
     #[test]
@@ -645,5 +951,6 @@ mod tests {
     #[test]
     fn unknown_task_has_no_proof_plan() {
         assert!(plan("придумай слоган для новой коллекции").is_none());
+        assert!(plan("изучи аккаунт Instagram").is_none());
     }
 }

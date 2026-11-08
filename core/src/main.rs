@@ -23,6 +23,7 @@ mod fuzz;
 mod gui;
 mod intent;
 mod jev;
+mod jev_gate;
 mod llm;
 mod logic;
 mod memory;
@@ -63,6 +64,24 @@ const CONSENT_TEXT: &str = "\
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--mcp") {
+        jev_gate::serve_stdio()?;
+        return Ok(());
+    }
+    if let Some(task) = flag_value(&args, "--route") {
+        let have: Vec<String> = flag_value(&args, "--have")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|fact| !fact.is_empty())
+            .map(str::to_string)
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&jev_gate::route_json(&task, &have))?
+        );
+        return Ok(());
+    }
     // Два служебных режима без GUI: нужны, чтобы Windows-машина (в том числе
     // CI) могла доказать, что .exe реально стартует и видит экран.
     if args.iter().any(|a| a == "--selfcheck") {
