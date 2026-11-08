@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 /// Максимум узлов. Больше — почти всегда признак того, что модель
 /// расписала задачу до уровня «нажми пробел», и такой план не выполним.
 pub const MAX_NODES: usize = 40;
-const MAX_DEPS: usize = 8;
+const MAX_DEPS: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
