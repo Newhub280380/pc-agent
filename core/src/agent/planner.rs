@@ -85,6 +85,11 @@ pub fn make_graph(
     memory_hints: &str,
     intent: &str,
 ) -> Result<TaskGraph> {
+    // Для пяти доказанных маршрутов модель не участвует в решении: каталог
+    // операторов + Z3 задают порядок, а исполнение проверяется экраном.
+    if let Some(graph) = crate::proof::plan(task) {
+        return Ok(graph);
+    }
     let mut user = format!("ЗАДАЧА ПОЛЬЗОВАТЕЛЯ: {task}\n");
     let intent = intent_section(intent);
     if !intent.is_empty() {
