@@ -552,24 +552,42 @@ impl Agent {
         // фразы «цель видна выполненной».
         let mut graph = if let Some(snap) = &resumed {
             snap.graph.clone()
-        } else if let Some(g) = proof_graph {
-            g
-        } else if let Some(g) = replayed {
-            g
         } else {
-            match planner::make_graph(&self.llm, task, &hints, &self.intent_block) {
-                Ok(g) => g,
-                Err(e) => {
+            let routed = crate::coordinator::route(
+                crate::coordinator::Mode::from_env(),
+                proof_graph,
+                replayed,
+            );
+            match routed {
+                crate::coordinator::Routed::Plan(g, r) => {
+                    self.log(format!("Координатор: {}", r.name()));
+                    g
+                }
+                crate::coordinator::Routed::Refused(why) => {
+                    self.log(format!("Координатор: {why}"));
+                    return Ok(TaskReport::open(format!("Задача не взята: {why}")));
+                }
+                crate::coordinator::Routed::Model => {
                     self.log(format!(
-                        "Планировщик не дал валидный граф ({e}), иду одной целью"
+                        "Координатор: {}",
+                        crate::coordinator::Route::Model.name()
                     ));
-                    let mut g = TaskGraph::linear(task, &[(task.to_string(), task.to_string())]);
-                    if let Err(err) = g.validate() {
-                        return Ok(TaskReport::open(format!(
+                    match planner::make_graph(&self.llm, task, &hints, &self.intent_block) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            self.log(format!(
+                                "Планировщик не дал валидный граф ({e}), иду одной целью"
+                            ));
+                            let mut g =
+                                TaskGraph::linear(task, &[(task.to_string(), task.to_string())]);
+                            if let Err(err) = g.validate() {
+                                return Ok(TaskReport::open(format!(
                             "План не построен: {e}. Запасной план тоже не прошёл проверку: {err}"
                         )));
+                            }
+                            g
+                        }
                     }
-                    g
                 }
             }
         };
@@ -630,6 +648,12 @@ impl Agent {
         // регистрировался, уходил на главную — и узел «страница входа»
         // уже нельзя было закрыть, задача крутилась до лимита.
         let mut seen_screens: Vec<Evidence> = vec![];
+        // Контракт глубины: разделы считает код по экрану, не модель.
+        let mut coverage =
+            crate::coordinator::wants_depth(task).then(crate::coordinator::Coverage::default);
+        if coverage.is_some() {
+            self.log("Контракт глубины: задача закроется только после обхода всех разделов");
+        }
         // Экран на старте отката: закрываем откат только если он изменился.
         let mut rollback_origin: HashMap<String, Evidence> = HashMap::new();
         if phone_mode {
@@ -726,7 +750,13 @@ impl Agent {
                             }
                         }
                         return Ok(self.close_if_proven(
-                            task, &graph, &trace, &observed, &criteria, phone_mode,
+                            task,
+                            &graph,
+                            &trace,
+                            &observed,
+                            &criteria,
+                            phone_mode,
+                            coverage.as_ref(),
                         ));
                     }
                 },
@@ -782,6 +812,9 @@ impl Agent {
                 seen_screens.remove(0);
             }
             seen_screens.push(ev_before.clone());
+            if let Some(c) = coverage.as_mut() {
+                c.observe(&view.prompt);
+            }
             if let Work::Rollback { id, .. } = &work {
                 rollback_origin
                     .entry(id.clone())
@@ -852,6 +885,9 @@ impl Agent {
             // экрана модель иначе «забывает» исходную цель человека.
             if !self.intent_block.is_empty() {
                 prompt.push_str(&format!("\n{}\n", self.intent_block));
+            }
+            if let Some(c) = &coverage {
+                prompt.push_str(&c.prompt_block());
             }
             if !digest.is_empty() {
                 prompt.push_str(&format!("\nЧТО Я УЖЕ ЗНАЮ ПРО {shelf}: {digest}\n"));
@@ -1384,7 +1420,13 @@ impl Agent {
                                 "Задача закрыта: Z3 подтвердил решение, текст finish не использован как доказательство",
                             );
                             let proven = self.close_if_proven(
-                                task, &graph, &trace, &observed, &criteria, phone_mode,
+                                task,
+                                &graph,
+                                &trace,
+                                &observed,
+                                &criteria,
+                                phone_mode,
+                                coverage.as_ref(),
                             );
                             let m = self.mem_lock();
                             let note = crate::text::truncate(&proven.text, 400);
@@ -1620,6 +1662,7 @@ impl Agent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn close_if_proven(
         &self,
         task: &str,
@@ -1628,6 +1671,7 @@ impl Agent {
         observed: &HashMap<String, bool>,
         criteria: &[String],
         phone_mode: bool,
+        coverage: Option<&crate::coordinator::Coverage>,
     ) -> TaskReport {
         let evidence = match self.perceive(phone_mode, false) {
             Ok(view) => Evidence::from_prompt(&view.prompt),
@@ -1663,6 +1707,12 @@ impl Agent {
         {
             return TaskReport::open(format!(
                 "Задача не закрыта: {why}\n\n{}",
+                self.finish_report(graph, trace)
+            ));
+        }
+        if let Some(gap) = coverage.and_then(|c| c.gap()) {
+            return TaskReport::open(format!(
+                "Задача не закрыта: {gap}\n\n{}",
                 self.finish_report(graph, trace)
             ));
         }

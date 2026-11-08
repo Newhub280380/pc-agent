@@ -128,13 +128,14 @@ fn canonical_key(k: &str) -> String {
 /// Ключи, которые читаются через `std::env` в разных местах ядра: порог
 /// смысловой памяти, адрес и прогон эндоскопа, выбор солвера, таймаут
 /// зависания и ключ быстрых решений.
-pub const CORE_ENV_KEYS: [&str; 7] = [
+pub const CORE_ENV_KEYS: [&str; 8] = [
     "MEMORY_SEMANTIC_MIN",
     "ENDOSCOPE_URL",
     "ENDOSCOPE_RUN_ID",
     "PCAGENT_OPTIMIZER",
     "PCAGENT_HANG_SEC",
     "PCAGENT_INTENT",
+    "PCAGENT_ROUTE",
     "OPENROUTER_API_KEY",
 ];
 
@@ -671,6 +672,9 @@ PCAGENT_HANG_SEC=30
 # Слой намерения: auto — уточнять цель перед планом, confirm — ещё и
 # показывать понимание на подтверждение, off — старый путь без него
 PCAGENT_INTENT=auto
+# Координатор: open — без доказанного маршрута план строит модель (с пометкой),
+# strict — такая задача остаётся открытой, модель маршрут не выбирает
+PCAGENT_ROUTE=open
 "#
     )
 }

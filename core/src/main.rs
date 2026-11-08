@@ -15,6 +15,7 @@ mod agent;
 mod android;
 mod checkpoint;
 mod config;
+mod coordinator;
 mod decisions;
 mod endoscope;
 mod failure;
