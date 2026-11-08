@@ -1720,6 +1720,7 @@ impl Agent {
             observed,
             &crate::endoscope::Verdict::Proven,
             crate::back_gate::EndoscopePolicy::Optional,
+            "",
         ) {
             return TaskReport::open(format!(
                 "Задача не закрыта: {}\n\n{}",
@@ -1752,6 +1753,7 @@ impl Agent {
             observed,
             &verdict,
             crate::back_gate::EndoscopePolicy::Optional,
+            "",
         ) {
             Ok(seal) => {
                 self.remember_plan(task, graph);

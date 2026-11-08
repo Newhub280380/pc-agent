@@ -47,18 +47,27 @@ pub struct Seal {
     proof: Vec<&'static str>,
     /// Момент закрытия (UTC, RFC 3339).
     closed_at: String,
+    /// Якорь доказательств: цепной хэш свидетелей шлюза
+    /// (`witness::Ledger::anchor`). Пустая строка у встроенного агента,
+    /// у которого доказательства живут в его собственном trace.
+    anchor: String,
     _private: (),
 }
 
 impl Seal {
-    fn new(subject: &str, path: Vec<String>, proof: Vec<&'static str>) -> Self {
+    fn new(subject: &str, path: Vec<String>, proof: Vec<&'static str>, anchor: &str) -> Self {
         Self {
             subject: subject.to_string(),
             path,
             proof,
             closed_at: chrono::Utc::now().to_rfc3339(),
+            anchor: anchor.to_string(),
             _private: (),
         }
+    }
+
+    pub fn anchor(&self) -> &str {
+        &self.anchor
     }
 
     pub fn subject(&self) -> &str {
@@ -79,6 +88,7 @@ impl Seal {
             "path": self.path,
             "proof": self.proof,
             "closed_at": self.closed_at,
+            "anchor": self.anchor,
         })
     }
 }
@@ -329,6 +339,7 @@ pub fn seal_route(
     observed: &HashMap<String, bool>,
     verdict: &endoscope::Verdict,
     policy: EndoscopePolicy,
+    anchor: &str,
 ) -> Result<Seal, Box<Refusal>> {
     let mut refusal = inspect_route(subject, graph, observed);
     if !refusal.is_empty() {
@@ -361,7 +372,15 @@ pub fn seal_route(
         endoscope::Verdict::Proven => "endoscope",
         _ => "endoscope_not_configured",
     });
-    Ok(Seal::new(subject, graph.completed_order.clone(), proof))
+    if !anchor.is_empty() {
+        proof.push("witness_anchor");
+    }
+    Ok(Seal::new(
+        subject,
+        graph.completed_order.clone(),
+        proof,
+        anchor,
+    ))
 }
 
 /// Закрытие исследования корпуса через задние ворота.
@@ -433,7 +452,7 @@ pub fn seal_study(
         endoscope::Verdict::Proven => "endoscope",
         _ => "endoscope_not_configured",
     });
-    Ok((Seal::new(subject, path, proof), verified))
+    Ok((Seal::new(subject, path, proof, ""), verified))
 }
 
 #[cfg(test)]
@@ -469,6 +488,7 @@ mod tests {
             &observed_all(&graph),
             &endoscope::Verdict::Proven,
             EndoscopePolicy::Required,
+            "",
         )
         .unwrap();
         assert_eq!(seal.path(), ["n1", "n2", "n3"]);
@@ -491,6 +511,7 @@ mod tests {
             &observed_all(&graph),
             &endoscope::Verdict::Proven,
             EndoscopePolicy::Required,
+            "",
         )
         .unwrap_err();
         let ids: Vec<&str> = refusal
@@ -516,6 +537,7 @@ mod tests {
             &observed,
             &endoscope::Verdict::Proven,
             EndoscopePolicy::Required,
+            "",
         )
         .unwrap_err();
         assert!(refusal.unvisited.is_empty());
@@ -535,6 +557,7 @@ mod tests {
             &observed_all(&graph),
             &endoscope::Verdict::Proven,
             EndoscopePolicy::Required,
+            "",
         )
         .unwrap_err();
         assert!(refusal
@@ -555,6 +578,7 @@ mod tests {
             &observed_all(&graph),
             &endoscope::Verdict::Proven,
             EndoscopePolicy::Required,
+            "",
         )
         .unwrap_err();
         assert_eq!(
@@ -574,6 +598,7 @@ mod tests {
             &observed,
             &endoscope::Verdict::NotConfigured,
             EndoscopePolicy::Required,
+            "",
         )
         .unwrap_err();
         assert!(refused.proof_failures[0].contains("эндоскоп не настроен"));
@@ -583,6 +608,7 @@ mod tests {
             &observed,
             &endoscope::Verdict::NotConfigured,
             EndoscopePolicy::Optional,
+            "",
         )
         .unwrap();
         assert!(sealed.json()["proof"]
@@ -596,6 +622,7 @@ mod tests {
             &observed,
             &endoscope::Verdict::Disproven("нет записи".into()),
             EndoscopePolicy::Optional,
+            "",
         )
         .unwrap_err();
         assert!(disproven.proof_failures[0].contains("не доказано"));
@@ -610,6 +637,7 @@ mod tests {
             &HashMap::new(),
             &endoscope::Verdict::Proven,
             EndoscopePolicy::Required,
+            "",
         )
         .unwrap_err();
         assert!(refusal.summary().contains("граф пуст"));

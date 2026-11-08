@@ -42,6 +42,7 @@ mod supervisor;
 mod text;
 mod vision;
 mod watchdog;
+mod witness;
 
 use agent::{Agent, AgentCommand, AgentConfig, AgentEvent};
 use anyhow::Result;

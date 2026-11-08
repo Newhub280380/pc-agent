@@ -1,5 +1,5 @@
 use crate::agent::graph::{NodeState, TaskGraph};
-use crate::{back_gate, corpus, endoscope, ledger, logic, proof};
+use crate::{back_gate, corpus, endoscope, ledger, logic, proof, witness};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -16,6 +16,11 @@ pub struct Gate {
     /// только `close`/`close_study` после `back_gate::seal_*`; повторное
     /// закрытие того же id отклоняется, а `jev_status` показывает печать.
     closed: HashMap<String, back_gate::Seal>,
+    /// Политика доказательств (профиль strict/custom). Меняет пороги, но
+    /// не само требование: без свидетеля шлюза шаг не закрывается.
+    policy: witness::Policy,
+    /// Архив закрытых маршрутов (журнал и свидетели) для `jev_report`.
+    archive: HashMap<String, RouteState>,
     /// Подмена приговора эндоскопа только в тестах: в бою приговор всегда
     /// берётся из `endoscope::judge_report`, обходного пути нет.
     #[cfg(test)]
@@ -29,8 +34,16 @@ type Judge = Box<dyn Fn(&str) -> endoscope::Verdict>;
 struct RouteState {
     task: String,
     graph: TaskGraph,
+    /// Подтверждение шлюза по узлу: `true` ставится только когда критерий
+    /// узла сверен с содержимым, захваченным самим шлюзом (свидетели) или
+    /// собранным его сборщиком. Слова агента сюда не попадают.
     observed: HashMap<String, bool>,
     sources: Vec<ledger::Source>,
+    /// Предпосылки, заявленные вызывающей стороной в `jev_route`. Шлюз их
+    /// не проверяет и честно показывает в отчёте как допущения.
+    have: Vec<String>,
+    /// Свидетели и журнал действий маршрута.
+    ledger: witness::Ledger,
 }
 
 struct StudyState {
@@ -69,6 +82,8 @@ impl Default for Gate {
             next_study_id: 0,
             extractor: None,
             closed: HashMap::new(),
+            policy: witness::Policy::from_env(),
+            archive: HashMap::new(),
             #[cfg(test)]
             judge: None,
         }
@@ -155,17 +170,76 @@ impl Gate {
                 self.route_task(task, &have)
             }
             "jev_step_done" => {
-                let (Some(route_id), Some(step_id), Some(evidence)) = (
+                let (Some(route_id), Some(step_id)) = (
                     args.get("route_id").and_then(Value::as_str),
                     args.get("step_id").and_then(Value::as_str),
-                    args.get("evidence").and_then(Value::as_str),
                 ) else {
                     return tool_result(
-                        json!({"status":"refused","reason":"route_id, step_id и evidence должны быть строками"}),
+                        json!({"status":"refused","reason":"route_id и step_id должны быть строками"}),
                         true,
                     );
                 };
-                self.step_done(route_id, step_id, evidence)
+                // Старый параметр `evidence` (свободный текст агента)
+                // больше не доказательство. Он отклоняется явно, чтобы
+                // агент не думал, что текст «не дошёл».
+                if args.get("evidence").is_some() {
+                    return tool_result(
+                        json!({
+                            "status":"refused",
+                            "reason":"параметр evidence упразднён: доказательством служат только свидетели шлюза — сначала jev_observe, затем witness_ids"
+                        }),
+                        true,
+                    );
+                }
+                let witness_ids = match args.get("witness_ids") {
+                    Some(Value::Array(values)) => {
+                        let mut ids = Vec::with_capacity(values.len());
+                        for value in values {
+                            let Some(id) = value.as_str() else {
+                                return tool_result(
+                                    json!({"status":"refused","reason":"элементы witness_ids должны быть строками"}),
+                                    true,
+                                );
+                            };
+                            ids.push(id.to_string());
+                        }
+                        ids
+                    }
+                    _ => {
+                        return tool_result(
+                            json!({"status":"refused","reason":"witness_ids должен быть массивом идентификаторов от jev_observe"}),
+                            true,
+                        )
+                    }
+                };
+                let note = args.get("note").and_then(Value::as_str).unwrap_or_default();
+                self.step_done(route_id, step_id, &witness_ids, note)
+            }
+            "jev_observe" => {
+                let (Some(route_id), Some(step_id), Some(probe)) = (
+                    args.get("route_id").and_then(Value::as_str),
+                    args.get("step_id").and_then(Value::as_str),
+                    args.get("probe"),
+                ) else {
+                    return tool_result(
+                        json!({"status":"refused","reason":"route_id, step_id должны быть строками, probe — объектом"}),
+                        true,
+                    );
+                };
+                let probe = match witness::Probe::from_json(probe) {
+                    Ok(probe) => probe,
+                    Err(reason) => return refusal(reason),
+                };
+                self.observe(route_id, step_id, probe)
+            }
+            "jev_report" => {
+                let Some(id) = args.get("id").and_then(Value::as_str) else {
+                    return tool_result(
+                        json!({"status":"refused","reason":"id должен быть строкой"}),
+                        true,
+                    );
+                };
+                self.report(id)
             }
             "jev_collect" => {
                 let Some(route_id) = args.get("route_id").and_then(Value::as_str) else {
@@ -280,6 +354,8 @@ impl Gate {
                         graph,
                         observed,
                         sources: Vec::new(),
+                        have: have.to_vec(),
+                        ledger: witness::Ledger::default(),
                     },
                 );
                 tool_result(result, false)
@@ -287,11 +363,111 @@ impl Gate {
         }
     }
 
-    fn step_done(&mut self, route_id: &str, step_id: &str, evidence: &str) -> Value {
-        let Some(route) = self.routes.get(route_id) else {
+    /// Наблюдение шлюза ради доказательства шага. Разрешено только для
+    /// узла, который сейчас на рельсах (готов по зависимостям и ещё не
+    /// закрыт): попытка наблюдать «вперёд» или «назад» отклоняется и
+    /// записывается в журнал как `off_rail`. Так агент физически не может
+    /// собрать доказательства по трём роликам и закрыть тридцать.
+    fn observe(&mut self, route_id: &str, step_id: &str, probe: witness::Probe) -> Value {
+        let Some(route) = self.routes.get_mut(route_id) else {
             return refusal(format!("неизвестный маршрут {route_id}"));
         };
         let Some(node) = route.graph.nodes.iter().find(|node| node.id == step_id) else {
+            route
+                .ledger
+                .log("jev_observe", step_id, "refused", "неизвестный шаг");
+            return refusal(format!("неизвестный шаг {step_id}"));
+        };
+        if route.is_research() && (collector_owned_step(step_id) || step_id == "research_summary") {
+            route.ledger.log(
+                "jev_observe",
+                step_id,
+                "refused",
+                "шаг принадлежит сборщику шлюза",
+            );
+            return refusal(
+                "этот шаг доказывает только сборщик шлюза, свидетели не нужны".to_string(),
+            );
+        }
+        if node.state == NodeState::Done {
+            route
+                .ledger
+                .log("jev_observe", step_id, "refused", "шаг уже закрыт");
+            return refusal(format!("шаг {step_id} уже закрыт"));
+        }
+        let on_rail = route.graph.ready().iter().any(|ready| ready.id == step_id);
+        if !on_rail {
+            let current: Vec<String> = route
+                .graph
+                .ready()
+                .iter()
+                .map(|ready| ready.id.clone())
+                .collect();
+            route.ledger.log(
+                "jev_observe",
+                step_id,
+                "off_rail",
+                format!("текущие узлы пути: {}", current.join(", ")),
+            );
+            return tool_result(
+                json!({
+                    "status":"refused",
+                    "reason":format!("шаг {step_id} сейчас не на рельсах: его зависимости не закрыты"),
+                    "current_steps":current
+                }),
+                true,
+            );
+        }
+        if let Err(reason) = self.policy.allows(&probe) {
+            route
+                .ledger
+                .log("jev_observe", step_id, "refused", reason.clone());
+            return refusal(reason);
+        }
+        let locator = probe.locator();
+        match witness::observe(probe) {
+            Ok(observation) => {
+                let witness = route.ledger.record(route_id, step_id, observation);
+                tool_result(
+                    json!({
+                        "status":"observed",
+                        "witness":witness.json(),
+                        "next":"jev_step_done"
+                    }),
+                    false,
+                )
+            }
+            Err(reason) => {
+                route.ledger.log(
+                    "jev_observe",
+                    step_id,
+                    "refused",
+                    format!("{locator}: {reason}"),
+                );
+                refusal(reason)
+            }
+        }
+    }
+
+    /// Закрыть шаг по свидетелям шлюза. Решение принимает код: каждый
+    /// свидетель должен существовать, принадлежать этому маршруту и этому
+    /// шагу, а захваченное содержимое — удовлетворять критерию `done_when`
+    /// и порогу профиля. `note` агента сохраняется в журнал как
+    /// непроверенный комментарий и ни на что не влияет.
+    fn step_done(
+        &mut self,
+        route_id: &str,
+        step_id: &str,
+        witness_ids: &[String],
+        note: &str,
+    ) -> Value {
+        let Some(route) = self.routes.get_mut(route_id) else {
+            return refusal(format!("неизвестный маршрут {route_id}"));
+        };
+        let Some(node) = route.graph.nodes.iter().find(|node| node.id == step_id) else {
+            route
+                .ledger
+                .log("jev_step_done", step_id, "refused", "неизвестный шаг");
             return refusal(format!("неизвестный шаг {step_id}"));
         };
         if route.is_research() && collector_owned_step(step_id) {
@@ -301,49 +477,77 @@ impl Gate {
             return refusal("сводку закрывает только проверка отчёта шлюзом".to_string());
         }
         let done_when = node.done_when.clone();
-        if evidence.trim().is_empty() {
-            return refusal("доказательство пустое".to_string());
+        if witness_ids.is_empty() {
+            route
+                .ledger
+                .log("jev_step_done", step_id, "refused", "без свидетелей");
+            return refusal(
+                "нет свидетелей: сначала jev_observe для этого шага, затем передайте witness_ids"
+                    .to_string(),
+            );
         }
-        let evidence_lower = evidence.to_lowercase();
-        let groups = quoted_fragment_groups(&done_when);
-        if groups.len() == 1 {
-            let missing: Vec<String> = groups[0]
-                .iter()
-                .filter(|fragment| !evidence_lower.contains(&fragment.to_lowercase()))
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
-                return refusal(format!(
-                    "в доказательстве отсутствует обязательный фрагмент: {}",
-                    missing.join("; ")
-                ));
+        let mut witnesses = Vec::with_capacity(witness_ids.len());
+        for id in witness_ids {
+            match route.ledger.get(id) {
+                Some(witness) if witness.step_id == step_id => witnesses.push(witness),
+                Some(witness) => {
+                    let reason = format!(
+                        "свидетель {id} принадлежит шагу {}, а не {step_id}",
+                        witness.step_id
+                    );
+                    route
+                        .ledger
+                        .log("jev_step_done", step_id, "refused", reason.clone());
+                    return refusal(reason);
+                }
+                None => {
+                    let reason = format!("свидетель {id} неизвестен шлюзу для маршрута {route_id}");
+                    route
+                        .ledger
+                        .log("jev_step_done", step_id, "refused", reason.clone());
+                    return refusal(reason);
+                }
             }
-        } else if !groups.is_empty()
-            && !groups.iter().any(|group| {
-                group
-                    .iter()
-                    .all(|fragment| evidence_lower.contains(&fragment.to_lowercase()))
-            })
-        {
-            let alternatives: Vec<String> = groups.iter().map(|group| group.join(" + ")).collect();
-            return refusal(format!(
-                "в доказательстве отсутствует подходящий вариант: {}",
-                alternatives.join(" или ")
-            ));
         }
-        let route = self.routes.get_mut(route_id).unwrap();
+        if let Err(reason) = witness::satisfies(&done_when, &witnesses, &self.policy) {
+            route
+                .ledger
+                .log("jev_step_done", step_id, "refused", reason.clone());
+            return refusal(reason);
+        }
+        let gate_note = witnesses
+            .iter()
+            .map(|witness| witness.note())
+            .collect::<Vec<_>>()
+            .join(" | ");
         match logic::allow_node_done(&route.graph, step_id, true) {
             logic::Verdict::Ok => {}
-            logic::Verdict::Violation(reason) => return refusal(reason),
+            logic::Verdict::Violation(reason) => {
+                route
+                    .ledger
+                    .log("jev_step_done", step_id, "refused", reason.clone());
+                return refusal(reason);
+            }
         }
         if let Some(node) = route.graph.nodes.iter_mut().find(|node| node.id == step_id) {
             node.state = NodeState::Done;
-            node.note = evidence.to_string();
+            // В узле остаётся доказательство словами шлюза, не агента.
+            node.note = gate_note.clone();
         }
         if !route.graph.completed_order.iter().any(|id| id == step_id) {
             route.graph.completed_order.push(step_id.to_string());
         }
         route.observed.insert(step_id.to_string(), true);
+        route.ledger.log(
+            "jev_step_done",
+            step_id,
+            "accepted",
+            if note.trim().is_empty() {
+                gate_note
+            } else {
+                format!("{gate_note} | note(непроверено): {}", note.trim())
+            },
+        );
         let remaining: Vec<&str> = route
             .graph
             .nodes
@@ -360,6 +564,7 @@ impl Gate {
             json!({
                 "status":"done",
                 "step_id":step_id,
+                "witnesses":witness_ids,
                 "remaining":remaining,
                 "all_steps_done":all_steps_done,
                 "jev_close":false,
@@ -526,12 +731,14 @@ impl Gate {
         // Эндоскоп спрашиваем только когда путь структурно цел: иначе
         // независимая проверка тратится на заведомо открытую задачу.
         let route = self.routes.get(route_id).unwrap();
+        let anchor = route.ledger.anchor();
         let verdict = if back_gate::seal_route(
             route_id,
             &route.graph,
             &route.observed,
             &endoscope::Verdict::Proven,
             back_gate::EndoscopePolicy::Required,
+            &anchor,
         )
         .is_ok()
         {
@@ -545,15 +752,120 @@ impl Gate {
             &route.observed,
             &verdict,
             back_gate::EndoscopePolicy::Required,
+            &anchor,
         ) {
             Ok(seal) => {
-                let result = json!({"status":"closed","route_id":route_id,"seal":seal.json()});
-                self.routes.remove(route_id);
+                let route = self.routes.get_mut(route_id).unwrap();
+                route
+                    .ledger
+                    .log("jev_close", "", "accepted", "печать поставлена");
+                let result = json!({
+                    "status":"closed",
+                    "route_id":route_id,
+                    "seal":seal.json(),
+                    "assumptions":route.have,
+                    "off_rail_attempts":route.ledger.off_rail_count()
+                });
+                // Закрытый маршрут уходит в архив целиком: печать и журнал
+                // нужны для `jev_report` после закрытия.
+                let route = self.routes.remove(route_id).unwrap();
+                self.archive.insert(route_id.to_string(), route);
                 self.closed.insert(route_id.to_string(), seal);
                 tool_result(result, false)
             }
-            Err(refused) => tool_result(refused.json(), true),
+            Err(refused) => {
+                let route = self.routes.get_mut(route_id).unwrap();
+                route
+                    .ledger
+                    .log("jev_close", "", "refused", refused.summary());
+                tool_result(refused.json(), true)
+            }
         }
+    }
+
+    /// Итоговый ответ пользователю, собранный шлюзом, а не агентом.
+    /// Закрыто — текст начинается с «ПОДТВЕРЖДЕНО ШЛЮЗОМ» и содержит путь,
+    /// свидетелей и якорь печати. Не закрыто — «НЕ ПОДТВЕРЖДЕНО» и точный
+    /// перечень непройденного. Любой текст агента без этого заголовка —
+    /// не результат, а черновик.
+    fn report(&self, id: &str) -> Value {
+        if let Some(seal) = self.closed.get(id) {
+            let archived = self.archive.get(id);
+            let witnesses: Vec<Value> = archived
+                .map(|route| {
+                    route
+                        .ledger
+                        .witnesses()
+                        .iter()
+                        .map(witness::Witness::json)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let assumptions: Vec<String> =
+                archived.map(|route| route.have.clone()).unwrap_or_default();
+            let mut text = format!(
+                "ПОДТВЕРЖДЕНО ШЛЮЗОМ: {id} закрыт, шагов пройдено {}, якорь {}\n",
+                seal.path().len(),
+                seal.anchor()
+            );
+            text.push_str(&format!("Путь: {}\n", seal.path().join(" → ")));
+            if !witnesses.is_empty() {
+                text.push_str(&format!("Свидетелей шлюза: {}\n", witnesses.len()));
+            }
+            if !assumptions.is_empty() {
+                text.push_str(&format!(
+                    "Допущения, заявленные вызывающей стороной (шлюзом не проверялись): {}\n",
+                    assumptions.join(", ")
+                ));
+            }
+            return tool_result(
+                json!({
+                    "status":"closed",
+                    "id":id,
+                    "verified":true,
+                    "text":text,
+                    "seal":seal.json(),
+                    "witnesses":witnesses,
+                    "assumptions":assumptions
+                }),
+                false,
+            );
+        }
+        let Some(route) = self.routes.get(id) else {
+            if self.studies.contains_key(id) {
+                return tool_result(
+                    json!({
+                        "status":"open",
+                        "id":id,
+                        "verified":false,
+                        "text":format!("НЕ ПОДТВЕРЖДЕНО: исследование {id} не закрыто шлюзом; вызовите jev_close_study")
+                    }),
+                    true,
+                );
+            }
+            return refusal(format!("неизвестный маршрут или исследование {id}"));
+        };
+        let refused = back_gate::seal_route(
+            id,
+            &route.graph,
+            &route.observed,
+            &endoscope::Verdict::NotConfigured,
+            back_gate::EndoscopePolicy::Required,
+            &route.ledger.anchor(),
+        )
+        .err()
+        .map(|refusal| *refusal)
+        .unwrap_or_default();
+        tool_result(
+            json!({
+                "status":"open",
+                "id":id,
+                "verified":false,
+                "text":format!("НЕ ПОДТВЕРЖДЕНО: маршрут {id} не закрыт шлюзом — {}", refused.summary()),
+                "refusal":refused.json()
+            }),
+            true,
+        )
     }
 
     /// Состояние маршрута или исследования глазами задних ворот: закрыт ли
@@ -573,6 +885,7 @@ impl Gate {
                 &route.observed,
                 &endoscope::Verdict::NotConfigured,
                 back_gate::EndoscopePolicy::Required,
+                &route.ledger.anchor(),
             )
             .err()
             .map(|refusal| refusal.json())
@@ -585,14 +898,33 @@ impl Gate {
                     json!({
                         "id":node.id,
                         "state":format!("{:?}", node.state).to_lowercase(),
-                        "observed":route.observed.get(&node.id).copied().unwrap_or(false)
+                        "observed":route.observed.get(&node.id).copied().unwrap_or(false),
+                        "witnesses":route.ledger.for_step(&node.id).len()
                     })
                 })
+                .collect();
+            let current: Vec<String> = route
+                .graph
+                .ready()
+                .iter()
+                .map(|node| node.id.clone())
                 .collect();
             let mut result = refused;
             result["id"] = id.into();
             result["steps"] = Value::Array(steps);
+            result["current_steps"] = json!(current);
             result["completed_order"] = json!(route.graph.completed_order);
+            result["assumptions"] = json!(route.have);
+            result["policy"] = self.policy.json();
+            result["off_rail_attempts"] = json!(route.ledger.off_rail_count());
+            result["journal"] = Value::Array(
+                route
+                    .ledger
+                    .journal()
+                    .iter()
+                    .map(witness::JournalEntry::json)
+                    .collect(),
+            );
             return tool_result(result, false);
         }
         if let Some(study) = self.studies.get(id) {
@@ -881,16 +1213,42 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name":"jev_step_done",
-            "description":"Закрыть один шаг по зависимостям Z3 и текстовому доказательству.",
+            "name":"jev_observe",
+            "description":"Наблюдение шлюза ради доказательства текущего шага: file (path), url (url), command (program, args) или screen. Возвращает witness_id; текст агента доказательством не является.",
             "inputSchema":{
                 "type":"object",
                 "properties":{
                     "route_id":{"type":"string"},
                     "step_id":{"type":"string"},
-                    "evidence":{"type":"string"}
+                    "probe":{
+                        "type":"object",
+                        "properties":{
+                            "kind":{"type":"string","enum":["file","url","command","screen"]},
+                            "path":{"type":"string"},
+                            "url":{"type":"string"},
+                            "program":{"type":"string"},
+                            "args":{"type":"array","items":{"type":"string"}}
+                        },
+                        "required":["kind"],
+                        "additionalProperties":false
+                    }
                 },
-                "required":["route_id","step_id","evidence"],
+                "required":["route_id","step_id","probe"],
+                "additionalProperties":false
+            }
+        }),
+        json!({
+            "name":"jev_step_done",
+            "description":"Закрыть один шаг по свидетелям шлюза (witness_ids от jev_observe) и зависимостям Z3. Критерий шага сверяется с захваченным содержимым, а не с текстом агента.",
+            "inputSchema":{
+                "type":"object",
+                "properties":{
+                    "route_id":{"type":"string"},
+                    "step_id":{"type":"string"},
+                    "witness_ids":{"type":"array","items":{"type":"string"}},
+                    "note":{"type":"string"}
+                },
+                "required":["route_id","step_id","witness_ids"],
                 "additionalProperties":false
             }
         }),
@@ -946,6 +1304,18 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name":"jev_report",
+            "description":"Итоговый ответ пользователю, собранный шлюзом: «ПОДТВЕРЖДЕНО ШЛЮЗОМ» с печатью и свидетелями или «НЕ ПОДТВЕРЖДЕНО» с перечнем непройденного.",
+            "inputSchema":{
+                "type":"object",
+                "properties":{
+                    "id":{"type":"string"}
+                },
+                "required":["id"],
+                "additionalProperties":false
+            }
+        }),
+        json!({
             "name":"jev_status",
             "description":"Состояние маршрута или исследования: есть ли печать jev_close и какие шаги не пройдены.",
             "inputSchema":{
@@ -977,43 +1347,6 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
         "id":id,
         "error":{"code":code,"message":message}
     })
-}
-
-fn quoted_fragment_groups(text: &str) -> Vec<Vec<String>> {
-    let mut open = None;
-    let mut fragment = String::new();
-    let mut previous_fragment_end = None;
-    let mut group = Vec::new();
-    let mut groups = Vec::new();
-    for (index, ch) in text.char_indices() {
-        match open {
-            None if ch == '«' => {
-                open = Some('»');
-                fragment.clear();
-            }
-            None if ch == '"' => {
-                open = Some('"');
-                fragment.clear();
-            }
-            Some(close) if ch == close => {
-                if !fragment.trim().is_empty() {
-                    if previous_fragment_end.is_some_and(|end| text[end..index].contains(" или "))
-                    {
-                        groups.push(std::mem::take(&mut group));
-                    }
-                    group.push(fragment.clone());
-                    previous_fragment_end = Some(index + ch.len_utf8());
-                }
-                open = None;
-            }
-            Some(_) => fragment.push(ch),
-            None => {}
-        }
-    }
-    if !group.is_empty() {
-        groups.push(group);
-    }
-    groups
 }
 
 pub fn serve_stdio() -> anyhow::Result<()> {
@@ -1084,7 +1417,33 @@ mod tests {
         )
     }
 
-    fn call_step(gate: &mut Gate, route_id: &str, step: &Value, evidence: &str) -> Value {
+    /// Файл, который «видит» шлюз вместо экрана: содержимое — то, что в бою
+    /// захватили бы file/url/command/screen. Дополняется строкой-паддингом,
+    /// чтобы короткие тестовые фразы проходили порог профиля по байтам
+    /// (порог ловит пустые наблюдения, а не короткие).
+    fn captured_file(content: &str) -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("pcagent-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("capture-{n}.txt"));
+        std::fs::write(&path, format!("{content}\n[захвачено шлюзом в тесте]\n")).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn call_observe(gate: &mut Gate, route_id: &str, step_id: &str, probe: Value) -> Value {
+        gate.handle(request(
+            2,
+            "tools/call",
+            json!({
+                "name":"jev_observe",
+                "arguments":{"route_id":route_id,"step_id":step_id,"probe":probe}
+            }),
+        ))
+        .unwrap()
+    }
+
+    fn call_step_with(gate: &mut Gate, route_id: &str, step: &Value, witness_ids: Value) -> Value {
         gate.handle(request(
             2,
             "tools/call",
@@ -1093,11 +1452,28 @@ mod tests {
                 "arguments":{
                     "route_id":route_id,
                     "step_id":step["id"],
-                    "evidence":evidence
+                    "witness_ids":witness_ids
                 }
             }),
         ))
         .unwrap()
+    }
+
+    /// Честный шаг: шлюз наблюдает файл с `content`, затем шаг закрывается
+    /// по полученному свидетелю. Если наблюдение отклонено (шаг не на
+    /// рельсах, маршрут закрыт, шаг сборщика) — возвращается этот отказ.
+    fn call_step(gate: &mut Gate, route_id: &str, step: &Value, content: &str) -> Value {
+        let observed = call_observe(
+            gate,
+            route_id,
+            step["id"].as_str().unwrap(),
+            json!({"kind":"file","path":captured_file(content)}),
+        );
+        if observed["result"]["isError"] == true {
+            return observed;
+        }
+        let witness_id = response_text(&observed)["witness"]["witness_id"].clone();
+        call_step_with(gate, route_id, step, json!([witness_id]))
     }
 
     fn call_collect(gate: &mut Gate, route_id: &str) -> Value {
@@ -1168,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_and_tools_list_expose_seven_tools() {
+    fn initialize_and_tools_list_expose_nine_tools() {
         let mut gate = Gate::default();
         let initialized = gate.handle(request(1, "initialize", json!({}))).unwrap();
         assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
@@ -1177,7 +1553,7 @@ mod tests {
             .handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .is_none());
         let listed = gate.handle(request(2, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 9);
     }
 
     struct StudyExtractor;
@@ -1292,7 +1668,7 @@ mod tests {
         assert_eq!(refused["result"]["isError"], true);
         assert_eq!(
             response_text(&refused)["reason"],
-            "этот шаг закрывает только сборщик шлюза"
+            "этот шаг доказывает только сборщик шлюза, свидетели не нужны"
         );
         let profile_step = steps
             .iter()
@@ -1302,6 +1678,12 @@ mod tests {
         assert_eq!(refused["result"]["isError"], true);
         assert_eq!(
             response_text(&refused)["reason"],
+            "этот шаг доказывает только сборщик шлюза, свидетели не нужны"
+        );
+        // И напрямую, минуя наблюдение, шаг сборщика тоже не закрыть.
+        let direct = call_step_with(&mut gate, &route_id, reel_step, json!(["w-0000"]));
+        assert_eq!(
+            response_text(&direct)["reason"],
             "этот шаг закрывает только сборщик шлюза"
         );
     }
@@ -1830,6 +2212,208 @@ mod tests {
             .contains("неизвестный маршрут"));
     }
 
+    /// Главный вектор обхода: агент присылает текст критерия как
+    /// «доказательство». Параметр упразднён — отказ ещё до разбора.
+    #[test]
+    fn agent_text_is_not_evidence_anymore() {
+        let mut gate = Gate::default();
+        let (route_id, steps) = route(&mut gate, "отрендери ролик с заменой лица");
+        let response = gate
+            .handle(request(
+                2,
+                "tools/call",
+                json!({"name":"jev_step_done","arguments":{
+                    "route_id":route_id,
+                    "step_id":steps[0]["id"],
+                    "evidence":steps[0]["done_when"]
+                }}),
+            ))
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response_text(&response)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("evidence упразднён"));
+        // Без свидетелей — тоже отказ, и узел остаётся не пройденным.
+        let empty = call_step_with(&mut gate, &route_id, &steps[0], json!([]));
+        assert_eq!(empty["result"]["isError"], true);
+        let node_state = gate.routes[&route_id].graph.nodes[0].state;
+        assert_eq!(node_state, NodeState::Pending);
+    }
+
+    /// Свидетель одного шага не закрывает другой; выдуманный id неизвестен.
+    #[test]
+    fn witness_is_bound_to_its_step_and_cannot_be_forged() {
+        let mut gate = Gate::default();
+        let (route_id, steps) = route(&mut gate, "отрендери ролик с заменой лица");
+        let first = &steps[0];
+        let observed = call_observe(
+            &mut gate,
+            &route_id,
+            first["id"].as_str().unwrap(),
+            json!({"kind":"file","path":captured_file(first["done_when"].as_str().unwrap())}),
+        );
+        let witness_id = response_text(&observed)["witness"]["witness_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let accepted = call_step_with(&mut gate, &route_id, first, json!([witness_id]));
+        assert_eq!(accepted["result"]["isError"], false, "{accepted}");
+
+        let second = &steps[1];
+        let reused = call_step_with(&mut gate, &route_id, second, json!([witness_id]));
+        assert!(response_text(&reused)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("принадлежит шагу"));
+        let forged = call_step_with(&mut gate, &route_id, second, json!(["w-deadbeefdeadbeef"]));
+        assert!(response_text(&forged)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("неизвестен шлюзу"));
+    }
+
+    /// Наблюдать «вперёд» по пути нельзя: попытка отклоняется и остаётся в
+    /// журнале как off_rail, а статус её показывает.
+    #[test]
+    fn observing_ahead_of_the_rail_is_refused_and_journaled() {
+        let mut gate = Gate::default();
+        let (route_id, steps) = route(&mut gate, "прочитай директ instagram");
+        let dependent = steps
+            .iter()
+            .find(|step| !step["deps"].as_array().unwrap().is_empty())
+            .unwrap();
+        let refused = call_observe(
+            &mut gate,
+            &route_id,
+            dependent["id"].as_str().unwrap(),
+            json!({"kind":"file","path":captured_file("что угодно")}),
+        );
+        assert_eq!(refused["result"]["isError"], true);
+        let refused = response_text(&refused);
+        assert!(refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("не на рельсах"));
+        assert!(!refused["current_steps"].as_array().unwrap().is_empty());
+        let status = response_text(&call_status(&mut gate, &route_id));
+        assert_eq!(status["off_rail_attempts"], 1);
+        assert_eq!(status["journal"][0]["outcome"], "off_rail");
+        assert_eq!(status["policy"]["profile"], "strict");
+    }
+
+    /// Критерий сверяется с захваченным содержимым: файл без нужного
+    /// фрагмента — отказ, даже если агент уверяет обратное в note.
+    #[test]
+    fn captured_content_decides_not_the_note() {
+        let mut gate = Gate::default();
+        let (route_id, steps) = route(&mut gate, "сделай пост в instagram");
+        let first = steps
+            .iter()
+            .find(|step| step["deps"].as_array().unwrap().is_empty())
+            .unwrap();
+        let observed = call_observe(
+            &mut gate,
+            &route_id,
+            first["id"].as_str().unwrap(),
+            json!({"kind":"file","path":captured_file("лог без признаков критерия")}),
+        );
+        let witness_id = response_text(&observed)["witness"]["witness_id"].clone();
+        let response = gate
+            .handle(request(
+                2,
+                "tools/call",
+                json!({"name":"jev_step_done","arguments":{
+                    "route_id":route_id,
+                    "step_id":first["id"],
+                    "witness_ids":[witness_id],
+                    "note":first["done_when"]
+                }}),
+            ))
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response_text(&response)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("обязательный фрагмент"));
+    }
+
+    /// Пустое наблюдение (нулевой файл) не проходит порог профиля.
+    #[test]
+    fn empty_capture_fails_profile_threshold() {
+        let mut gate = Gate::default();
+        let (route_id, steps) = route(&mut gate, "отрендери ролик с заменой лица");
+        let dir = std::env::temp_dir().join(format!("pcagent-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+        let observed = call_observe(
+            &mut gate,
+            &route_id,
+            steps[0]["id"].as_str().unwrap(),
+            json!({"kind":"file","path":path.to_string_lossy()}),
+        );
+        let witness_id = response_text(&observed)["witness"]["witness_id"].clone();
+        let response = call_step_with(&mut gate, &route_id, &steps[0], json!([witness_id]));
+        assert!(response_text(&response)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("порог профиля"));
+    }
+
+    /// Итоговый ответ собирает шлюз: до печати — «НЕ ПОДТВЕРЖДЕНО» с
+    /// перечнем, после — «ПОДТВЕРЖДЕНО ШЛЮЗОМ» с якорем свидетелей.
+    #[test]
+    fn report_is_built_by_the_gate_from_the_seal() {
+        let mut gate = Gate::default();
+        gate.judge = Some(Box::new(|_| endoscope::Verdict::Proven));
+        let (route_id, steps) = route(&mut gate, "отрендери ролик с заменой лица");
+        let call_report = |gate: &mut Gate| {
+            gate.handle(request(
+                5,
+                "tools/call",
+                json!({"name":"jev_report","arguments":{"id":route_id}}),
+            ))
+            .unwrap()
+        };
+        let before = call_report(&mut gate);
+        assert_eq!(before["result"]["isError"], true);
+        let before = response_text(&before);
+        assert_eq!(before["verified"], false);
+        assert!(before["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("НЕ ПОДТВЕРЖДЕНО"));
+        assert!(!before["refusal"]["unvisited"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        walk_all_steps(&mut gate, &route_id, &steps);
+        let closed = response_text(&call_close(&mut gate, &route_id, "готово"));
+        assert_eq!(closed["status"], "closed");
+        let anchor = closed["seal"]["anchor"].as_str().unwrap().to_string();
+        assert_eq!(anchor.len(), 64);
+        assert!(closed["seal"]["proof"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "witness_anchor"));
+
+        let after = call_report(&mut gate);
+        assert_eq!(after["result"]["isError"], false);
+        let after = response_text(&after);
+        assert_eq!(after["verified"], true);
+        assert!(after["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("ПОДТВЕРЖДЕНО ШЛЮЗОМ"));
+        assert_eq!(after["seal"]["anchor"], anchor);
+        assert_eq!(after["witnesses"].as_array().unwrap().len(), steps.len());
+        // Допущения из have показаны явно как непроверенные.
+        assert!(!after["assumptions"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn unknown_method_returns_json_rpc_method_not_found() {
         let mut gate = Gate::default();
@@ -1847,7 +2431,7 @@ mod tests {
                 1,
                 "tools/call",
                 json!({"name":"jev_step_done","arguments":{
-                    "route_id":"missing","step_id":"step","evidence":"text"
+                    "route_id":"missing","step_id":"step","witness_ids":["w-1"]
                 }}),
             ))
             .unwrap();

@@ -40,6 +40,7 @@ log = "0.4"
 # задаёт CMAKE_POLICY_VERSION_MINIMUM=3.5 (.cargo/config.toml и Windows CI).
 z3 = { version = "0.12", features = ["static-link-z3"] }
 env_logger = "0.11"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 # egui-wgpu сам не включает ни одного бэкенда, поэтому DX12 включаем явно:
