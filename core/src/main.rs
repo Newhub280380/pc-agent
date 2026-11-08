@@ -13,6 +13,7 @@
 mod acceptance;
 mod agent;
 mod android;
+mod back_gate;
 mod checkpoint;
 mod config;
 mod coordinator;
