@@ -1,10 +1,21 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Unit {
+    #[default]
+    Sec,
+    Block,
+    Page,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct Source {
     pub id: String,
     pub url: String,
+    #[serde(default)]
+    pub unit: Unit,
     pub duration: u32,
     pub segments: Vec<Segment>,
 }
@@ -32,6 +43,46 @@ impl ReportCheck {
 pub fn complete(source: &Source) -> Result<(), String> {
     if source.segments.is_empty() {
         return Err(format!("{}: нет сегментов транскрипта", source.id));
+    }
+
+    if source.unit != Unit::Sec {
+        let first = if source.unit == Unit::Page { 1 } else { 0 };
+        let expected_last = if source.unit == Unit::Page {
+            source.duration
+        } else {
+            source
+                .duration
+                .checked_sub(1)
+                .ok_or_else(|| format!("{}: число блоков должно быть больше нуля", source.id))?
+        };
+        let mut expected_start = first;
+        for segment in &source.segments {
+            if segment.start > segment.end {
+                return Err(format!("{}: начало сегмента позже его конца", source.id));
+            }
+            if segment.start != expected_start {
+                return Err(format!(
+                    "{}: пропуск в {:?}-единицах — ожидалось {}, получено {}",
+                    source.id, source.unit, expected_start, segment.start
+                ));
+            }
+            expected_start = segment
+                .end
+                .checked_add(1)
+                .ok_or_else(|| format!("{}: индекс сегмента слишком велик", source.id))?;
+        }
+        let actual_last = source
+            .segments
+            .last()
+            .map(|segment| segment.end)
+            .unwrap_or(first);
+        if actual_last != expected_last {
+            return Err(format!(
+                "{}: неполное покрытие {:?}-единиц — последний индекс {}, ожидался {}",
+                source.id, source.unit, actual_last, expected_last
+            ));
+        }
+        return Ok(());
     }
 
     let mut previous_start = None;
@@ -77,11 +128,11 @@ pub fn check_report(report: &str, sources: &[Source]) -> ReportCheck {
     let mut cited_by_verified = HashSet::new();
 
     for statement in statements(report) {
-        let (citations, text, malformed) = extract_citations(&statement);
+        let (_, text, _) = extract_citations(&statement);
         if is_heading(&text) {
             continue;
         }
-        let result = verify_statement(&citations, &text, malformed.as_deref(), sources);
+        let result = verify_statement(&statement, sources);
         match result {
             Ok(source_ids) => {
                 cited_by_verified.extend(source_ids);
@@ -107,7 +158,14 @@ pub fn check_report(report: &str, sources: &[Source]) -> ReportCheck {
 #[derive(Debug)]
 struct Citation {
     source_id: String,
-    time: u32,
+    locator: Locator,
+}
+
+#[derive(Debug)]
+enum Locator {
+    Sec(u32),
+    Block(u32),
+    Page(u32),
 }
 
 fn statements(report: &str) -> Vec<String> {
@@ -160,7 +218,7 @@ fn extract_citations(statement: &str) -> (Vec<Citation>, String, Option<String>)
         match parse_citation(content) {
             Some(citation) => citations.push(citation),
             None => {
-                if content.starts_with("reel_") {
+                if content.starts_with("reel_") || content.contains('@') {
                     malformed.get_or_insert_with(|| bracket.to_string());
                 }
                 text.push_str(bracket);
@@ -175,28 +233,59 @@ fn extract_citations(statement: &str) -> (Vec<Citation>, String, Option<String>)
 }
 
 fn parse_citation(value: &str) -> Option<Citation> {
-    let rest = value.strip_prefix("reel_")?;
-    let (number, time) = rest.split_once('@')?;
-    if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    let (minutes, seconds) = time.split_once(':')?;
-    if minutes.is_empty()
-        || seconds.is_empty()
-        || !minutes.chars().all(|ch| ch.is_ascii_digit())
-        || !seconds.chars().all(|ch| ch.is_ascii_digit())
+    let (source_id, locator) = value.split_once('@')?;
+    if source_id.is_empty()
+        || !source_id
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
     {
         return None;
     }
-    let minutes = minutes.parse::<u32>().ok()?;
-    let seconds = seconds.parse::<u32>().ok()?;
-    if seconds >= 60 {
+    let locator = if let Some(block) = locator.strip_prefix('b') {
+        Locator::Block(parse_index(block)?)
+    } else if let Some(page) = locator.strip_prefix('p') {
+        Locator::Page(parse_index(page)?)
+    } else {
+        Locator::Sec(parse_timecode(locator)?)
+    };
+    Some(Citation {
+        source_id: source_id.to_string(),
+        locator,
+    })
+}
+
+fn parse_index(value: &str) -> Option<u32> {
+    if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
-    Some(Citation {
-        source_id: format!("reel_{number}"),
-        time: minutes.checked_mul(60)?.checked_add(seconds)?,
-    })
+    value.parse().ok()
+}
+
+fn parse_timecode(value: &str) -> Option<u32> {
+    let parts: Vec<&str> = value.split(':').collect();
+    match parts.as_slice() {
+        [minutes, seconds] => {
+            let minutes = parse_index(minutes)?;
+            let seconds = parse_index(seconds)?;
+            if seconds >= 60 {
+                return None;
+            }
+            minutes.checked_mul(60)?.checked_add(seconds)
+        }
+        [hours, minutes, seconds] => {
+            let hours = parse_index(hours)?;
+            let minutes = parse_index(minutes)?;
+            let seconds = parse_index(seconds)?;
+            if minutes >= 60 || seconds >= 60 {
+                return None;
+            }
+            hours
+                .checked_mul(3600)?
+                .checked_add(minutes.checked_mul(60)?)?
+                .checked_add(seconds)
+        }
+        _ => None,
+    }
 }
 
 fn is_heading(text: &str) -> bool {
@@ -206,7 +295,12 @@ fn is_heading(text: &str) -> bool {
     text.split_whitespace().count() <= 3 && !text.chars().any(|ch| ch.is_ascii_digit())
 }
 
-fn verify_statement(
+pub fn verify_statement(statement: &str, sources: &[Source]) -> Result<Vec<String>, String> {
+    let (citations, text, malformed) = extract_citations(statement);
+    verify_statement_parts(&citations, &text, malformed.as_deref(), sources)
+}
+
+fn verify_statement_parts(
     citations: &[Citation],
     text: &str,
     malformed: Option<&str>,
@@ -216,7 +310,7 @@ fn verify_statement(
         return Err(format!("некорректная ссылка {citation}"));
     }
     if citations.is_empty() {
-        return Err("нет ссылки вида [reel_N@mm:ss]".to_string());
+        return Err("нет ссылки вида [id@позиция]".to_string());
     }
 
     let mut window = Vec::new();
@@ -226,16 +320,32 @@ fn verify_statement(
             .iter()
             .find(|source| source.id == citation.source_id)
             .ok_or_else(|| format!("источник {} отсутствует", citation.source_id))?;
+        let position = match (source.unit, &citation.locator) {
+            (Unit::Sec, Locator::Sec(time)) => *time,
+            (Unit::Block, Locator::Block(block)) => *block,
+            (Unit::Page, Locator::Page(page)) => *page,
+            (unit, _) => {
+                return Err(format!(
+                    "формат ссылки не соответствует {:?}-источнику {}",
+                    unit, citation.source_id
+                ));
+            }
+        };
         let segment_index = source
             .segments
             .iter()
-            .position(|segment| segment.start <= citation.time && citation.time <= segment.end)
-            .ok_or_else(|| {
-                format!(
+            .position(|segment| segment.start <= position && position <= segment.end)
+            .ok_or_else(|| match source.unit {
+                Unit::Sec => format!(
                     "таймкод {} не попадает в сегмент источника {}",
-                    timecode(citation.time),
+                    timecode(position),
                     citation.source_id
-                )
+                ),
+                unit => format!(
+                    "позиция {} не попадает в сегмент источника {}",
+                    format_locator(unit, position),
+                    citation.source_id
+                ),
             })?;
         let first = segment_index.saturating_sub(1);
         let last = (segment_index + 1).min(source.segments.len() - 1);
@@ -305,7 +415,32 @@ fn digit_runs(text: &str) -> Vec<String> {
 }
 
 fn timecode(seconds: u32) -> String {
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    if seconds >= 3600 {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60
+        )
+    } else {
+        format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+fn format_locator(unit: Unit, position: u32) -> String {
+    match unit {
+        Unit::Sec => timecode(position),
+        Unit::Block => format!("b{position}"),
+        Unit::Page => format!("p{position}"),
+    }
+}
+
+pub fn locator_for(unit: Unit, segment: &Segment) -> String {
+    format_locator(unit, segment.start)
+}
+
+pub fn citation_for_segment(source_id: &str, unit: Unit, segment: &Segment) -> String {
+    format!("[{}@{}]", source_id, locator_for(unit, segment))
 }
 
 #[cfg(test)]
@@ -316,6 +451,7 @@ mod tests {
         Source {
             id: id.to_string(),
             url: format!("https://example.test/{id}"),
+            unit: Unit::Sec,
             duration: 100,
             segments: vec![
                 Segment {
@@ -374,6 +510,62 @@ mod tests {
     }
 
     #[test]
+    fn old_source_json_defaults_to_seconds() {
+        let source: Source = serde_json::from_str(
+            r#"{"id":"reel_3","url":"https://example.test/3","duration":10,"segments":[{"start":0,"end":10,"text":"текст"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(source.unit, Unit::Sec);
+    }
+
+    #[test]
+    fn block_and_page_sources_require_contiguous_full_coverage() {
+        let block = Source {
+            id: "text_file".to_string(),
+            url: "file:test.txt".to_string(),
+            unit: Unit::Block,
+            duration: 2,
+            segments: vec![
+                Segment {
+                    start: 0,
+                    end: 0,
+                    text: "Первый блок текста.".to_string(),
+                },
+                Segment {
+                    start: 1,
+                    end: 1,
+                    text: "Второй блок текста.".to_string(),
+                },
+            ],
+        };
+        assert!(complete(&block).is_ok());
+        let mut missing_block = block.clone();
+        missing_block.segments[1].start = 2;
+        missing_block.segments[1].end = 2;
+        assert!(complete(&missing_block).unwrap_err().contains("пропуск"));
+
+        let page = Source {
+            id: "book_2024".to_string(),
+            url: "file:book.pdf".to_string(),
+            unit: Unit::Page,
+            duration: 2,
+            segments: vec![
+                Segment {
+                    start: 1,
+                    end: 1,
+                    text: "Текст первой страницы.".to_string(),
+                },
+                Segment {
+                    start: 2,
+                    end: 2,
+                    text: "Текст второй страницы.".to_string(),
+                },
+            ],
+        };
+        assert!(complete(&page).is_ok());
+    }
+
+    #[test]
     fn report_verifies_a_cited_claim() {
         let check = check_report(
             "Водитель поворачивает направо возле перекрёстка [reel_1@00:40].",
@@ -429,5 +621,62 @@ mod tests {
             &[source("reel_1"), source("reel_2")],
         );
         assert_eq!(check.uncited_sources, vec!["reel_2"]);
+    }
+
+    #[test]
+    fn block_and_page_citations_match_unit_positions() {
+        let block = Source {
+            id: "notes_file_2".to_string(),
+            url: "file:notes.txt".to_string(),
+            unit: Unit::Block,
+            duration: 1,
+            segments: vec![Segment {
+                start: 0,
+                end: 0,
+                text: "Главное утверждение подтверждено текстовым источником.".to_string(),
+            }],
+        };
+        assert!(verify_statement(
+            "Главное утверждение подтверждено текстовым источником [notes_file_2@b0].",
+            &[block]
+        )
+        .is_ok());
+
+        let page = Source {
+            id: "book_2024".to_string(),
+            url: "file:book.pdf".to_string(),
+            unit: Unit::Page,
+            duration: 1,
+            segments: vec![Segment {
+                start: 1,
+                end: 1,
+                text: "На первой странице содержится важный научный вывод.".to_string(),
+            }],
+        };
+        assert!(verify_statement(
+            "На первой странице содержится важный научный вывод [book_2024@p1].",
+            &[page]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn hour_minute_second_citation_is_supported() {
+        let source = Source {
+            id: "lecture_1".to_string(),
+            url: "https://example.test/lecture".to_string(),
+            unit: Unit::Sec,
+            duration: 3700,
+            segments: vec![Segment {
+                start: 3600,
+                end: 3700,
+                text: "Лектор объясняет важный научный вывод.".to_string(),
+            }],
+        };
+        assert!(verify_statement(
+            "Лектор объясняет важный научный вывод [lecture_1@1:00:00].",
+            &[source]
+        )
+        .is_ok());
     }
 }

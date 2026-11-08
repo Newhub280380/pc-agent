@@ -1,16 +1,16 @@
 use crate::agent::graph::{NodeState, TaskGraph};
-use crate::{endoscope, ledger, logic, proof};
+use crate::{corpus, endoscope, ledger, logic, proof};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, Read, Write};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::io::{BufRead, Write};
 
 pub struct Gate {
     routes: HashMap<String, RouteState>,
     next_route_id: u64,
     collector: Option<String>,
+    studies: HashMap<String, StudyState>,
+    next_study_id: u64,
+    pub extractor: Option<Box<dyn corpus::Extract>>,
 }
 
 struct RouteState {
@@ -18,6 +18,11 @@ struct RouteState {
     graph: TaskGraph,
     observed: HashMap<String, bool>,
     sources: Vec<ledger::Source>,
+}
+
+struct StudyState {
+    sources: Vec<ledger::Source>,
+    walk: corpus::Walk,
 }
 
 impl RouteState {
@@ -47,6 +52,9 @@ impl Default for Gate {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            studies: HashMap::new(),
+            next_study_id: 0,
+            extractor: None,
         }
     }
 }
@@ -163,6 +171,44 @@ impl Gate {
                     );
                 };
                 self.close(route_id, report)
+            }
+            "jev_study" => {
+                let Some(question) = args.get("question").and_then(Value::as_str) else {
+                    return tool_result(
+                        json!({"status":"refused","reason":"question должен быть строкой"}),
+                        true,
+                    );
+                };
+                let Some(specs) = args.get("sources").and_then(Value::as_array) else {
+                    return tool_result(
+                        json!({"status":"refused","reason":"sources должен быть массивом строк"}),
+                        true,
+                    );
+                };
+                let mut values = Vec::with_capacity(specs.len());
+                for spec in specs {
+                    let Some(spec) = spec.as_str() else {
+                        return tool_result(
+                            json!({"status":"refused","reason":"элементы sources должны быть строками"}),
+                            true,
+                        );
+                    };
+                    values.push(spec.to_string());
+                }
+                let (result, is_error) = self.study(question, &values);
+                tool_result(result, is_error)
+            }
+            "jev_close_study" => {
+                let (Some(study_id), Some(report)) = (
+                    args.get("study_id").and_then(Value::as_str),
+                    args.get("report").and_then(Value::as_str),
+                ) else {
+                    return tool_result(
+                        json!({"status":"refused","reason":"study_id и report должны быть строками"}),
+                        true,
+                    );
+                };
+                self.close_study(study_id, report)
             }
             _ => tool_result(
                 json!({"status":"refused","reason":format!("неизвестный инструмент {name}")}),
@@ -298,9 +344,10 @@ impl Gate {
                 true,
             );
         };
-        let sources = match run_collector(command, &task, reel_count) {
+        let sources = match corpus::run_collector(command, &[task.clone(), reel_count.to_string()])
+        {
             Ok(sources) => sources,
-            Err(reason) => return refusal(reason),
+            Err(reason) => return refusal(format!("{reason:#}")),
         };
 
         let all_complete = exactly_complete_sources(&sources, &reel_ids);
@@ -430,6 +477,140 @@ impl Gate {
             Err(reason) => refusal(reason),
         }
     }
+
+    fn study(&mut self, question: &str, specs: &[String]) -> (Value, bool) {
+        if question.trim().is_empty() {
+            return (
+                json!({"status":"refused","reason":"question не должен быть пустым"}),
+                true,
+            );
+        }
+        if specs.is_empty() {
+            return (
+                json!({"status":"refused","reason":"нужен хотя бы один source"}),
+                true,
+            );
+        }
+        let mut missing = Vec::new();
+        let owned_extractor = if self.extractor.is_none() {
+            match corpus::LlmExtract::from_config() {
+                Ok(extractor) => Some(extractor),
+                Err(error) => {
+                    missing.push(format!("{error:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if specs.iter().any(|spec| spec.starts_with("collector:")) && self.collector.is_none() {
+            missing.push("сборщик видео не настроен: задайте PCAGENT_COLLECTOR".to_string());
+        }
+        if !missing.is_empty() {
+            return (json!({"status":"missing","missing":missing}), true);
+        }
+        let sources = match corpus::load_sources(specs, self.collector.as_deref()) {
+            Ok(sources) if !sources.is_empty() => sources,
+            Ok(_) => {
+                return (
+                    json!({"status":"refused","reason":"источники не содержат единиц материала"}),
+                    true,
+                )
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                if reason.contains("PCAGENT_COLLECTOR") {
+                    return (json!({"status":"missing","missing":[reason]}), true);
+                }
+                return (json!({"status":"refused","reason":reason}), true);
+            }
+        };
+        let walk = if let Some(extractor) = self.extractor.as_deref() {
+            corpus::walk(question, &sources, extractor)
+        } else {
+            corpus::walk(
+                question,
+                &sources,
+                owned_extractor.as_ref().expect("LLM extractor was created"),
+            )
+        };
+        let walk = match walk {
+            Ok(walk) => walk,
+            Err(error) => {
+                return (
+                    json!({"status":"refused","reason":format!("{error:#}")}),
+                    true,
+                );
+            }
+        };
+
+        self.next_study_id = self
+            .next_study_id
+            .checked_add(1)
+            .expect("study ID counter exhausted");
+        let study_id = format!("study-{}", self.next_study_id);
+        let units: Vec<Value> = sources
+            .iter()
+            .map(|source| {
+                json!({
+                    "id":source.id,
+                    "locator":source.url,
+                    "chunks":source.segments.len()
+                })
+            })
+            .collect();
+        let dropped: Vec<Value> = walk
+            .dropped
+            .iter()
+            .map(|(statement, why)| json!({"statement":statement,"why":why}))
+            .collect();
+        let failed: Vec<Value> = walk
+            .failed
+            .iter()
+            .map(|(id, position, why)| json!({"id":id,"position":position,"why":why}))
+            .collect();
+        self.studies.insert(
+            study_id.clone(),
+            StudyState {
+                sources,
+                walk: walk.clone(),
+            },
+        );
+        (
+            json!({
+                "status":"studied",
+                "study_id":study_id,
+                "units":units,
+                "notes":walk.notes,
+                "dropped":dropped,
+                "failed":failed
+            }),
+            false,
+        )
+    }
+
+    fn close_study(&mut self, study_id: &str, report: &str) -> Value {
+        let Some(study) = self.studies.get(study_id) else {
+            return tool_result(
+                json!({"status":"refused","reason":format!("неизвестное исследование {study_id}")}),
+                true,
+            );
+        };
+        let verified_text = match corpus::back_gate(&study.sources, &study.walk, report) {
+            Ok(text) => text,
+            Err(reasons) => return tool_result(reasons, true),
+        };
+        let verdict = endoscope::judge_report(&verified_text);
+        if let Err(reason) = close_endoscope_verdict(&verdict) {
+            return tool_result(json!({"status":"open","reason":reason}), true);
+        }
+        self.studies.remove(study_id);
+        tool_result(json!({"status":"closed","study_id":study_id}), false)
+    }
+}
+
+pub fn study_json(question: &str, sources: &[String]) -> Value {
+    Gate::default().study(question, sources).0
 }
 
 fn close_endoscope_verdict(verdict: &endoscope::Verdict) -> Result<(), String> {
@@ -479,57 +660,6 @@ fn exactly_complete_sources(sources: &[ledger::Source], reel_ids: &[String]) -> 
                 .is_some_and(|source| ledger::complete(source).is_ok())
                 && matches.next().is_none()
         })
-}
-
-fn run_collector(
-    command: &str,
-    task: &str,
-    reel_count: usize,
-) -> Result<Vec<ledger::Source>, String> {
-    let mut child = Command::new(command)
-        .arg(task)
-        .arg(reel_count.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| format!("не удалось запустить сборщик: {error}"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "не удалось прочитать stdout сборщика".to_string())?;
-    let output_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).map(|_| output)
-    });
-    let started = Instant::now();
-    let timeout = Duration::from_secs(15 * 60);
-    let status = loop {
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = output_reader.join();
-            return Err("сборщик не завершился за 15 минут".to_string());
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(100)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = output_reader.join();
-                return Err(format!("ошибка ожидания сборщика: {error}"));
-            }
-        }
-    };
-    let output = output_reader
-        .join()
-        .map_err(|_| "ошибка чтения stdout сборщика".to_string())?
-        .map_err(|error| format!("не удалось прочитать stdout сборщика: {error}"))?;
-    if !status.success() {
-        return Err(format!("сборщик завершился с кодом {status}"));
-    }
-    serde_json::from_slice(&output)
-        .map_err(|error| format!("сборщик вернул некорректный JSON [Source]: {error}"))
 }
 
 fn route_result(routing: proof::Routing, route_id: &str) -> Value {
@@ -624,6 +754,32 @@ fn tool_definitions() -> Vec<Value> {
                     "report":{"type":"string"}
                 },
                 "required":["route_id","report"],
+                "additionalProperties":false
+            }
+        }),
+        json!({
+            "name":"jev_study",
+            "description":"Изучить все фрагменты указанных источников с проверенными заметками.",
+            "inputSchema":{
+                "type":"object",
+                "properties":{
+                    "question":{"type":"string"},
+                    "sources":{"type":"array","items":{"type":"string"}}
+                },
+                "required":["question","sources"],
+                "additionalProperties":false
+            }
+        }),
+        json!({
+            "name":"jev_close_study",
+            "description":"Закрыть исследование после back-gate проверки отчёта и эндоскопа.",
+            "inputSchema":{
+                "type":"object",
+                "properties":{
+                    "study_id":{"type":"string"},
+                    "report":{"type":"string"}
+                },
+                "required":["study_id","report"],
                 "additionalProperties":false
             }
         }),
@@ -816,6 +972,7 @@ mod tests {
         ledger::Source {
             id: id.to_string(),
             url: format!("https://example.test/{id}"),
+            unit: ledger::Unit::Sec,
             duration,
             segments: vec![
                 ledger::Segment {
@@ -833,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_and_tools_list_expose_four_tools() {
+    fn initialize_and_tools_list_expose_six_tools() {
         let mut gate = Gate::default();
         let initialized = gate.handle(request(1, "initialize", json!({}))).unwrap();
         assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
@@ -842,7 +999,66 @@ mod tests {
             .handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .is_none());
         let listed = gate.handle(request(2, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 6);
+    }
+
+    struct StudyExtractor;
+
+    impl corpus::Extract for StudyExtractor {
+        fn extract(
+            &self,
+            _question: &str,
+            source_id: &str,
+            unit: ledger::Unit,
+            segment: &ledger::Segment,
+        ) -> anyhow::Result<Vec<String>> {
+            Ok(vec![format!(
+                "{} {}",
+                segment.text.trim().trim_end_matches('.'),
+                ledger::citation_for_segment(source_id, unit, segment)
+            )])
+        }
+    }
+
+    #[test]
+    fn study_tool_walks_file_sources_with_injected_extractor() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let path = std::env::temp_dir().join(format!(
+            "pc-agent-jev-study-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "Документ подтверждает важный вывод для команды.").unwrap();
+
+        let mut gate = Gate::default();
+        gate.extractor = Some(Box::new(StudyExtractor));
+        let response = gate
+            .handle(request(
+                3,
+                "tools/call",
+                json!({
+                    "name":"jev_study",
+                    "arguments":{
+                        "question":"Что подтверждает документ?",
+                        "sources":[format!("file:{}", path.display())]
+                    }
+                }),
+            ))
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+
+        let result = response_text(&response);
+        assert_eq!(result["status"], "studied");
+        assert_eq!(result["units"][0]["chunks"], 1);
+        assert_eq!(result["notes"].as_array().unwrap().len(), 1);
+        let study_id = result["study_id"].as_str().unwrap();
+        let study = gate.studies.get(study_id).unwrap();
+        let report = result["notes"][0].as_str().unwrap();
+        assert!(corpus::back_gate(&study.sources, &study.walk, report).is_ok());
     }
 
     #[test]

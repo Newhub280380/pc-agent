@@ -16,6 +16,7 @@ mod android;
 mod checkpoint;
 mod config;
 mod coordinator;
+mod corpus;
 mod decisions;
 mod endoscope;
 mod failure;
@@ -69,8 +70,25 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--mcp") {
         let paths = config::Paths::resolve()?;
         config::ensure_env_file(&paths.env_file)?;
-        config::Layers::load(&paths)?.export_core_env();
+        let layers = config::Layers::load(&paths)?;
+        layers.export_core_env();
+        let settings = config::Settings::load(&layers)?;
+        let _router = headless_router(&paths, &layers, &settings);
         jev_gate::serve_stdio()?;
+        return Ok(());
+    }
+    if let Some(question) = flag_value(&args, "--study") {
+        let sources = flag_values(&args, "--source");
+        let paths = config::Paths::resolve()?;
+        config::ensure_env_file(&paths.env_file)?;
+        let layers = config::Layers::load(&paths)?;
+        layers.export_core_env();
+        let settings = config::Settings::load(&layers)?;
+        let _router = headless_router(&paths, &layers, &settings);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&jev_gate::study_json(&question, &sources))?
+        );
         return Ok(());
     }
     if let Some(task) = flag_value(&args, "--route") {
@@ -550,6 +568,35 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1))
         .filter(|v| !v.starts_with("--"))
         .cloned()
+}
+
+fn flag_values(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag && !pair[1].starts_with("--"))
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
+fn headless_router(
+    paths: &config::Paths,
+    layers: &config::Layers,
+    settings: &config::Settings,
+) -> Option<supervisor::Router> {
+    if layers.llm_summary().provider == "нет" {
+        return None;
+    }
+    match supervisor::Router::start(
+        &paths.router_exe,
+        &paths.env_file,
+        &format!("{}/health", settings.router_url),
+        &layers.router_env(),
+    ) {
+        Ok(router) => Some(router),
+        Err(error) => {
+            eprintln!("JEV LLM router unavailable: {error}");
+            None
+        }
+    }
 }
 
 /// Самопроверка: пути, .env, роутер, native-слой, экран, память.
