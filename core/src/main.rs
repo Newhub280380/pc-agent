@@ -13,6 +13,7 @@
 mod acceptance;
 mod agent;
 mod android;
+mod back_gate;
 mod checkpoint;
 mod config;
 mod coordinator;
@@ -41,6 +42,7 @@ mod supervisor;
 mod text;
 mod vision;
 mod watchdog;
+mod witness;
 
 use agent::{Agent, AgentCommand, AgentConfig, AgentEvent};
 use anyhow::Result;

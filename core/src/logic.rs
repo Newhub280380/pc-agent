@@ -176,6 +176,73 @@ pub fn check_solution(graph: &TaskGraph, observed: &HashMap<String, bool>) -> Ve
     })
 }
 
+/// Доказательство, что фактический порядок прохождения пути (`order` —
+/// журнал `completed_order`) покрывает все узлы графа и согласован с
+/// зависимостями. Используется задними воротами (`back_gate`) при
+/// выставлении печати закрытия.
+///
+/// Кодировка: позиция каждого узла — целое, зафиксированное его местом в
+/// журнале (`pos_i == k`). Узел, которого в журнале нет, или попавший туда
+/// дважды, даёт заведомо ложное утверждение с именем — оно всплывает в
+/// unsat-ядре. Для каждой зависимости требуется `pos_i > pos_j`. Если
+/// журнал подделан (зависимый шаг закрыт раньше предпосылки) — UNSAT, и
+/// отказ называет пару узлов.
+pub fn prove_walk_order(graph: &TaskGraph, order: &[String]) -> Verdict {
+    if graph.nodes.is_empty() {
+        return Verdict::Violation("граф задач пуст".into());
+    }
+    with_solver(|ctx, solver| {
+        let index = index_of(graph);
+        let pos: Vec<Int> = (0..graph.nodes.len())
+            .map(|i| Int::new_const(ctx, format!("pos_{i}")))
+            .collect();
+        // Сколько раз каждый узел встретился в журнале.
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for (k, id) in order.iter().enumerate() {
+            match index.get(id.as_str()) {
+                Some(&i) => {
+                    let count = seen.entry(id.as_str()).or_insert(0);
+                    *count += 1;
+                    if *count == 1 {
+                        let tag = Bool::new_const(ctx, format!("walk_pos_{}", graph.nodes[i].id));
+                        solver.assert_and_track(&pos[i]._eq(&Int::from_i64(ctx, k as i64)), &tag);
+                    } else {
+                        let tag = Bool::new_const(ctx, format!("walk_twice_{}", graph.nodes[i].id));
+                        solver.assert_and_track(&Bool::from_bool(ctx, false), &tag);
+                    }
+                }
+                None => {
+                    let tag = Bool::new_const(ctx, format!("walk_alien_{id}"));
+                    solver.assert_and_track(&Bool::from_bool(ctx, false), &tag);
+                }
+            }
+        }
+        for (i, node) in graph.nodes.iter().enumerate() {
+            if !seen.contains_key(node.id.as_str()) {
+                let tag = Bool::new_const(ctx, format!("walk_unvisited_{}", node.id));
+                solver.assert_and_track(&Bool::from_bool(ctx, false), &tag);
+            }
+            for d in &node.deps {
+                match index.get(d.as_str()) {
+                    Some(&j) => {
+                        let tag =
+                            Bool::new_const(ctx, format!("walk_order_{}_after_{}", node.id, d));
+                        solver.assert_and_track(&pos[i].gt(&pos[j]), &tag);
+                    }
+                    None => {
+                        let tag = Bool::new_const(ctx, format!("walk_missing_dep_{}_{d}", node.id));
+                        solver.assert_and_track(&Bool::from_bool(ctx, false), &tag);
+                    }
+                }
+            }
+        }
+        verdict(
+            solver,
+            "порядок прохождения пути не согласован с зависимостями или неполон",
+        )
+    })
+}
+
 /// Фильтр одного действия до исполнения. Это политика, не отчёт модели.
 pub fn gate_action(action: &str, pol: &Policies) -> Verdict {
     let low = action.to_lowercase();
@@ -396,6 +463,41 @@ mod tests {
         let observed = HashMap::from([("n1".to_string(), true)]);
         assert!(matches!(
             check_solution(&g, &observed),
+            Verdict::Violation(_)
+        ));
+    }
+
+    #[test]
+    fn walk_order_proof_accepts_topological_journal() {
+        let g = linear(3);
+        let order: Vec<String> = ["n1", "n2", "n3"].map(String::from).to_vec();
+        assert_eq!(prove_walk_order(&g, &order), Verdict::Ok);
+    }
+
+    #[test]
+    fn walk_order_proof_names_the_violation() {
+        let g = linear(3);
+        // Зависимый шаг раньше предпосылки.
+        let swapped: Vec<String> = ["n2", "n1", "n3"].map(String::from).to_vec();
+        match prove_walk_order(&g, &swapped) {
+            Verdict::Violation(why) => assert!(why.contains("walk_order_n2_after_n1"), "{why}"),
+            Verdict::Ok => panic!("подделанный порядок принят"),
+        }
+        // Неполный журнал.
+        let short: Vec<String> = ["n1", "n2"].map(String::from).to_vec();
+        match prove_walk_order(&g, &short) {
+            Verdict::Violation(why) => assert!(why.contains("walk_unvisited_n3"), "{why}"),
+            Verdict::Ok => panic!("неполный журнал принят"),
+        }
+        // Повтор и чужой узел.
+        let twice: Vec<String> = ["n1", "n1", "n2", "n3"].map(String::from).to_vec();
+        assert!(matches!(
+            prove_walk_order(&g, &twice),
+            Verdict::Violation(_)
+        ));
+        let alien: Vec<String> = ["n1", "n2", "n3", "zz"].map(String::from).to_vec();
+        assert!(matches!(
+            prove_walk_order(&g, &alien),
             Verdict::Violation(_)
         ));
     }

@@ -92,7 +92,15 @@ impl TaskReport {
         }
     }
 
-    fn closed(text: impl Into<String>) -> Self {
+    /// Закрытый отчёт создаётся только по печати задних ворот: без
+    /// значения `back_gate::Seal` (а его выдаёт лишь `back_gate::seal_route`
+    /// после полной проверки пути) собрать `closed: true` невозможно.
+    fn closed(seal: &crate::back_gate::Seal, text: impl Into<String>) -> Self {
+        log::info!(
+            "задние ворота: печать закрытия для «{}», шагов {}",
+            seal.subject(),
+            seal.path().len()
+        );
         Self {
             text: text.into(),
             closed: true,
@@ -1703,10 +1711,20 @@ impl Agent {
                 self.finish_report(graph, trace)
             ));
         }
-        if let crate::logic::Verdict::Violation(why) = crate::logic::check_solution(graph, observed)
-        {
+        // Структурная часть задних ворот до эндоскопа: все узлы пройдены,
+        // подтверждены, порядок доказан Z3. Отказ возвращает точный перечень
+        // непройденного, а не общее «не подтверждено».
+        if let Err(refused) = crate::back_gate::seal_route(
+            task,
+            graph,
+            observed,
+            &crate::endoscope::Verdict::Proven,
+            crate::back_gate::EndoscopePolicy::Optional,
+            "",
+        ) {
             return TaskReport::open(format!(
-                "Задача не закрыта: {why}\n\n{}",
+                "Задача не закрыта: {}\n\n{}",
+                refused.summary(),
                 self.finish_report(graph, trace)
             ));
         }
@@ -1725,11 +1743,26 @@ impl Agent {
         // не доезжали до сверки — проверять было нечего, а статус выглядел
         // нормальным. Поэтому для проверки собираем все заявления по узлам.
         let verdict = crate::endoscope::judge_report(&self.claims_report(task, graph, trace));
-        if verdict.closes() {
-            self.remember_plan(task, graph);
-            TaskReport::closed(report)
-        } else {
-            TaskReport::open(format!("Задача не закрыта: {}\n\n{report}", verdict.why()))
+        // Печать выдают только задние ворота — с приговором эндоскопа
+        // внутри. Это единственное место в агенте, где рождается
+        // `closed: true`. Без эндоскопа (не настроен) агент закрывается
+        // проверками ядра — поведение GUI/headless не меняется.
+        match crate::back_gate::seal_route(
+            task,
+            graph,
+            observed,
+            &verdict,
+            crate::back_gate::EndoscopePolicy::Optional,
+            "",
+        ) {
+            Ok(seal) => {
+                self.remember_plan(task, graph);
+                TaskReport::closed(&seal, report)
+            }
+            Err(refused) => TaskReport::open(format!(
+                "Задача не закрыта: {}\n\n{report}",
+                refused.summary()
+            )),
         }
     }
 
