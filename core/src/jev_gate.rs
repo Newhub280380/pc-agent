@@ -160,14 +160,31 @@ impl Gate {
         if evidence.trim().is_empty() {
             return refusal("доказательство пустое".to_string());
         }
-        let missing: Vec<String> = quoted_fragments(&node.done_when)
-            .into_iter()
-            .filter(|fragment| !evidence.to_lowercase().contains(&fragment.to_lowercase()))
-            .collect();
-        if !missing.is_empty() {
+        let evidence_lower = evidence.to_lowercase();
+        let groups = quoted_fragment_groups(&node.done_when);
+        if groups.len() == 1 {
+            let missing: Vec<String> = groups[0]
+                .iter()
+                .filter(|fragment| !evidence_lower.contains(&fragment.to_lowercase()))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                return refusal(format!(
+                    "в доказательстве отсутствует обязательный фрагмент: {}",
+                    missing.join("; ")
+                ));
+            }
+        } else if !groups.is_empty()
+            && !groups.iter().any(|group| {
+                group
+                    .iter()
+                    .all(|fragment| evidence_lower.contains(&fragment.to_lowercase()))
+            })
+        {
+            let alternatives: Vec<String> = groups.iter().map(|group| group.join(" + ")).collect();
             return refusal(format!(
-                "в доказательстве отсутствует обязательный фрагмент: {}",
-                missing.join("; ")
+                "в доказательстве отсутствует подходящий вариант: {}",
+                alternatives.join(" или ")
             ));
         }
         match logic::allow_node_done(graph, step_id, true) {
@@ -329,11 +346,13 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     })
 }
 
-fn quoted_fragments(text: &str) -> Vec<String> {
+fn quoted_fragment_groups(text: &str) -> Vec<Vec<String>> {
     let mut open = None;
     let mut fragment = String::new();
-    let mut fragments = Vec::new();
-    for ch in text.chars() {
+    let mut previous_fragment_end = None;
+    let mut group = Vec::new();
+    let mut groups = Vec::new();
+    for (index, ch) in text.char_indices() {
         match open {
             None if ch == '«' => {
                 open = Some('»');
@@ -345,7 +364,13 @@ fn quoted_fragments(text: &str) -> Vec<String> {
             }
             Some(close) if ch == close => {
                 if !fragment.trim().is_empty() {
-                    fragments.push(fragment.clone());
+                    if previous_fragment_end
+                        .is_some_and(|end| text[end..index].contains(" или "))
+                    {
+                        groups.push(std::mem::take(&mut group));
+                    }
+                    group.push(fragment.clone());
+                    previous_fragment_end = Some(index + ch.len_utf8());
                 }
                 open = None;
             }
@@ -353,7 +378,10 @@ fn quoted_fragments(text: &str) -> Vec<String> {
             None => {}
         }
     }
-    fragments
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
 }
 
 pub fn serve_stdio() -> anyhow::Result<()> {
@@ -505,6 +533,46 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("обязательный фрагмент"));
+    }
+
+    #[test]
+    fn step_done_accepts_any_quoted_alternative() {
+        let task = "сделай пост в instagram";
+        let mut gate = Gate::default();
+        let (route_id, steps) = route(&mut gate, task);
+        let first = steps
+            .iter()
+            .find(|step| step["deps"].as_array().unwrap().is_empty())
+            .unwrap();
+        gate.routes
+            .get_mut(&route_id)
+            .unwrap()
+            .0
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == first["id"].as_str().unwrap())
+            .unwrap()
+            .done_when = "на экране видно «вариант A» или «вариант B»".to_string();
+        let accepted = call_step(&mut gate, &route_id, first, "видно вариант A");
+        assert_eq!(accepted["result"]["isError"], false);
+
+        let (second_route_id, second_steps) = route(&mut gate, task);
+        let second_first = second_steps
+            .iter()
+            .find(|step| step["deps"].as_array().unwrap().is_empty())
+            .unwrap();
+        gate.routes
+            .get_mut(&second_route_id)
+            .unwrap()
+            .0
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == second_first["id"].as_str().unwrap())
+            .unwrap()
+            .done_when = "на экране видно «вариант A» или «вариант B»".to_string();
+        let refused = call_step(&mut gate, &second_route_id, second_first, "виден другой вариант");
+        assert_eq!(refused["result"]["isError"], true);
+        assert_eq!(response_text(&refused)["status"], "refused");
     }
 
     #[test]
