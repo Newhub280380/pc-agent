@@ -25,6 +25,7 @@ mod gui;
 mod intent;
 mod jev;
 mod jev_gate;
+mod ledger;
 mod llm;
 mod logic;
 mod memory;
@@ -66,6 +67,9 @@ const CONSENT_TEXT: &str = "\
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--mcp") {
+        let paths = config::Paths::resolve()?;
+        config::ensure_env_file(&paths.env_file)?;
+        config::Layers::load(&paths)?.export_core_env();
         jev_gate::serve_stdio()?;
         return Ok(());
     }
