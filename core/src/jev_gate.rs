@@ -21,6 +21,12 @@ pub struct Gate {
     policy: witness::Policy,
     /// Архив закрытых маршрутов (журнал и свидетели) для `jev_report`.
     archive: HashMap<String, RouteState>,
+    /// Эндоскоп — отдельный самостоятельный продукт. Агент обязан работать
+    /// и без него: тогда печать ставят свидетели шлюза + Z3, а в печати
+    /// честно стоит `endoscope_not_configured`. Обязательным эндоскоп
+    /// становится, только если его явно подключили (`ENDOSCOPE_URL`,
+    /// `ENDOSCOPE_RUN_ID` или `ENDOSCOPE_REQUIRED`).
+    endoscope: back_gate::EndoscopePolicy,
     /// Подмена приговора эндоскопа только в тестах: в бою приговор всегда
     /// берётся из `endoscope::judge_report`, обходного пути нет.
     #[cfg(test)]
@@ -84,9 +90,20 @@ impl Default for Gate {
             closed: HashMap::new(),
             policy: witness::Policy::from_env(),
             archive: HashMap::new(),
+            endoscope: endoscope_policy_from_env(),
             #[cfg(test)]
             judge: None,
         }
+    }
+}
+
+/// Эндоскоп обязателен только когда его явно подключили в окружении.
+fn endoscope_policy_from_env() -> back_gate::EndoscopePolicy {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    if set("ENDOSCOPE_URL") || set("ENDOSCOPE_RUN_ID") || set("ENDOSCOPE_REQUIRED") {
+        back_gate::EndoscopePolicy::Required
+    } else {
+        back_gate::EndoscopePolicy::Optional
     }
 }
 
@@ -751,7 +768,7 @@ impl Gate {
             &route.graph,
             &route.observed,
             &verdict,
-            back_gate::EndoscopePolicy::Required,
+            self.endoscope,
             &anchor,
         ) {
             Ok(seal) => {
@@ -850,18 +867,23 @@ impl Gate {
             &route.graph,
             &route.observed,
             &endoscope::Verdict::NotConfigured,
-            back_gate::EndoscopePolicy::Required,
+            self.endoscope,
             &route.ledger.anchor(),
         )
         .err()
         .map(|refusal| *refusal)
         .unwrap_or_default();
+        let why = if refused.is_empty() {
+            "путь пройден, осталось вызвать jev_close".to_string()
+        } else {
+            refused.summary()
+        };
         tool_result(
             json!({
                 "status":"open",
                 "id":id,
                 "verified":false,
-                "text":format!("НЕ ПОДТВЕРЖДЕНО: маршрут {id} не закрыт шлюзом — {}", refused.summary()),
+                "text":format!("НЕ ПОДТВЕРЖДЕНО: маршрут {id} не закрыт шлюзом — {why}"),
                 "refusal":refused.json()
             }),
             true,
@@ -884,7 +906,7 @@ impl Gate {
                 &route.graph,
                 &route.observed,
                 &endoscope::Verdict::NotConfigured,
-                back_gate::EndoscopePolicy::Required,
+                self.endoscope,
                 &route.ledger.anchor(),
             )
             .err()
@@ -1100,7 +1122,7 @@ impl Gate {
             &study.walk,
             report,
             &verdict,
-            back_gate::EndoscopePolicy::Required,
+            self.endoscope,
         ) {
             Ok((seal, _)) => {
                 let result = json!({"status":"closed","study_id":study_id,"seal":seal.json()});
@@ -1773,6 +1795,7 @@ mod tests {
         ];
         let (_collector, executable) = fake_collector(&sources);
         let mut gate = Gate::default();
+        gate.endoscope = back_gate::EndoscopePolicy::Required;
         gate.collector = Some(executable);
         let (route_id, _) = route(&mut gate, "исследуй последние 2 reels instagram");
         let collected = call_collect(&mut gate, &route_id);
@@ -1987,6 +2010,8 @@ mod tests {
     #[test]
     fn all_steps_done_without_endoscope_stays_open() {
         let mut gate = Gate::default();
+        // Эндоскоп явно подключён как обязательный, но не отвечает.
+        gate.endoscope = back_gate::EndoscopePolicy::Required;
         let (route_id, steps) = route(&mut gate, "отрендери ролик с заменой лица");
         walk_all_steps(&mut gate, &route_id, &steps);
         let route = gate.routes.get(&route_id).unwrap();
@@ -2007,6 +2032,38 @@ mod tests {
             .contains("эндоскоп не настроен"));
         assert!(gate.routes.contains_key(&route_id));
         assert!(!gate.closed.contains_key(&route_id));
+    }
+
+    /// Агент самостоятелен: без подключённого эндоскопа полный проход
+    /// закрывают свидетели шлюза + Z3, а печать честно говорит, что
+    /// независимой проверки не было.
+    #[test]
+    fn standalone_agent_closes_without_endoscope() {
+        let mut gate = Gate::default();
+        gate.endoscope = back_gate::EndoscopePolicy::Optional;
+        let (route_id, steps) = route(&mut gate, "отрендери ролик с заменой лица");
+        walk_all_steps(&mut gate, &route_id, &steps);
+        let report = response_text(
+            &gate
+                .handle(request(
+                    7,
+                    "tools/call",
+                    json!({"name":"jev_report","arguments":{"id":route_id}}),
+                ))
+                .unwrap(),
+        );
+        assert!(report["text"]
+            .as_str()
+            .unwrap()
+            .contains("осталось вызвать jev_close"));
+        let response = call_close(&mut gate, &route_id, "готово");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let result = response_text(&response);
+        assert_eq!(result["status"], "closed");
+        assert_eq!(result["seal"]["jev_close"], true);
+        let proof = result["seal"]["proof"].to_string();
+        assert!(proof.contains("endoscope_not_configured"), "{proof}");
+        assert!(proof.contains("witness_anchor"), "{proof}");
     }
 
     /// Положительный сценарий: полный проход пути → печать jev_close.
