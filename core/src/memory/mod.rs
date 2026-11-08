@@ -23,7 +23,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -137,6 +137,17 @@ impl Memory {
                 status TEXT NOT NULL DEFAULT 'running',
                 started_at TEXT NOT NULL,
                 finished_at TEXT NOT NULL DEFAULT ''
+            );
+
+            -- Доказанные планы: повтор точной задачи идёт по графу без LLM.
+            CREATE TABLE IF NOT EXISTS plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_key TEXT NOT NULL UNIQUE,
+                task TEXT NOT NULL,
+                graph TEXT NOT NULL,
+                uses INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_used TEXT NOT NULL
             );
             "#,
         )?;
@@ -505,6 +516,50 @@ impl Memory {
         Ok(())
     }
 
+    fn plan_key(task: &str) -> String {
+        task.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    /// Сохраняет граф, который уже закрыл задачу по доказательству. Пишем
+    /// только JSON: память не должна тянуть типы агента в свою схему.
+    pub fn save_plan(&self, task: &str, graph: &str) -> Result<()> {
+        let key = Self::plan_key(task);
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO plans (task_key, task, graph, uses, created_at, last_used) VALUES (?1,?2,?3,0,?4,?5)
+             ON CONFLICT(task_key) DO UPDATE SET task=excluded.task, graph=excluded.graph, last_used=excluded.last_used",
+            params![key, task, graph, now, now],
+        )?;
+        Ok(())
+    }
+
+    /// Точный повтор задачи. Нечёткое совпадение сюда не попадает: план с
+    /// чужими объектами хуже, чем честный LLM-планировщик.
+    pub fn find_plan(&self, task: &str) -> Result<Option<String>> {
+        let key = Self::plan_key(task);
+        let graph = self
+            .conn
+            .query_row(
+                "SELECT graph FROM plans WHERE task_key=?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(graph)
+    }
+
+    pub fn touch_plan(&self, task: &str) -> Result<()> {
+        let key = Self::plan_key(task);
+        self.conn.execute(
+            "UPDATE plans SET uses=uses+1, last_used=?2 WHERE task_key=?1",
+            params![key, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     /// Задачи, застрявшие в 'running': их процесс уже не существует.
     pub fn interrupted_tasks(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self
@@ -626,6 +681,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{}.db", rand::random::<u64>()));
         Memory::open(&path).unwrap()
+    }
+
+    #[test]
+    fn plan_roundtrip_uses_normalized_key() {
+        let m = mem();
+        m.save_plan("  Сделай   ОТЧЁТ  ", "{\"goal\":\"x\"}")
+            .unwrap();
+        assert_eq!(
+            m.find_plan("сделай отчёт").unwrap().as_deref(),
+            Some("{\"goal\":\"x\"}")
+        );
+        assert!(m.find_plan("другой отчёт").unwrap().is_none());
+        m.touch_plan("СДЕЛАЙ ОТЧЁТ").unwrap();
+        assert!(m.find_plan("сделай отчёт").unwrap().is_some());
     }
 
     #[test]
