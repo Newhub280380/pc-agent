@@ -705,12 +705,29 @@ fn build_research_plan(task: &str) -> Option<TaskGraph> {
 }
 
 fn requested_reel_count(task: &str) -> usize {
-    let digits: String = task
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit())
-        .take_while(char::is_ascii_digit)
+    let lowercase = task.to_lowercase();
+    let tokens: Vec<&str> = lowercase
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
         .collect();
-    digits.parse::<usize>().unwrap_or(10).clamp(1, 12)
+    let count = tokens.iter().enumerate().find_map(|(index, token)| {
+        if token.chars().all(|c| c.is_ascii_digit())
+            && tokens
+                .iter()
+                .skip(index + 1)
+                .take(3)
+                .any(|next| {
+                    ["ролик", "рилс", "reel", "видео", "публикац", "пост"]
+                        .iter()
+                        .any(|stem| next.starts_with(stem) || next.contains(stem))
+                })
+        {
+            Some(token.parse::<usize>().unwrap_or(12))
+        } else {
+            None
+        }
+    });
+    count.unwrap_or(10).clamp(1, 12)
 }
 
 fn solve_order(ops: &[Operator], initial: &[&str], goal: &str) -> Option<Vec<usize>> {
@@ -917,6 +934,11 @@ mod tests {
         assert_eq!(requested_reel_count("исследуй reels Instagram"), 10);
         assert_eq!(requested_reel_count("исследуй 3 reels Instagram"), 3);
         assert_eq!(requested_reel_count("исследуй 99 reels Instagram"), 12);
+        assert_eq!(
+            requested_reel_count("изучи instagram beauty_art2024 и 5 последних роликов"),
+            5
+        );
+        assert_eq!(requested_reel_count("изучи instagram user123"), 10);
     }
 
     #[test]
