@@ -668,7 +668,7 @@ fn build_research_plan(task: &str) -> Option<TaskGraph> {
         id: id.clone(),
         goal: format!("Досмотреть ролик №{} до конца и сохранить расшифровку", i + 1),
         done_when: "«просмотрен целиком, включая последнюю минуту»; виден конец ролика: «таймкод равен длительности»; «расшифровка ролика сохранена»".to_string(),
-        deps: vec!["research_list_reels".to_string()],
+        deps: Vec::new(),
         rollback: String::new(),
         state: NodeState::Pending,
         note: String::new(),

@@ -126,12 +126,13 @@ fn canonical_key(k: &str) -> String {
 }
 
 /// Ключи, которые читаются через `std::env` в разных местах ядра: порог
-/// смысловой памяти, адрес и прогон эндоскопа, выбор солвера, таймаут
-/// зависания и ключ быстрых решений.
-pub const CORE_ENV_KEYS: [&str; 8] = [
+/// смысловой памяти, адрес и прогон эндоскопа, сборщик роликов, выбор солвера,
+/// таймаут зависания и ключ быстрых решений.
+pub const CORE_ENV_KEYS: [&str; 9] = [
     "MEMORY_SEMANTIC_MIN",
     "ENDOSCOPE_URL",
     "ENDOSCOPE_RUN_ID",
+    "PCAGENT_COLLECTOR",
     "PCAGENT_OPTIMIZER",
     "PCAGENT_HANG_SEC",
     "PCAGENT_INTENT",
@@ -675,6 +676,8 @@ PCAGENT_INTENT=auto
 # Координатор: open — без доказанного маршрута план строит модель (с пометкой),
 # strict — такая задача остаётся открытой, модель маршрут не выбирает
 PCAGENT_ROUTE=open
+# Команда-сборщик роликов: получает задачу и N аргументами, печатает JSON [Source]
+PCAGENT_COLLECTOR=
 "#
     )
 }
@@ -969,6 +972,12 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("битый JSON"), "{err}");
+    }
+
+    #[test]
+    fn collector_setting_is_exported_to_core_env() {
+        assert!(CORE_ENV_KEYS.contains(&"PCAGENT_COLLECTOR"));
+        assert!(template("test-token").contains("PCAGENT_COLLECTOR=\n"));
     }
 
     /// Порог смысловой памяти человек пишет в `.env`/`config.json`, а ядро
