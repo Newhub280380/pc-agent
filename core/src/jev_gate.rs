@@ -7,6 +7,7 @@ use std::io::{BufRead, Write};
 #[derive(Default)]
 pub struct Gate {
     routes: HashMap<String, (TaskGraph, HashMap<String, bool>)>,
+    next_route_id: u64,
 }
 
 impl Gate {
@@ -130,14 +131,11 @@ impl Gate {
                 false,
             ),
             proof::Routing::Route { kind, graph } => {
-                let mut serial = self.routes.len() + 1;
-                let route_id = loop {
-                    let candidate = format!("route-{serial}");
-                    if !self.routes.contains_key(&candidate) {
-                        break candidate;
-                    }
-                    serial += 1;
-                };
+                self.next_route_id = self
+                    .next_route_id
+                    .checked_add(1)
+                    .expect("route ID counter exhausted");
+                let route_id = format!("route-{}", self.next_route_id);
                 let observed = graph
                     .nodes
                     .iter()
@@ -631,6 +629,29 @@ mod tests {
             .unwrap();
         assert_eq!(later["result"]["isError"], true);
         assert!(response_text(&later)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("неизвестный маршрут"));
+    }
+
+    #[test]
+    fn route_ids_are_not_reused_after_successful_close() {
+        let mut gate = Gate::default();
+        let (route_a, steps_a) = route(&mut gate, "отрендери ролик с заменой лица");
+        let closed = gate.close_after_proof(&route_a, &endoscope::Verdict::Proven);
+        assert_eq!(closed["isError"], false);
+
+        let (route_b, _) = route(&mut gate, "отрендери ролик с заменой лица");
+        assert_ne!(route_a, route_b);
+
+        let stale_step = call_step(
+            &mut gate,
+            &route_a,
+            &steps_a[0],
+            steps_a[0]["done_when"].as_str().unwrap(),
+        );
+        assert_eq!(stale_step["result"]["isError"], true);
+        assert!(response_text(&stale_step)["reason"]
             .as_str()
             .unwrap()
             .contains("неизвестный маршрут"));
