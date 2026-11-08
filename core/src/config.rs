@@ -676,7 +676,7 @@ PCAGENT_INTENT=auto
 # Координатор: open — без доказанного маршрута план строит модель (с пометкой),
 # strict — такая задача остаётся открытой, модель маршрут не выбирает
 PCAGENT_ROUTE=open
-# Команда-сборщик роликов: получает задачу и N аргументами, печатает JSON [Source]
+# Команда-сборщик: research получает задачу и N отдельными argv; collector:ARG — ARG; stdout — JSON [Source]
 PCAGENT_COLLECTOR=
 "#
     )
