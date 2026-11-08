@@ -367,8 +367,7 @@ fn quoted_fragment_groups(text: &str) -> Vec<Vec<String>> {
             }
             Some(close) if ch == close => {
                 if !fragment.trim().is_empty() {
-                    if previous_fragment_end
-                        .is_some_and(|end| text[end..index].contains(" или "))
+                    if previous_fragment_end.is_some_and(|end| text[end..index].contains(" или "))
                     {
                         groups.push(std::mem::take(&mut group));
                     }
@@ -573,7 +572,12 @@ mod tests {
             .find(|node| node.id == second_first["id"].as_str().unwrap())
             .unwrap()
             .done_when = "на экране видно «вариант A» или «вариант B»".to_string();
-        let refused = call_step(&mut gate, &second_route_id, second_first, "виден другой вариант");
+        let refused = call_step(
+            &mut gate,
+            &second_route_id,
+            second_first,
+            "виден другой вариант",
+        );
         assert_eq!(refused["result"]["isError"], true);
         assert_eq!(response_text(&refused)["status"], "refused");
     }
@@ -613,11 +617,19 @@ mod tests {
 
         let response = gate.close_after_proof(&route_id, &endoscope::Verdict::Proven);
         assert_eq!(response["isError"], false);
-        assert_eq!(response_text(&response)["status"], "closed");
+        let closed: Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(closed["status"], "closed");
         assert!(!gate.routes.contains_key(&route_id));
 
-        let later = gate.close(&route_id, "готово");
-        assert_eq!(later["isError"], true);
+        let later = gate
+            .handle(request(
+                4,
+                "tools/call",
+                json!({"name":"jev_close","arguments":{"route_id":route_id,"report":"готово"}}),
+            ))
+            .unwrap();
+        assert_eq!(later["result"]["isError"], true);
         assert!(response_text(&later)["reason"]
             .as_str()
             .unwrap()
