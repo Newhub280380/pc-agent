@@ -31,7 +31,7 @@ use crate::retry::{retry, Backoff};
 use action::{Action, Decision};
 use anyhow::Result;
 use executor::{Executor, Outcome};
-use graph::TaskGraph;
+use graph::{NodeState, TaskGraph};
 use grounding::Evidence;
 use react::{Gate, Step, Trace};
 use std::collections::HashMap;
@@ -107,6 +107,18 @@ impl TaskReport {
             chat: false,
         }
     }
+}
+
+fn replayable_graph(graph: &TaskGraph) -> TaskGraph {
+    let mut g = graph.clone();
+    for node in &mut g.nodes {
+        node.state = NodeState::Pending;
+        node.note.clear();
+        node.attempts = 0;
+        node.rounds = 0;
+    }
+    g.completed_order.clear();
+    g
 }
 
 pub struct AgentConfig {
@@ -291,6 +303,14 @@ impl Agent {
     /// содержимое и работаем дальше.
     fn mem_lock(&self) -> std::sync::MutexGuard<'_, Memory> {
         self.mem.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn remember_plan(&self, task: &str, graph: &TaskGraph) {
+        let g = replayable_graph(graph);
+        if let Ok(json) = serde_json::to_string(&g) {
+            let m = self.mem_lock();
+            let _ = m.save_plan(task, &json);
+        }
     }
 
     /// Вектор запроса для смыслового поиска по памяти. `None` — эмбеддер не
@@ -492,16 +512,37 @@ impl Agent {
         }
 
         // 1. Поднимаем прошлый опыт ДО планирования.
+        let proof_graph = if resumed.is_none() {
+            crate::proof::plan(task)
+        } else {
+            None
+        };
+        let mut replayed: Option<TaskGraph> = None;
         let hints = if resumed.is_some() {
             String::new()
         } else {
             let m = self.mem_lock();
+            if proof_graph.is_none() {
+                if let Ok(Some(json)) = m.find_plan(task) {
+                    if let Ok(g) = serde_json::from_str::<TaskGraph>(&json) {
+                        let mut g = replayable_graph(&g);
+                        g.goal = task.to_string();
+                        if g.validate().is_ok() {
+                            replayed = Some(g);
+                            let _ = m.touch_plan(task);
+                        }
+                    }
+                }
+            }
             m.recall_global(task, 8)?
                 .into_iter()
                 .map(|i| format!("- [{}] {}: {}", i.shelf, i.title, i.summary))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        if replayed.is_some() {
+            self.log("Нашёл доказанный план этой задачи, иду по нему без LLM");
+        }
         if !hints.is_empty() {
             self.log("Нашёл прошлый опыт по этой теме, учитываю в плане");
         }
@@ -511,6 +552,10 @@ impl Agent {
         // фразы «цель видна выполненной».
         let mut graph = if let Some(snap) = &resumed {
             snap.graph.clone()
+        } else if let Some(g) = proof_graph {
+            g
+        } else if let Some(g) = replayed {
+            g
         } else {
             match planner::make_graph(&self.llm, task, &hints, &self.intent_block) {
                 Ok(g) => g,
@@ -1631,6 +1676,7 @@ impl Agent {
         // нормальным. Поэтому для проверки собираем все заявления по узлам.
         let verdict = crate::endoscope::judge_report(&self.claims_report(task, graph, trace));
         if verdict.closes() {
+            self.remember_plan(task, graph);
             TaskReport::closed(report)
         } else {
             TaskReport::open(format!("Задача не закрыта: {}\n\n{report}", verdict.why()))
@@ -2361,5 +2407,26 @@ mod tests {
             ),
             "проваленный граф нельзя закрыть отчётом"
         );
+    }
+
+    /// Повторный запуск не должен наследовать Done/attempts прошлого прогона,
+    /// иначе граф закроется сам по себе, не сделав ни одного шага.
+    #[test]
+    fn replayable_graph_resets_run_state_but_keeps_plan() {
+        let mut g = TaskGraph::linear("задача", &[("шаг".into(), "критерий".into())]);
+        g.validate().unwrap();
+        g.nodes[0].state = NodeState::Done;
+        g.nodes[0].note = "видно на экране".into();
+        g.nodes[0].attempts = 2;
+        g.nodes[0].rounds = 1;
+        g.completed_order.push("n1".into());
+
+        let r = replayable_graph(&g);
+        assert_eq!(r.nodes[0].state, NodeState::Pending);
+        assert!(r.nodes[0].note.is_empty());
+        assert_eq!(r.nodes[0].attempts, 0);
+        assert_eq!(r.nodes[0].rounds, 0);
+        assert!(r.completed_order.is_empty());
+        assert_eq!(r.nodes[0].goal, "шаг");
     }
 }
