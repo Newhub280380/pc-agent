@@ -712,7 +712,7 @@ fn requested_reel_count(task: &str) -> usize {
         .collect();
     let count = tokens.iter().enumerate().find_map(|(index, token)| {
         if token.chars().all(|c| c.is_ascii_digit())
-            && tokens.iter().skip(index + 1).take(3).any(|next| {
+            && tokens.iter().skip(index + 1).take(5).any(|next| {
                 ["ролик", "рилс", "reel", "видео", "публикац", "пост"]
                     .iter()
                     .any(|stem| next.starts_with(stem) || next.contains(stem))
@@ -929,6 +929,10 @@ mod tests {
             5
         );
         assert_eq!(requested_reel_count("изучи instagram user123"), 10);
+        assert_eq!(
+            requested_reel_count("исследуй 3 самых последних опубликованных reels Instagram"),
+            3
+        );
     }
 
     #[test]
