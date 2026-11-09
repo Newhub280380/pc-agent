@@ -15,6 +15,7 @@ mod agent;
 mod android;
 mod back_gate;
 mod checkpoint;
+mod claims;
 mod config;
 mod coordinator;
 mod corpus;
@@ -92,12 +93,23 @@ fn main() -> Result<()> {
         let policy = jev_gate::RemotePolicy {
             file_root: flag_value(&args, "--file-root").map(std::path::PathBuf::from),
         };
+        // `--upstream https://api.x.ai` — прокси к API ботов: шлюз видит
+        // каждый ответ и проверяет авторство без участия бота. Ключ API —
+        // в `PCAGENT_UPSTREAM_KEY` (или `XAI_API_KEY`), боты его не знают.
+        let upstream = flag_value(&args, "--upstream").map(|base| jev_http::Upstream {
+            base: base.trim_end_matches('/').to_string(),
+            key: std::env::var("PCAGENT_UPSTREAM_KEY")
+                .or_else(|_| std::env::var("XAI_API_KEY"))
+                .ok()
+                .filter(|k| !k.trim().is_empty()),
+        });
         let listener = std::net::TcpListener::bind(&bind)?;
         eprintln!(
-            "pcagent jev http: {bind}, агенты: {}",
-            agents.names().join(", ")
+            "pcagent jev http: {bind}, агенты: {}, прокси: {}",
+            agents.names().join(", "),
+            upstream.as_ref().map_or("нет", |u| u.base.as_str())
         );
-        jev_http::serve(listener, agents, jev_gate::Gate::remote(policy))?;
+        jev_http::serve(listener, agents, jev_gate::Gate::remote(policy), upstream)?;
         return Ok(());
     }
     if let Some(question) = flag_value(&args, "--study") {

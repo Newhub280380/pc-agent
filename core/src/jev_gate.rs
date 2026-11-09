@@ -265,6 +265,22 @@ impl Gate {
         })
     }
 
+    /// Реестр авторства (для HTTP-прокси, который видит ответы агентов).
+    pub fn provenance_mut(&mut self) -> &mut provenance::Registry {
+        &mut self.provenance
+    }
+
+    pub fn provenance_ref(&self) -> &provenance::Registry {
+        &self.provenance
+    }
+
+    /// Наблюдение артефакта + dHash, если это картинка.
+    fn observe_with_dhash(&self, artifact: &Value) -> Result<(witness::Observation, Option<u64>), String> {
+        let observation = self.observe_artifact(artifact)?;
+        let dhash = artifact_bytes(&observation.probe).and_then(|b| provenance::dhash(&b));
+        Ok((observation, dhash))
+    }
+
     /// Наблюдение артефакта для реестра авторства (вне маршрута).
     fn observe_artifact(&self, artifact: &Value) -> Result<witness::Observation, String> {
         let probe = witness::Probe::from_json(artifact)?;
@@ -280,9 +296,9 @@ impl Gate {
 
     fn register_artifact(&mut self, args: &Value) -> Value {
         let caller = self.caller.clone();
-        let (sha, bytes, locator, source) = if let Some(artifact) = args.get("artifact") {
-            match self.observe_artifact(artifact) {
-                Ok(o) => (o.sha256, o.bytes, o.probe.locator(), "observed"),
+        let (sha, bytes, locator, source, dhash) = if let Some(artifact) = args.get("artifact") {
+            match self.observe_with_dhash(artifact) {
+                Ok((o, dhash)) => (o.sha256, o.bytes, o.probe.locator(), "observed", dhash),
                 Err(reason) => return refusal(reason),
             }
         } else if let Some(sha) = args.get("sha256").and_then(Value::as_str) {
@@ -297,13 +313,16 @@ impl Gate {
                     .unwrap_or_default()
                     .to_string(),
                 "declared",
+                args.get("dhash")
+                    .and_then(Value::as_str)
+                    .and_then(|h| u64::from_str_radix(h, 16).ok()),
             )
         } else {
             return refusal("нужен artifact {kind:file|url} или sha256".into());
         };
         let author = self
             .provenance
-            .register(&caller, &sha, bytes, &locator, source);
+            .register(&caller, &sha, bytes, &locator, source, dhash);
         if author.author == caller {
             tool_result(
                 json!({"status":"registered","author":caller,"record":author.json()}),
@@ -329,43 +348,75 @@ impl Gate {
         ) else {
             return refusal("нужны artifact {kind:file|url} и claimed_author".into());
         };
-        let observation = match self.observe_artifact(artifact) {
+        let (observation, dhash) = match self.observe_with_dhash(artifact) {
             Ok(o) => o,
             Err(reason) => return refusal(reason),
         };
         let caller = self.caller.clone();
         let locator = observation.probe.locator();
-        match self
+        let verdict = self
             .provenance
-            .attest(&caller, claimed, &observation.sha256, &locator)
-        {
-            provenance::Verdict::Confirmed(record) => tool_result(
-                json!({
-                    "status":"confirmed",
-                    "verdict":format!("ПОДТВЕРЖДЕНО ШЛЮЗОМ: автор {}", record.author),
-                    "sha256":observation.sha256,
-                    "record":record.json()
+            .attest(&caller, claimed, &observation.sha256, dhash, &locator);
+        tool_result(
+            json!({
+                "status": verdict.code(),
+                "verdict": verdict.text(claimed),
+                "sha256": observation.sha256,
+                "record": match &verdict {
+                    provenance::Verdict::Confirmed(r) => Some(r.json()),
+                    provenance::Verdict::NearConfirmed { record, .. } => Some(record.json()),
+                    provenance::Verdict::Mismatch { author, .. }
+                    | provenance::Verdict::NearMismatch { author, .. } => Some(author.json()),
+                    _ => None,
+                },
+            }),
+            !verdict.is_confirmed(),
+        )
+    }
+
+    /// Проверить отчёт агента (текст + файлы). Отчитавшимся считается
+    /// вызывающий; `admin` может указать `agent`, чей отчёт он вставил.
+    fn check_report(&mut self, args: &Value) -> Value {
+        let Some(text) = args.get("text").and_then(Value::as_str) else {
+            return refusal("нужен text — сообщение агента".into());
+        };
+        let reporter = match args.get("agent").and_then(Value::as_str) {
+            Some(agent) if self.caller == "admin" || self.caller == "local" => provenance::normalize(agent),
+            Some(_) => return refusal("указать чужой отчёт (agent) может только admin".into()),
+            None => self.caller.clone(),
+        };
+        let mut seen = Vec::new();
+        for artifact in args.get("artifacts").and_then(Value::as_array).into_iter().flatten() {
+            match self.observe_with_dhash(artifact) {
+                Ok((o, dhash)) => seen.push(provenance::Seen {
+                    locator: o.probe.locator(),
+                    sha256: o.sha256,
+                    dhash,
                 }),
-                false,
-            ),
-            provenance::Verdict::Mismatch { claimed, author } => tool_result(
-                json!({
-                    "status":"mismatch",
-                    "verdict":format!("ВЫДУМКА: заявлен автор {claimed}, а по реестру автор {}", author.author),
-                    "sha256":observation.sha256,
-                    "record":author.json()
-                }),
-                true,
-            ),
-            provenance::Verdict::Unproven => tool_result(
-                json!({
-                    "status":"unproven",
-                    "verdict":format!("НЕ ПОДТВЕРЖДЕНО: этот файл никто не регистрировал, авторство {claimed} не доказано"),
-                    "sha256":observation.sha256
-                }),
-                true,
-            ),
+                Err(reason) => return refusal(reason),
+            }
         }
+        for (i, file) in args.get("attachments").and_then(Value::as_array).into_iter().flatten().enumerate() {
+            let Some(bytes) = file
+                .get("base64")
+                .and_then(Value::as_str)
+                .and_then(|b| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b.trim()).ok())
+            else {
+                return refusal(format!("attachments[{i}].base64 не декодируется"));
+            };
+            seen.push(provenance::Seen {
+                locator: file
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("attachment-{i}")),
+                sha256: witness::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+                dhash: provenance::dhash(&bytes),
+            });
+        }
+        let out = self.provenance.check_report(&reporter, text, &seen);
+        let bad = out["status"] == "fabrication";
+        tool_result(out, bad)
     }
 
     fn dispatch_tool(&mut self, params: &Value) -> Value {
@@ -551,6 +602,7 @@ impl Gate {
             "jev_register_artifact" => self.register_artifact(args),
             "jev_attest" => self.attest(args),
             "jev_agents" => tool_result(self.provenance.agents_json(), false),
+            "jev_check_report" => self.check_report(args),
             _ => tool_result(
                 json!({"status":"refused","reason":format!("неизвестный инструмент {name}")}),
                 true,
@@ -1605,7 +1657,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name":"jev_attest",
-            "description":"ОБЯЗАТЕЛЬНО перед словами «это сделал X»: шлюз сам скачивает/читает артефакт, считает SHA-256 и сверяет заявленного автора с реестром. Ответ: confirmed, mismatch (выдумка, засчитывается тебе) или unproven.",
+            "description":"ОБЯЗАТЕЛЬНО перед словами «это сделал X»: шлюз сам скачивает/читает артефакт, считает SHA-256 и перцептивный хэш картинки и сверяет заявленного автора с реестром. Ответ: confirmed / near_confirmed, mismatch / near_mismatch / not_produced (выдумка, засчитывается тебе) или unproven.",
             "inputSchema":{
                 "type":"object",
                 "properties":{
@@ -1626,11 +1678,43 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name":"jev_check_report",
+            "description":"Проверить сообщение агента целиком: шлюз сам находит в тексте утверждения «это сделал X» и сверяет их с файлами (artifacts {kind:file|url} или attachments {name, base64}). Отчитавшийся — вызывающий; admin может указать agent.",
+            "inputSchema":{
+                "type":"object",
+                "properties":{
+                    "text":{"type":"string"},
+                    "agent":{"type":"string"},
+                    "artifacts":{"type":"array","items":{"type":"object"}},
+                    "attachments":{"type":"array","items":{
+                        "type":"object",
+                        "properties":{"name":{"type":"string"},"base64":{"type":"string"}},
+                        "required":["base64"]
+                    }}
+                },
+                "required":["text"],
+                "additionalProperties":false
+            }
+        }),
+        json!({
             "name":"jev_agents",
             "description":"Сводка по агентам: вызовы, отказы шлюза, зарегистрированные артефакты, подтверждённое авторство и пойманные выдумки; последние события.",
             "inputSchema":{"type":"object","properties":{},"additionalProperties":false}
         }),
     ]
+}
+
+/// Байты артефакта для перцептивного хэша (картинки ≤ 32 МБ).
+fn artifact_bytes(probe: &witness::Probe) -> Option<Vec<u8>> {
+    const CAP: u64 = 32 * 1024 * 1024;
+    match probe {
+        witness::Probe::File { path } => {
+            let meta = std::fs::metadata(path).ok()?;
+            (meta.len() <= CAP).then(|| std::fs::read(path).ok()).flatten()
+        }
+        witness::Probe::Url { url } => crate::jev_http::fetch_capped(url, CAP as usize).ok(),
+        _ => None,
+    }
 }
 
 fn tool_result(value: Value, is_error: bool) -> Value {
@@ -1856,7 +1940,7 @@ mod tests {
             .handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .is_none());
         let listed = gate.handle(request(2, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 12);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 13);
     }
 
     struct StudyExtractor;
