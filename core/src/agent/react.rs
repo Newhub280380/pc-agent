@@ -1,4 +1,4 @@
-//! ReAct: Thought → Action → Observation, и только потом следующий шаг.
+﻿//! ReAct: Thought → Action → Observation, и только потом следующий шаг.
 //!
 //! Что здесь принципиально:
 //!   - Observation ЗАПИСЫВАЕТСЯ ПОСЛЕ действия и берётся из реального
@@ -40,9 +40,6 @@ pub struct Trace {
 
 impl Trace {
     pub fn push(&mut self, step: Step) {
-        if self.steps.len() == MEMORY_STEPS {
-            self.steps.pop_front();
-        }
         self.steps.push_back(step);
     }
 
@@ -57,10 +54,7 @@ impl Trace {
     }
 
     pub fn from_steps(&mut self, steps: Vec<Step>) {
-        self.steps.clear();
-        for step in steps.into_iter().take(MEMORY_STEPS) {
-            self.steps.push_back(step);
-        }
+        self.steps = steps.into();
     }
 
     pub fn verified_count(&self) -> usize {
@@ -86,7 +80,8 @@ impl Trace {
             return String::new();
         }
         let mut s = String::from("ПОСЛЕДНИЕ ШАГИ (ReAct, максимум 10):\n");
-        for st in &self.steps {
+        let skip = self.steps.len().saturating_sub(MEMORY_STEPS);
+        for st in self.steps.iter().skip(skip) {
             s.push_str(&format!(
                 "#{n} Thought: {t} (уверенность {c:.2})\n   Action: {a}\n   Observation: {o}{v}\n",
                 n = st.n,
@@ -168,11 +163,11 @@ mod tests {
         for i in 0..25 {
             t.push(step(i, &format!("a{i}")));
         }
-        assert_eq!(t.len(), MEMORY_STEPS);
+        assert_eq!(t.len(), 25);
         let r = t.render();
         assert!(r.contains("#24"));
         assert!(!r.contains("#14"), "старые шаги должны вытесняться");
-        assert_eq!(t.verified_count(), MEMORY_STEPS);
+        assert_eq!(t.verified_count(), 25);
     }
 
     #[test]
@@ -201,3 +196,5 @@ mod tests {
         ));
     }
 }
+
+
