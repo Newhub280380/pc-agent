@@ -1,4 +1,4 @@
-use crate::ledger::{self, Segment, Source, Unit};
+﻿use crate::ledger::{self, Segment, Source, Unit};
 use crate::llm::{LlmClient, Message};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeSet, HashSet, VecDeque};
@@ -649,7 +649,7 @@ pub fn walk(question: &str, sources: &[Source], extractor: &dyn Extract) -> Resu
                 }
                 match ledger::verify_statement(&note, &[chunk.clone()]) {
                     Ok(_) => output.notes.push(note),
-                    Err(reason) => output.dropped.push((note, reason)),
+                    Err(reason) => output.dropped.push((note, reason.to_string())),
                 }
             }
         }
@@ -1049,3 +1049,4 @@ mod tests {
         assert!(ledger::complete(&source).is_ok());
     }
 }
+
