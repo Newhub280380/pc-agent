@@ -2461,5 +2461,3 @@ mod tests {
         assert_eq!(response["result"]["isError"], true);
     }
 }
-
-
