@@ -1044,6 +1044,7 @@ impl Agent {
                     ),
                     confidence: decision.confidence,
                     verified: Some(false),
+                    spans: Vec::new(),
                 });
                 failures.push(format!("выдуманные сущности: {why}"));
                 continue;
@@ -1107,6 +1108,7 @@ impl Agent {
                         observation: format!("человек ответил: {ans}"),
                         confidence: decision.confidence,
                         verified: None,
+                        spans: Vec::new(),
                     });
                     continue;
                 }
@@ -1257,6 +1259,7 @@ impl Agent {
                         observation,
                         confidence: decision.confidence,
                         verified: Some(verdict.is_confirmed()),
+                        spans: Vec::new(),
                     });
                     self.jev.observe(&act_str, !verdict.is_refuted());
                     self.mem_lock().log_step(
@@ -1301,6 +1304,7 @@ impl Agent {
                                 },
                                 confidence: decision.confidence,
                                 verified: Some(proven),
+                                spans: Vec::new(),
                             });
                         }
                         Work::Node { id, done_when, .. } => {
@@ -1355,6 +1359,7 @@ impl Agent {
                                 },
                                 confidence: decision.confidence,
                                 verified: Some(ok),
+                                spans: Vec::new(),
                             });
                         }
                     }
@@ -1465,6 +1470,7 @@ impl Agent {
                                 observation: format!("finish отклонён: {why}"),
                                 confidence: decision.confidence,
                                 verified: Some(false),
+                                spans: Vec::new(),
                             });
                             continue;
                         }
@@ -1487,6 +1493,7 @@ impl Agent {
                         observation,
                         confidence: decision.confidence,
                         verified: None,
+                        spans: Vec::new(),
                     });
                 }
                 Ok(Outcome::NeedTool { what, why, how }) => {
@@ -1506,6 +1513,7 @@ impl Agent {
                         observation: format!("человек ответил: {ans}"),
                         confidence: decision.confidence,
                         verified: None,
+                        spans: Vec::new(),
                     });
                 }
                 Err(e) => {
@@ -1535,6 +1543,7 @@ impl Agent {
                         observation: format!("ошибка: {err}"),
                         confidence: decision.confidence,
                         verified: Some(false),
+                        spans: Vec::new(),
                     });
                     let cause = crate::failure::analyze(&trace.render(), &err);
                     self.log(format!("Причина сбоя: {}", cause.summary));

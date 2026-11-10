@@ -649,7 +649,7 @@ pub fn walk(question: &str, sources: &[Source], extractor: &dyn Extract) -> Resu
                 }
                 match ledger::verify_statement(&note, &[chunk.clone()]) {
                     Ok(_) => output.notes.push(note),
-                    Err(reason) => output.dropped.push((note, reason)),
+                    Err(reason) => output.dropped.push((note, reason.to_string())),
                 }
             }
         }

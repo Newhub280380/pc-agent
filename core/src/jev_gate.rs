@@ -520,13 +520,13 @@ impl Gate {
             .map(|witness| witness.note())
             .collect::<Vec<_>>()
             .join(" | ");
-        match logic::allow_node_done(&route.graph, step_id, true) {
-            logic::Verdict::Ok => {}
-            logic::Verdict::Violation(reason) => {
+        match logic::allow_node_done_min(&route.graph, step_id, true) {
+            (logic::Verdict::Ok, _) => {}
+            (logic::Verdict::Violation(reason), minimal) => {
                 route
                     .ledger
                     .log("jev_step_done", step_id, "refused", reason.clone());
-                return refusal(reason);
+                return refusal_with(reason, &minimal);
             }
         }
         if let Some(node) = route.graph.nodes.iter_mut().find(|node| node.id == step_id) {
@@ -1339,6 +1339,14 @@ fn tool_result(value: Value, is_error: bool) -> Value {
 
 fn refusal(reason: String) -> Value {
     tool_result(json!({"status":"refused","reason":reason}), true)
+}
+
+/// Отказ с минимальным набором: что именно надо чинить.
+fn refusal_with(reason: String, minimal: &crate::minimal::MinimalSet) -> Value {
+    tool_result(
+        json!({"status":"refused","reason":reason,"minimal":minimal}),
+        true,
+    )
 }
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {

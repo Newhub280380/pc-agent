@@ -1,3 +1,4 @@
+use crate::minimal::{Lit, MinimalSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -27,10 +28,39 @@ pub struct Segment {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Refusal {
+    pub reason: String,
+    pub minimal: MinimalSet,
+}
+
+impl Refusal {
+    pub fn from_reason(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            minimal: MinimalSet::new(),
+        }
+    }
+
+    pub fn with_cited(mut self, citations: &[Citation]) -> Self {
+        for c in citations {
+            self.minimal.push_lit(Lit::Ident(c.source_id.clone()));
+        }
+        self
+    }
+}
+
+impl std::ops::Deref for Refusal {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.reason
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportCheck {
     pub verified: Vec<String>,
-    pub rejected: Vec<(String, String)>,
+    pub rejected: Vec<(String, Refusal)>,
     pub uncited_sources: Vec<String>,
 }
 
@@ -295,9 +325,10 @@ fn is_heading(text: &str) -> bool {
     text.split_whitespace().count() <= 3 && !text.chars().any(|ch| ch.is_ascii_digit())
 }
 
-pub fn verify_statement(statement: &str, sources: &[Source]) -> Result<Vec<String>, String> {
+pub fn verify_statement(statement: &str, sources: &[Source]) -> Result<Vec<String>, Refusal> {
     let (citations, text, malformed) = extract_citations(statement);
     verify_statement_parts(&citations, &text, malformed.as_deref(), sources)
+        .map_err(|reason| Refusal::from_reason(reason).with_cited(&citations))
 }
 
 fn verify_statement_parts(

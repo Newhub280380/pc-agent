@@ -18,6 +18,7 @@
 //! отказ, а не разрешение.
 
 use crate::agent::graph::{NodeState, TaskGraph};
+use crate::minimal::{Lit, MinimalSet};
 use std::collections::HashMap;
 use z3::ast::{Ast, Bool, Int};
 use z3::{Config, Context, SatResult, Solver};
@@ -48,6 +49,34 @@ impl Default for Policies {
 pub enum Verdict {
     Ok,
     Violation(String),
+}
+
+/// Отказ несёт причину и минимальный набор того, что её вызвало.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub reason: String,
+    pub minimal: MinimalSet,
+}
+
+impl Refusal {
+    pub fn from_reason(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            minimal: MinimalSet::new(),
+        }
+    }
+
+    pub fn with_node(mut self, id: &str) -> Self {
+        self.minimal.push_lit(Lit::Ident(format!("node:{id}")));
+        self
+    }
+}
+
+impl std::ops::Deref for Refusal {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.reason
+    }
 }
 
 /// План можно исполнять, только если он короче лимита, не содержит
@@ -513,4 +542,22 @@ mod tests {
             Verdict::Violation(_)
         ));
     }
+}
+
+/// Отказ плюс минимальный набор: узел, на котором он возник.
+pub fn allow_node_done_min(
+    graph: &TaskGraph,
+    id: &str,
+    observed_now: bool,
+) -> (Verdict, MinimalSet) {
+    let verdict = allow_node_done(graph, id, observed_now);
+    let set = match verdict {
+        Verdict::Ok => MinimalSet::new(),
+        Verdict::Violation(_) => {
+            let mut s = MinimalSet::new();
+            s.push_lit(Lit::Ident(format!("node:{id}")));
+            s
+        }
+    };
+    (verdict, set)
 }
