@@ -1,4 +1,4 @@
-//! Точка входа. Один .exe: GUI + ядро агента + вшитый Go-роутер.
+﻿//! Точка входа. Один .exe: GUI + ядро агента + вшитый Go-роутер.
 //!
 //! Порядок запуска:
 //!   1. создать %APPDATA%\PCAgent и .env (первый запуск);
@@ -31,12 +31,14 @@ mod ledger;
 mod llm;
 mod logic;
 mod memory;
+mod minimal;
 mod optimize;
 mod platform;
 mod proof;
 mod radar;
 mod retry;
 mod sandbox;
+mod spans;
 mod stage_bench;
 mod supervisor;
 mod text;
