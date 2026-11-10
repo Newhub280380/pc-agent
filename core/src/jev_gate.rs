@@ -1,4 +1,4 @@
-use crate::agent::graph::{NodeState, TaskGraph};
+﻿use crate::agent::graph::{NodeState, TaskGraph};
 use crate::{back_gate, corpus, endoscope, ledger, logic, proof, witness};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -778,6 +778,18 @@ impl Gate {
                 route
                     .ledger
                     .log("jev_close", "", "refused", refused.summary());
+                // Единственная причина, по которой честный путь остаётся
+                // открытым навсегда, — отсутствие внешнего проверяющего.
+                // Тогда отдаём Degraded: причина названа, дыры перечислены.
+                if matches!(verdict, endoscope::Verdict::NotConfigured)
+                    && refused.unvisited.is_empty()
+                    && refused.out_of_order.is_empty()
+                {
+                    let mut out = refused.json();
+                    out["status"] = json!("degraded");
+                    out["cause"] = json!("no_verifier");
+                    return tool_result(out, true);
+                }
                 tool_result(refused.json(), true)
             }
         }
@@ -1763,7 +1775,8 @@ mod tests {
             ))
             .unwrap();
         let result = response_text(&response);
-        assert_eq!(result["status"], "open");
+        assert_eq!(result["status"], "degraded");
+        assert_eq!(result["cause"], "no_verifier");
         assert_eq!(result["rejected"][0]["statement"], claim);
         assert!(result["rejected"][0]["why"]
             .as_str()
@@ -1795,7 +1808,8 @@ mod tests {
             ))
             .unwrap();
         let result = response_text(&response);
-        assert_eq!(result["status"], "open");
+        assert_eq!(result["status"], "degraded");
+        assert_eq!(result["cause"], "no_verifier");
         assert_eq!(result["jev_close"], false);
         assert!(result["reason"]
             .as_str()
@@ -2007,7 +2021,8 @@ mod tests {
         let response = call_close(&mut gate, &route_id, "готово");
         assert_eq!(response["result"]["isError"], true);
         let result = response_text(&response);
-        assert_eq!(result["status"], "open");
+        assert_eq!(result["status"], "degraded");
+        assert_eq!(result["cause"], "no_verifier");
         assert_eq!(result["jev_close"], false);
         assert!(result["proof_failures"][0]
             .as_str()
@@ -2446,3 +2461,5 @@ mod tests {
         assert_eq!(response["result"]["isError"], true);
     }
 }
+
+
