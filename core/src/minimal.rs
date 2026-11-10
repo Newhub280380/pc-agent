@@ -1,4 +1,4 @@
-//! A failing set reduced to 1-minimality.
+﻿//! A failing set reduced to 1-minimality.
 //!
 //! Fail without a set is a shrug, not a failure.
 
@@ -172,3 +172,4 @@ mod tests {
         assert!(reduced.is_empty());
     }
 }
+

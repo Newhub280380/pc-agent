@@ -15,6 +15,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+use crate::spans::SpanId;
+
 /// Сколько шагов агент держит «в голове». Требование: последние 10.
 pub const MEMORY_STEPS: usize = 10;
 
@@ -31,6 +33,9 @@ pub struct Step {
     pub confidence: f64,
     /// Результат self-verify: None = проверка не применима.
     pub verified: Option<bool>,
+    /// Spans the observation was taken from.
+    #[serde(default)]
+    pub spans: Vec<SpanId>,
 }
 
 #[derive(Debug, Default)]
@@ -41,6 +46,10 @@ pub struct Trace {
 impl Trace {
     pub fn push(&mut self, step: Step) {
         self.steps.push_back(step);
+    }
+
+    pub fn span_ids(&self) -> Vec<SpanId> {
+        self.steps.iter().flat_map(|s| s.spans.iter().copied()).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -154,6 +163,7 @@ mod tests {
             observation: "экран".into(),
             confidence: 0.9,
             verified: Some(true),
+            spans: Vec::new(),
         }
     }
 
@@ -196,5 +206,8 @@ mod tests {
         ));
     }
 }
+
+
+
 
 

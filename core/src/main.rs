@@ -909,3 +909,4 @@ fn create_desktop_shortcut() -> Result<()> {
 fn create_desktop_shortcut() -> Result<()> {
     Ok(())
 }
+
