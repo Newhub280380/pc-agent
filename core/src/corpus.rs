@@ -1,4 +1,4 @@
-﻿use crate::ledger::{self, Segment, Source, Unit};
+use crate::ledger::{self, Segment, Source, Unit};
 use crate::llm::{LlmClient, Message};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeSet, HashSet, VecDeque};
@@ -1049,5 +1049,3 @@ mod tests {
         assert!(ledger::complete(&source).is_ok());
     }
 }
-
-

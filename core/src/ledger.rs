@@ -1,5 +1,5 @@
-﻿use serde::{Deserialize, Serialize};
 use crate::minimal::{Lit, MinimalSet};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -711,7 +711,3 @@ mod tests {
         .is_ok());
     }
 }
-
-
-
-

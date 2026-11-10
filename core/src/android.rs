@@ -1,4 +1,4 @@
-﻿//! Управление Android-телефоном через ADB (USB или Wi-Fi).
+//! Управление Android-телефоном через ADB (USB или Wi-Fi).
 //!
 //! Почему ADB, а не Appium/uiautomator2-сервер:
 //!   - ADB уже есть в Android Platform Tools, ставится один раз, не требует
@@ -344,4 +344,3 @@ mod tests {
         assert_eq!((neg[0].cx, neg[0].cy), (10, 10));
     }
 }
-

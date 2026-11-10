@@ -1,4 +1,4 @@
-﻿//! Z3-слой: доказательная проверка планов и решений.
+//! Z3-слой: доказательная проверка планов и решений.
 //!
 //! Солвер вшит в бинарник и вызывается напрямую. Отдельного режима
 //! «без Z3» нет: раньше он был выключен фичей `z3logic`, а вместо него
@@ -544,10 +544,12 @@ mod tests {
     }
 }
 
-
-
 /// Отказ плюс минимальный набор: узел, на котором он возник.
-pub fn allow_node_done_min(graph: &TaskGraph, id: &str, observed_now: bool) -> (Verdict, MinimalSet) {
+pub fn allow_node_done_min(
+    graph: &TaskGraph,
+    id: &str,
+    observed_now: bool,
+) -> (Verdict, MinimalSet) {
     let verdict = allow_node_done(graph, id, observed_now);
     let set = match verdict {
         Verdict::Ok => MinimalSet::new(),
@@ -559,4 +561,3 @@ pub fn allow_node_done_min(graph: &TaskGraph, id: &str, observed_now: bool) -> (
     };
     (verdict, set)
 }
-

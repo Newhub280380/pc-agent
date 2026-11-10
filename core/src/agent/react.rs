@@ -1,4 +1,4 @@
-﻿//! ReAct: Thought → Action → Observation, и только потом следующий шаг.
+//! ReAct: Thought → Action → Observation, и только потом следующий шаг.
 //!
 //! Что здесь принципиально:
 //!   - Observation ЗАПИСЫВАЕТСЯ ПОСЛЕ действия и берётся из реального
@@ -49,7 +49,10 @@ impl Trace {
     }
 
     pub fn span_ids(&self) -> Vec<SpanId> {
-        self.steps.iter().flat_map(|s| s.spans.iter().copied()).collect()
+        self.steps
+            .iter()
+            .flat_map(|s| s.spans.iter().copied())
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -206,8 +209,3 @@ mod tests {
         ));
     }
 }
-
-
-
-
-

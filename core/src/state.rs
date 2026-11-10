@@ -1,4 +1,4 @@
-﻿//! Terminal run states. A run may end without an answer and still be correct.
+//! Terminal run states. A run may end without an answer and still be correct.
 
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +44,10 @@ mod tests {
     fn only_closed_is_success() {
         assert!(RunState::Closed.is_success());
         assert!(!RunState::degraded(DegradeCause::NoVerifier, vec![]).is_success());
-        assert!(!RunState::Refused { reason: "unknown route".into() }.is_success());
+        assert!(!RunState::Refused {
+            reason: "unknown route".into()
+        }
+        .is_success());
     }
 
     #[test]
@@ -59,4 +62,3 @@ mod tests {
         );
     }
 }
-

@@ -1,4 +1,4 @@
-﻿//! Append-only span store. Every observable piece of material gets a stable,
+//! Append-only span store. Every observable piece of material gets a stable,
 //! content-addressed id. Nothing is ever overwritten or evicted.
 //!
 //! Provenance lives here and only here. A refusal names spans, and a span
@@ -224,4 +224,3 @@ mod tests {
         assert_eq!(st.get(id).unwrap().off(), 5);
     }
 }
-

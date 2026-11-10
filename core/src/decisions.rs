@@ -1,4 +1,4 @@
-﻿//! Быстрые решения JEV через OpenRouter Decisions API.
+//! Быстрые решения JEV через OpenRouter Decisions API.
 //!
 //! `POST https://openrouter.ai/api/alpha/decisions`, модель `typesafe/jev-1.13`.
 //! `noul` — да/нет с вероятностью «да». `choice` — выбор одного варианта.
@@ -370,4 +370,3 @@ mod tests {
         assert!(matches!(err, DecisionError::Unavailable(_)));
     }
 }
-

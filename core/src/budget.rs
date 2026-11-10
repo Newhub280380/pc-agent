@@ -1,4 +1,4 @@
-﻿//! Hard ceilings per run. Exhaustion is a normal transition, not a panic.
+//! Hard ceilings per run. Exhaustion is a normal transition, not a panic.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -145,5 +145,3 @@ mod tests {
         assert_eq!(b.remaining(), Duration::ZERO);
     }
 }
-
-

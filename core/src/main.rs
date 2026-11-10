@@ -1,4 +1,4 @@
-﻿//! Точка входа. Один .exe: GUI + ядро агента + вшитый Go-роутер.
+//! Точка входа. Один .exe: GUI + ядро агента + вшитый Go-роутер.
 //!
 //! Порядок запуска:
 //!   1. создать %APPDATA%\PCAgent и .env (первый запуск);
@@ -14,8 +14,8 @@ mod acceptance;
 mod agent;
 mod android;
 mod back_gate;
-mod checkpoint;
 mod budget;
+mod checkpoint;
 mod config;
 mod coordinator;
 mod corpus;
@@ -41,8 +41,8 @@ mod retry;
 mod sandbox;
 mod spans;
 mod stage_bench;
-mod supervisor;
 mod state;
+mod supervisor;
 mod text;
 mod vision;
 mod watchdog;
@@ -909,4 +909,3 @@ fn create_desktop_shortcut() -> Result<()> {
 fn create_desktop_shortcut() -> Result<()> {
     Ok(())
 }
-

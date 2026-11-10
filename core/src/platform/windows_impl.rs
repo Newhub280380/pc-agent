@@ -1,4 +1,4 @@
-﻿//! Безопасные обёртки над C ABI из native/include/agent_native.h.
+//! Безопасные обёртки над C ABI из native/include/agent_native.h.
 //!
 //! Правило этого файла: наружу не утекает ни один сырой указатель.
 //! Всё, что вернула C++-сторона, немедленно копируется в Rust-типы и
@@ -266,4 +266,3 @@ pub fn screen_size() -> Result<(i32, i32)> {
 pub fn user_idle_seconds() -> i32 {
     unsafe { an_user_idle_seconds() }
 }
-
