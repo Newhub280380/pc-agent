@@ -1775,13 +1775,20 @@ mod tests {
             ))
             .unwrap();
         let result = response_text(&response);
-        assert_eq!(result["status"], "degraded");
-        assert_eq!(result["cause"], "no_verifier");
+        // Выдуманное утверждение — это найденная ложь, а не «нет проверяющего»:
+        // маршрут остаётся открытым, деградации здесь нет.
+        assert_eq!(result["status"], "open");
+        assert!(result.get("cause").is_none());
         assert_eq!(result["rejected"][0]["statement"], claim);
-        assert!(result["rejected"][0]["why"]
+        // После spans причина отказа — объект {reason, minimal}.
+        assert!(result["rejected"][0]["why"]["reason"]
             .as_str()
             .unwrap()
             .contains("число 9"));
+        assert_eq!(
+            result["rejected"][0]["why"]["minimal"]["literals"][0]["Ident"],
+            "reel_1"
+        );
         assert_eq!(result["uncited"], json!(["reel_1", "reel_2"]));
     }
 
