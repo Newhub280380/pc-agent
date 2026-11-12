@@ -1028,4 +1028,3 @@ mod tests {
         assert_eq!(s.router_token, "t");
     }
 }
-
