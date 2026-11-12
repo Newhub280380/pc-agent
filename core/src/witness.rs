@@ -601,7 +601,7 @@ pub fn quoted_fragment_groups(text: &str) -> Vec<Vec<String>> {
     groups
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

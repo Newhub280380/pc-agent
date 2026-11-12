@@ -16,6 +16,7 @@ mod android;
 mod back_gate;
 mod budget;
 mod checkpoint;
+mod claims;
 mod config;
 mod coordinator;
 mod corpus;
@@ -28,6 +29,7 @@ mod gui;
 mod intent;
 mod jev;
 mod jev_gate;
+mod jev_http;
 mod ledger;
 mod llm;
 mod logic;
@@ -36,6 +38,7 @@ mod minimal;
 mod optimize;
 mod platform;
 mod proof;
+mod provenance;
 mod radar;
 mod retry;
 mod sandbox;
@@ -81,6 +84,36 @@ fn main() -> Result<()> {
         let settings = config::Settings::load(&layers)?;
         let _router = headless_router(&paths, &layers, &settings);
         jev_gate::serve_stdio()?;
+        return Ok(());
+    }
+    if let Some(bind) = flag_value(&args, "--mcp-http") {
+        // Шлюз для облачных агентов: `--mcp-http 0.0.0.0:3000 --agents agents.txt
+        // [--file-root каталог]`. Файл агентов обязателен: без токенов
+        // шлюз наружу не открывается.
+        let agents_path = flag_value(&args, "--agents")
+            .or_else(|| std::env::var("PCAGENT_AGENTS_FILE").ok())
+            .ok_or_else(|| anyhow::anyhow!("нужен --agents <файл> со строками `имя токен`"))?;
+        let agents = jev_http::Agents::parse(&std::fs::read_to_string(&agents_path)?)?;
+        let policy = jev_gate::RemotePolicy {
+            file_root: flag_value(&args, "--file-root").map(std::path::PathBuf::from),
+        };
+        // `--upstream https://api.x.ai` — прокси к API ботов: шлюз видит
+        // каждый ответ и проверяет авторство без участия бота. Ключ API —
+        // в `PCAGENT_UPSTREAM_KEY` (или `XAI_API_KEY`), боты его не знают.
+        let upstream = flag_value(&args, "--upstream").map(|base| jev_http::Upstream {
+            base: base.trim_end_matches('/').to_string(),
+            key: std::env::var("PCAGENT_UPSTREAM_KEY")
+                .or_else(|_| std::env::var("XAI_API_KEY"))
+                .ok()
+                .filter(|k| !k.trim().is_empty()),
+        });
+        let listener = std::net::TcpListener::bind(&bind)?;
+        eprintln!(
+            "pcagent jev http: {bind}, агенты: {}, прокси: {}",
+            agents.names().join(", "),
+            upstream.as_ref().map_or("нет", |u| u.base.as_str())
+        );
+        jev_http::serve(listener, agents, jev_gate::Gate::remote(policy), upstream)?;
         return Ok(());
     }
     if let Some(question) = flag_value(&args, "--study") {
