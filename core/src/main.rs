@@ -76,6 +76,11 @@ const CONSENT_TEXT: &str = "\
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--accept`: согласие без окна (сервер, CI, Linux без GUI-библиотек).
+    // Кладём в окружение до старта потоков, дальше его читает gui.
+    if args.iter().any(|a| a == "--accept") {
+        std::env::set_var("PCAGENT_ACCEPT", "1");
+    }
     if args.iter().any(|a| a == "--mcp") {
         let paths = config::Paths::resolve()?;
         config::ensure_env_file(&paths.env_file)?;
@@ -169,27 +174,46 @@ fn main() -> Result<()> {
         Err(e) => {
             log::error!("агент не запустился: {e:#}");
             gui::error_dialog(&format!(
-                "Агент не запустился.\n\n{e:#}\n\nПодробности в логе %LOCALAPPDATA%\\PCAgent\\logs."
+                "Агент не запустился.\n\n{e:#}\n\nПодробности в логе {LOG_HINT}."
             ));
             Err(e)
         }
     }
 }
 
+/// Где искать лог — человеку, у которого «ничего не открылось».
+#[cfg(windows)]
+const LOG_HINT: &str = "%APPDATA%\\PCAgent\\logs";
+#[cfg(not(windows))]
+const LOG_HINT: &str = "~/.local/share/PCAgent/logs";
+
 fn run_app() -> Result<()> {
     let paths = config::Paths::resolve()?;
     init_logging(&paths.logs);
 
     let first_run = config::ensure_env_file(&paths.env_file)?;
-    if first_run || !paths.consent.exists() {
+    // Согласие спрашиваем, только если его ещё нет. Раньше окно всплывало и
+    // при каждом новом .env — даже когда consent.json уже лежал (CI, переустановка).
+    if !paths.consent.exists() {
         if !gui::consent_dialog(CONSENT_TEXT) {
             return Ok(());
         }
         std::fs::write(&paths.consent, chrono::Utc::now().to_rfc3339())?;
         create_desktop_shortcut().ok();
-        if first_run {
-            // Ключей ещё нет — открываем .env в блокноте, чтобы человек
-            // вставил свой ключ прямо сейчас, без чтения документации.
+    }
+    if first_run {
+        log::info!(
+            "первый запуск: ключ LLM вписать в {}",
+            paths.env_file.display()
+        );
+        eprintln!(
+            "PC Agent: первый запуск. Впишите ключ LLM в {}",
+            paths.env_file.display()
+        );
+        // Ключей ещё нет — открываем .env в редакторе, чтобы человек
+        // вставил свой ключ прямо сейчас, без чтения документации.
+        // В CI/без сессии открывать нечем и незачем.
+        if std::env::var("CI").is_err() && gui::gui_unavailable_reason().is_none() {
             let _ = open_in_editor(&paths.env_file);
         }
     }
@@ -370,6 +394,14 @@ fn run_gui(app: gui::AppState) -> Result<()> {
         "wgpu" => vec![eframe::Renderer::Wgpu],
         _ => vec![eframe::Renderer::Wgpu, eframe::Renderer::Glow],
     };
+    // Заведомо не откроется (Linux без libxkbcommon-x11 или без дисплея) —
+    // не ловим панику winit, а сразу говорим, что поставить.
+    if let Some(why) = gui::gui_unavailable_reason() {
+        gui::error_dialog(&format!(
+            "Не удалось открыть окно агента: {why}.\n\nБез окна агент работает так: pcagent --task \"задача\"."
+        ));
+        anyhow::bail!("GUI: {why}");
+    }
     for renderer in order {
         let opts = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
@@ -434,7 +466,7 @@ fn run_gui(app: gui::AppState) -> Result<()> {
     // Окна нет, консоли в релизе тоже нет: без этого сообщения двойной клик
     // по ярлыку выглядит как «ничего не произошло».
     gui::error_dialog(&format!(
-        "Не удалось открыть окно агента.\n\n{why}\n\nСкорее всего нет драйвера видеокарты или сессия без рабочего стола. Подробности в логе %APPDATA%\\PCAgent\\logs."
+        "Не удалось открыть окно агента.\n\n{why}\n\nСкорее всего нет драйвера видеокарты или сессия без рабочего стола. Подробности в логе {LOG_HINT}."
     ));
     anyhow::bail!("GUI: {why}")
 }
