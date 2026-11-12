@@ -18,9 +18,18 @@ need=()
 for t in curl xdotool scrot tesseract xclip xprintidle; do
   command -v "$t" >/dev/null 2>&1 || need+=("$t")
 done
-if [ "${#need[@]}" -gt 0 ]; then
-  pkgs=""
-  for t in "${need[@]}"; do
+# Библиотеки окна: winit открывает их через dlopen уже при запуске, и без
+# libxkbcommon-x11-0 окно агента не поднимается (раньше — паника).
+gui_libs="libxkbcommon-x11-0 libx11-xcb1 libxcursor1 libxrandr2 libxi6 libvulkan1 mesa-vulkan-drivers libegl1 libgl1 zenity"
+missing_libs=""
+if command -v dpkg >/dev/null 2>&1; then
+  for p in $gui_libs; do
+    dpkg -s "$p" >/dev/null 2>&1 || missing_libs="$missing_libs $p"
+  done
+fi
+if [ "${#need[@]}" -gt 0 ] || [ -n "$missing_libs" ]; then
+  pkgs="$missing_libs"
+  for t in "${need[@]+"${need[@]}"}"; do
     case "$t" in
       tesseract) pkgs="$pkgs tesseract-ocr tesseract-ocr-rus" ;;
       *) pkgs="$pkgs $t" ;;

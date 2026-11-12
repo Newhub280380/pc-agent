@@ -185,6 +185,24 @@ fn now() -> String {
 /// Экран первого запуска: одно окно, одно согласие, дальше агент работает.
 /// Никаких email-подтверждений и трёхэтапных идентификаций.
 pub fn consent_dialog(text: &str) -> bool {
+    // Согласие заранее: `--accept` или PCAGENT_ACCEPT=1 (CI, сервер, скрипт).
+    if consent_preaccepted() {
+        log::info!("согласие дано заранее (PCAGENT_ACCEPT / --accept)");
+        return true;
+    }
+    // Явный выбор терминала или заведомо неработающий GUI: окно даже не
+    // пробуем, чтобы не ловить панику рендерера и не пугать человека.
+    let forced_terminal = std::env::var("PCAGENT_CONSENT")
+        .map(|v| v.trim().eq_ignore_ascii_case("terminal"))
+        .unwrap_or(false);
+    if forced_terminal {
+        return confirm_native("PC Agent — доступ", text);
+    }
+    if let Some(why) = gui_unavailable_reason() {
+        log::warn!("окно согласия не открываю: {why}");
+        eprintln!("PC Agent: графическое окно недоступно — {why}");
+        return confirm_native("PC Agent — доступ", text);
+    }
     let accepted = Arc::new(AtomicBool::new(false));
     let text_for_fallback = text.to_string();
     let flag = accepted.clone();
@@ -263,9 +281,156 @@ fn confirm_native(title: &str, text: &str) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let _ = (title, text);
-        false
+        confirm_terminal(title, text)
     }
+}
+
+/// `--accept` (main кладёт его в окружение) или PCAGENT_ACCEPT=1/yes/true/да.
+pub fn consent_preaccepted() -> bool {
+    std::env::var("PCAGENT_ACCEPT")
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "yes" | "y" | "true" | "да"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Почему окно egui заведомо не откроется (`None` — можно пробовать).
+/// На Linux winit при старте на X11 грузит libxkbcommon-x11 через dlopen и
+/// ПАНИКУЕТ, если библиотеки нет (xkbcommon-dl). Проверяем заранее и даём
+/// человеку понятную команду вместо трассы паники.
+pub fn gui_unavailable_reason() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let has = |k: &str| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false);
+        let wayland = has("WAYLAND_DISPLAY");
+        if !has("DISPLAY") && !wayland {
+            return Some("нет графической сессии (не заданы DISPLAY/WAYLAND_DISPLAY)".into());
+        }
+        if !wayland && !linux_lib_present("libxkbcommon-x11.so.0") {
+            return Some(
+                "не найдена библиотека libxkbcommon-x11.so.0; установите её: \
+                 sudo apt install libxkbcommon-x11-0"
+                    .into(),
+            );
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_lib_present(name: &str) -> bool {
+    let mut dirs: Vec<String> = std::env::var("LD_LIBRARY_PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .collect();
+    dirs.extend(
+        [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/lib",
+            "/lib64",
+            "/lib",
+            "/usr/local/lib",
+        ]
+        .iter()
+        .map(|d| d.to_string()),
+    );
+    if dirs
+        .iter()
+        .any(|d| std::path::Path::new(d).join(name).exists())
+    {
+        return true;
+    }
+    // Нестандартные дистрибутивы (NixOS, Fedora с другими путями): спросим
+    // кэш загрузчика (строки вида «libX.so.0 (...) => /путь»), причём файл по
+    // пути должен существовать: кэш бывает устаревшим после удаления пакета.
+    // Нет ldconfig — считаем, что библиотека есть, и пусть решает попытка
+    // открыть окно (она всё равно под catch_unwind).
+    let out = std::process::Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .or_else(|_| {
+            std::process::Command::new("/sbin/ldconfig")
+                .arg("-p")
+                .output()
+        });
+    match out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.trim_start().starts_with(name))
+            .filter_map(|l| l.split("=>").nth(1))
+            .any(|p| std::path::Path::new(p.trim()).exists()),
+        _ => true,
+    }
+}
+
+/// Согласие без графики: вопрос в терминале, иначе zenity, иначе отказ с
+/// подсказкой, как дать согласие флагом.
+#[cfg(not(windows))]
+fn confirm_terminal(title: &str, text: &str) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    let hint = "Чтобы дать согласие без окна, запустите: pcagent --accept \
+                (или PCAGENT_ACCEPT=1 pcagent).";
+    if std::io::stdin().is_terminal() {
+        let mut out = std::io::stderr();
+        let _ = writeln!(out, "\n=== {title} ===\n{text}\n");
+        let _ = write!(
+            out,
+            "Разрешить агенту работать на этом компьютере? [да/нет]: "
+        );
+        let _ = out.flush();
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line).is_ok() {
+            let ok = matches!(
+                line.trim().to_lowercase().as_str(),
+                "да" | "д" | "y" | "yes" | "1"
+            );
+            if !ok {
+                let _ = writeln!(out, "Отказ. Агент не запущен.");
+            }
+            return ok;
+        }
+    }
+    // Двойной клик по ярлыку: терминала нет, но zenity на рабочем столе обычно есть.
+    let has_display = ["DISPLAY", "WAYLAND_DISPLAY"]
+        .iter()
+        .any(|k| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false));
+    if has_display {
+        if let Ok(st) = std::process::Command::new("zenity")
+            .args([
+                "--question",
+                "--title",
+                title,
+                "--width",
+                "560",
+                "--text",
+                text,
+            ])
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            // 0 — «Да», 1 — «Нет»; прочее — zenity сам не смог открыться.
+            match st.code() {
+                Some(0) => return true,
+                Some(1) => return false,
+                _ => {}
+            }
+        }
+    }
+    log::error!("согласие не получено: нет ни окна, ни терминала. {hint}");
+    eprintln!("PC Agent: согласие не получено — нет ни окна, ни терминала. {hint}");
+    false
 }
 
 #[cfg(windows)]

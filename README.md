@@ -19,16 +19,45 @@ Go-роутер вшивается внутрь `.exe` ядра (`include_bytes!
 
 ---
 
-## Быстрый старт (готовый .exe)
+## Быстрый старт: скачал → вписал ключ → запустил
 
-1. Двойной клик по `pcagent.exe`.
-2. Один раз согласиться с доступом (окно согласия) — создастся ярлык на рабочем столе.
-3. Рядом появится `.env`. Вписать ключ **любого одного** провайдера (или нескольких — будет резерв).
-4. Перезапустить, написать задачу, нажать **Старт**.
+Всё лежит в **[последнем релизе](https://github.com/Newhub280380/pc-agent/releases/latest)**:
+`pcagent.exe` (Windows), `pcagent-linux-x64` (Linux), установщики, `env.example`,
+`config.example.json` и контрольные суммы `SHA256SUMS.txt`.
 
-Файлы приложения: `%LOCALAPPDATA%\PCAgent\` (`.env`, `memory.db`, `consent.json`, логи).
+**Windows** — скачайте `install-windows.cmd` и `pcagent.exe` в одну папку и
+дважды щёлкните `install-windows.cmd`. Он спросит ключ, создаст ярлык и запустит
+агента. Без установщика: просто запустите `pcagent.exe`, согласитесь в окне,
+впишите ключ в открывшийся `.env` и перезапустите.
+
+**Linux (Ubuntu/Debian)** — одна команда, ставит зависимости (в том числе
+библиотеки окна `libxkbcommon-x11-0` и др.), спрашивает ключ, делает ярлык:
+
+```bash
+curl -fsSLO https://github.com/Newhub280380/pc-agent/releases/latest/download/install-linux.sh && bash install-linux.sh
+```
+
+**Куда вписать ключ LLM.** Подходит ключ любого одного провайдера (несколько — будет резерв):
+
+| | Windows | Linux |
+|---|---|---|
+| `.env` (создаётся при первом запуске) | `%APPDATA%\PCAgent\.env` | `~/.local/share/PCAgent/.env` |
+| или `config.json` рядом с агентом (так делают установщики) | `%LOCALAPPDATA%\PCAgent\config.json` | `~/.local/share/PCAgent/config.json` |
+
+В `.env` достаточно одной строки, например `OPENAI_API_KEY=sk-...` или три строки
+`LLM_PROVIDER=` / `LLM_BASE_URL=` / `LLM_API_KEY=` для любого OpenAI-совместимого
+сервиса. Полный список — в `env.example`. Без ключа агент запустится, но
+«думать» не сможет и честно об этом напишет.
+
+**Без окна** (сервер, SSH, нет графики): согласие можно дать флагом —
+`pcagent --accept` (или `PCAGENT_ACCEPT=1`), а задачу передать строкой:
+`pcagent --accept --task "задача"`. Если окно согласия не открывается, агент
+сам спросит «да/нет» в терминале, а не упадёт; спросить сразу в терминале —
+`PCAGENT_CONSENT=terminal`.
+
+Файлы приложения: `%APPDATA%\PCAgent\` на Windows и `~/.local/share/PCAgent/` на Linux (`.env`, `memory.db`, `consent.json`, логи).
 Конфиг ищется в четырёх местах, первый найденный побеждает: `%PCAGENT_HOME%`,
-папка рядом с `pcagent.exe`, текущая папка, `%LOCALAPPDATA%\PCAgent`.
+папка рядом с `pcagent.exe`, текущая папка, `%APPDATA%\PCAgent` (Linux: `~/.local/share/PCAgent`).
 В логе на старте видно, откуда прочитано:
 
 ```text
