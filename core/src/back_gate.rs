@@ -122,7 +122,7 @@ impl Refusal {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.unvisited.is_empty()
             && self.unconfirmed.is_empty()
             && self.out_of_order.is_empty()

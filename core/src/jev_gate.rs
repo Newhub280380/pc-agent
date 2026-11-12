@@ -1,5 +1,5 @@
-﻿use crate::agent::graph::{NodeState, TaskGraph};
-use crate::{back_gate, corpus, endoscope, ledger, logic, proof, witness};
+use crate::agent::graph::{NodeState, TaskGraph};
+use crate::{back_gate, corpus, endoscope, ledger, logic, proof, provenance, witness};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -10,7 +10,7 @@ pub struct Gate {
     collector: Option<String>,
     studies: HashMap<String, StudyState>,
     next_study_id: u64,
-    pub extractor: Option<Box<dyn corpus::Extract>>,
+    pub extractor: Option<Box<dyn corpus::Extract + Send>>,
     /// Реестр закрытых маршрутов и исследований: ключ — `route-N` или
     /// `study-N`, значение — печать задних ворот. Запись сюда делает
     /// только `close`/`close_study` после `back_gate::seal_*`; повторное
@@ -21,6 +21,21 @@ pub struct Gate {
     policy: witness::Policy,
     /// Архив закрытых маршрутов (журнал и свидетели) для `jev_report`.
     archive: HashMap<String, RouteState>,
+    /// Эндоскоп — отдельный самостоятельный продукт. Агент обязан работать
+    /// и без него: тогда печать ставят свидетели шлюза + Z3, а в печати
+    /// честно стоит `endoscope_not_configured`. Обязательным эндоскоп
+    /// становится, только если его явно подключили (`ENDOSCOPE_URL`,
+    /// `ENDOSCOPE_RUN_ID` или `ENDOSCOPE_REQUIRED`).
+    endoscope: back_gate::EndoscopePolicy,
+    /// Кто сейчас вызывает шлюз. По stdio — `PCAGENT_CALLER` или `local`;
+    /// по HTTP — имя агента, взятое шлюзом из его токена. Аргументы
+    /// инструментов эту личность не меняют.
+    caller: String,
+    /// Реестр авторства артефактов и сводка по агентам.
+    provenance: provenance::Registry,
+    /// Ограничения для удалённых (облачных) агентов. `None` — локальный
+    /// stdio-режим, где агент и так сидит на этой машине.
+    remote: Option<RemotePolicy>,
     /// Подмена приговора эндоскопа только в тестах: в бою приговор всегда
     /// берётся из `endoscope::judge_report`, обходного пути нет.
     #[cfg(test)]
@@ -29,7 +44,7 @@ pub struct Gate {
 
 /// Подменный судья для тестов: отчёт → приговор эндоскопа.
 #[cfg(test)]
-type Judge = Box<dyn Fn(&str) -> endoscope::Verdict>;
+type Judge = Box<dyn Fn(&str) -> endoscope::Verdict + Send>;
 
 struct RouteState {
     task: String,
@@ -44,6 +59,58 @@ struct RouteState {
     have: Vec<String>,
     /// Свидетели и журнал действий маршрута.
     ledger: witness::Ledger,
+    /// Агент, построивший маршрут. Чужой агент маршрут не трогает.
+    owner: String,
+}
+
+/// Что разрешено облачному агенту, подключённому по HTTP. Он не сидит на
+/// этой машине, поэтому шлюз не даёт ему читать произвольные файлы,
+/// запускать команды и снимать экран хоста.
+#[derive(Debug, Clone, Default)]
+pub struct RemotePolicy {
+    /// Единственный каталог, файлы из которого можно наблюдать/регистрировать.
+    pub file_root: Option<std::path::PathBuf>,
+}
+
+fn remote_admits(remote: Option<&RemotePolicy>, probe: &witness::Probe) -> Result<(), String> {
+    let Some(remote) = remote else {
+        return Ok(());
+    };
+    match probe {
+        witness::Probe::Url { .. } => Ok(()),
+        witness::Probe::File { path } => {
+            let Some(root) = &remote.file_root else {
+                return Err("удалённому агенту файлы хоста недоступны: шлюз запущен без --file-root".into());
+            };
+            let root = root
+                .canonicalize()
+                .map_err(|e| format!("каталог артефактов недоступен: {e}"))?;
+            let full = root.join(path);
+            let full = full
+                .canonicalize()
+                .map_err(|e| format!("файл {path} недоступен: {e}"))?;
+            if full.starts_with(&root) {
+                Ok(())
+            } else {
+                Err(format!("файл {path} вне каталога артефактов"))
+            }
+        }
+        _ => Err(format!(
+            "удалённому агенту наблюдение {} на хосте запрещено: допустимы url и file внутри каталога артефактов",
+            probe.kind()
+        )),
+    }
+}
+
+/// Для удалённого агента путь файла задаётся относительно каталога
+/// артефактов; шлюз подставляет полный путь сам.
+fn resolve_probe(remote: Option<&RemotePolicy>, probe: witness::Probe) -> witness::Probe {
+    match (remote.and_then(|r| r.file_root.as_ref()), probe) {
+        (Some(root), witness::Probe::File { path }) => witness::Probe::File {
+            path: root.join(path).to_string_lossy().into_owned(),
+        },
+        (_, probe) => probe,
+    }
 }
 
 struct StudyState {
@@ -84,13 +151,46 @@ impl Default for Gate {
             closed: HashMap::new(),
             policy: witness::Policy::from_env(),
             archive: HashMap::new(),
+            endoscope: endoscope_policy_from_env(),
+            caller: std::env::var("PCAGENT_CALLER")
+                .ok()
+                .map(|v| provenance::normalize(&v))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "local".to_string()),
+            provenance: provenance::Registry::from_env(),
+            remote: None,
             #[cfg(test)]
             judge: None,
         }
     }
 }
 
+/// Эндоскоп обязателен только когда его явно подключили в окружении.
+fn endoscope_policy_from_env() -> back_gate::EndoscopePolicy {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    if set("ENDOSCOPE_URL") || set("ENDOSCOPE_RUN_ID") || set("ENDOSCOPE_REQUIRED") {
+        back_gate::EndoscopePolicy::Required
+    } else {
+        back_gate::EndoscopePolicy::Optional
+    }
+}
+
 impl Gate {
+    /// Шлюз для облачных агентов (HTTP): ограниченные наблюдения.
+    pub fn remote(policy: RemotePolicy) -> Self {
+        Self {
+            remote: Some(policy),
+            ..Self::default()
+        }
+    }
+
+    /// Обработать запрос от имени агента, личность которого установил
+    /// транспорт (по токену). Это единственный способ задать `caller`.
+    pub fn handle_as(&mut self, caller: &str, req: Value) -> Option<Value> {
+        self.caller = provenance::normalize(caller);
+        self.handle(req)
+    }
+
     pub fn handle(&mut self, req: Value) -> Option<Value> {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let Some(method) = req.get("method").and_then(Value::as_str) else {
@@ -106,7 +206,13 @@ impl Gate {
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "protocolVersion": "2024-11-05",
+                    // Облачные клиенты (Streamable HTTP) просят новые версии
+                    // протокола; набор инструментов от этого не меняется.
+                    "protocolVersion": req
+                        .pointer("/params/protocolVersion")
+                        .and_then(Value::as_str)
+                        .filter(|v| matches!(*v, "2025-03-26" | "2025-06-18"))
+                        .unwrap_or("2024-11-05"),
                     "capabilities": { "tools": {} },
                     "serverInfo": {
                         "name": "pcagent-jev",
@@ -129,7 +235,205 @@ impl Gate {
         Some(response)
     }
 
+    /// Вход всех инструментов: проверка владельца маршрута и учёт вызова
+    /// в сводке агента.
     fn call_tool(&mut self, params: &Value) -> Value {
+        let args = params.get("arguments").unwrap_or(&Value::Null);
+        let result = match self.foreign_route(args) {
+            Some(reason) => refusal(reason),
+            None => self.dispatch_tool(params),
+        };
+        let refused = result.get("isError").and_then(Value::as_bool) == Some(true);
+        let caller = self.caller.clone();
+        self.provenance.note_call(&caller, refused);
+        result
+    }
+
+    /// Маршрут принадлежит тому агенту, который его построил. Пять облачных
+    /// агентов на одном шлюзе не могут закрывать шаги друг за друга.
+    fn foreign_route(&self, args: &Value) -> Option<String> {
+        let id = args
+            .get("route_id")
+            .or_else(|| args.get("id"))
+            .and_then(Value::as_str)?;
+        let route = self.routes.get(id).or_else(|| self.archive.get(id))?;
+        (route.owner != self.caller).then(|| {
+            format!(
+                "маршрут {id} принадлежит агенту {}, а вызывает {}",
+                route.owner, self.caller
+            )
+        })
+    }
+
+    /// Реестр авторства (для HTTP-прокси, который видит ответы агентов).
+    pub fn provenance_mut(&mut self) -> &mut provenance::Registry {
+        &mut self.provenance
+    }
+
+    pub fn provenance_ref(&self) -> &provenance::Registry {
+        &self.provenance
+    }
+
+    /// Наблюдение артефакта + dHash, если это картинка.
+    fn observe_with_dhash(
+        &self,
+        artifact: &Value,
+    ) -> Result<(witness::Observation, Option<u64>), String> {
+        let observation = self.observe_artifact(artifact)?;
+        let dhash = artifact_bytes(&observation.probe).and_then(|b| provenance::dhash(&b));
+        Ok((observation, dhash))
+    }
+
+    /// Наблюдение артефакта для реестра авторства (вне маршрута).
+    fn observe_artifact(&self, artifact: &Value) -> Result<witness::Observation, String> {
+        let probe = witness::Probe::from_json(artifact)?;
+        if !matches!(
+            probe,
+            witness::Probe::File { .. } | witness::Probe::Url { .. }
+        ) {
+            return Err("artifact.kind должен быть file или url".into());
+        }
+        remote_admits(self.remote.as_ref(), &probe)?;
+        witness::observe(resolve_probe(self.remote.as_ref(), probe))
+    }
+
+    fn register_artifact(&mut self, args: &Value) -> Value {
+        let caller = self.caller.clone();
+        let (sha, bytes, locator, source, dhash) = if let Some(artifact) = args.get("artifact") {
+            match self.observe_with_dhash(artifact) {
+                Ok((o, dhash)) => (o.sha256, o.bytes, o.probe.locator(), "observed", dhash),
+                Err(reason) => return refusal(reason),
+            }
+        } else if let Some(sha) = args.get("sha256").and_then(Value::as_str) {
+            if !provenance::valid_sha256(sha) {
+                return refusal("sha256 должен быть 64 hex-символа".into());
+            }
+            (
+                sha.to_lowercase(),
+                args.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+                args.get("locator")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                "declared",
+                args.get("dhash")
+                    .and_then(Value::as_str)
+                    .and_then(|h| u64::from_str_radix(h, 16).ok()),
+            )
+        } else {
+            return refusal("нужен artifact {kind:file|url} или sha256".into());
+        };
+        let author = self
+            .provenance
+            .register(&caller, &sha, bytes, &locator, source, dhash);
+        if author.author == caller {
+            tool_result(
+                json!({"status":"registered","author":caller,"record":author.json()}),
+                false,
+            )
+        } else {
+            // Хэш уже принадлежит другому: агент принёс чужую работу.
+            tool_result(
+                json!({
+                    "status":"refused",
+                    "reason":format!("этот артефакт раньше зарегистрировал {} — автор он, а не {caller}", author.author),
+                    "record":author.json()
+                }),
+                true,
+            )
+        }
+    }
+
+    fn attest(&mut self, args: &Value) -> Value {
+        let (Some(artifact), Some(claimed)) = (
+            args.get("artifact"),
+            args.get("claimed_author").and_then(Value::as_str),
+        ) else {
+            return refusal("нужны artifact {kind:file|url} и claimed_author".into());
+        };
+        let (observation, dhash) = match self.observe_with_dhash(artifact) {
+            Ok(o) => o,
+            Err(reason) => return refusal(reason),
+        };
+        let caller = self.caller.clone();
+        let locator = observation.probe.locator();
+        let verdict =
+            self.provenance
+                .attest(&caller, claimed, &observation.sha256, dhash, &locator);
+        tool_result(
+            json!({
+                "status": verdict.code(),
+                "verdict": verdict.text(claimed),
+                "sha256": observation.sha256,
+                "record": match &verdict {
+                    provenance::Verdict::Confirmed(r) => Some(r.json()),
+                    provenance::Verdict::NearConfirmed { record, .. } => Some(record.json()),
+                    provenance::Verdict::Mismatch { author, .. }
+                    | provenance::Verdict::NearMismatch { author, .. } => Some(author.json()),
+                    _ => None,
+                },
+            }),
+            !verdict.is_confirmed(),
+        )
+    }
+
+    /// Проверить отчёт агента (текст + файлы). Отчитавшимся считается
+    /// вызывающий; `admin` может указать `agent`, чей отчёт он вставил.
+    fn check_report(&mut self, args: &Value) -> Value {
+        let Some(text) = args.get("text").and_then(Value::as_str) else {
+            return refusal("нужен text — сообщение агента".into());
+        };
+        let reporter = match args.get("agent").and_then(Value::as_str) {
+            Some(agent) if self.caller == "admin" || self.caller == "local" => {
+                provenance::normalize(agent)
+            }
+            Some(_) => return refusal("указать чужой отчёт (agent) может только admin".into()),
+            None => self.caller.clone(),
+        };
+        let mut seen = Vec::new();
+        for artifact in args
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match self.observe_with_dhash(artifact) {
+                Ok((o, dhash)) => seen.push(provenance::Seen {
+                    locator: o.probe.locator(),
+                    sha256: o.sha256,
+                    dhash,
+                }),
+                Err(reason) => return refusal(reason),
+            }
+        }
+        for (i, file) in args
+            .get("attachments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let Some(bytes) = file.get("base64").and_then(Value::as_str).and_then(|b| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b.trim()).ok()
+            }) else {
+                return refusal(format!("attachments[{i}].base64 не декодируется"));
+            };
+            seen.push(provenance::Seen {
+                locator: file
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("attachment-{i}")),
+                sha256: witness::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+                dhash: provenance::dhash(&bytes),
+            });
+        }
+        let out = self.provenance.check_report(&reporter, text, &seen);
+        let bad = out["status"] == "fabrication";
+        tool_result(out, bad)
+    }
+
+    fn dispatch_tool(&mut self, params: &Value) -> Value {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return tool_result(
                 json!({"status":"refused","reason":"не указано имя инструмента"}),
@@ -309,6 +613,10 @@ impl Gate {
                 };
                 self.status(id)
             }
+            "jev_register_artifact" => self.register_artifact(args),
+            "jev_attest" => self.attest(args),
+            "jev_agents" => tool_result(self.provenance.agents_json(), false),
+            "jev_check_report" => self.check_report(args),
             _ => tool_result(
                 json!({"status":"refused","reason":format!("неизвестный инструмент {name}")}),
                 true,
@@ -356,6 +664,7 @@ impl Gate {
                         sources: Vec::new(),
                         have: have.to_vec(),
                         ledger: witness::Ledger::default(),
+                        owner: self.caller.clone(),
                     },
                 );
                 tool_result(result, false)
@@ -418,12 +727,17 @@ impl Gate {
                 true,
             );
         }
-        if let Err(reason) = self.policy.allows(&probe) {
+        if let Err(reason) = self
+            .policy
+            .allows(&probe)
+            .and_then(|_| remote_admits(self.remote.as_ref(), &probe))
+        {
             route
                 .ledger
                 .log("jev_observe", step_id, "refused", reason.clone());
             return refusal(reason);
         }
+        let probe = resolve_probe(self.remote.as_ref(), probe);
         let locator = probe.locator();
         match witness::observe(probe) {
             Ok(observation) => {
@@ -751,7 +1065,7 @@ impl Gate {
             &route.graph,
             &route.observed,
             &verdict,
-            back_gate::EndoscopePolicy::Required,
+            self.endoscope,
             &anchor,
         ) {
             Ok(seal) => {
@@ -862,18 +1176,23 @@ impl Gate {
             &route.graph,
             &route.observed,
             &endoscope::Verdict::NotConfigured,
-            back_gate::EndoscopePolicy::Required,
+            self.endoscope,
             &route.ledger.anchor(),
         )
         .err()
         .map(|refusal| *refusal)
         .unwrap_or_default();
+        let why = if refused.is_empty() {
+            "путь пройден, осталось вызвать jev_close".to_string()
+        } else {
+            refused.summary()
+        };
         tool_result(
             json!({
                 "status":"open",
                 "id":id,
                 "verified":false,
-                "text":format!("НЕ ПОДТВЕРЖДЕНО: маршрут {id} не закрыт шлюзом — {}", refused.summary()),
+                "text":format!("НЕ ПОДТВЕРЖДЕНО: маршрут {id} не закрыт шлюзом — {why}"),
                 "refusal":refused.json()
             }),
             true,
@@ -896,7 +1215,7 @@ impl Gate {
                 &route.graph,
                 &route.observed,
                 &endoscope::Verdict::NotConfigured,
-                back_gate::EndoscopePolicy::Required,
+                self.endoscope,
                 &route.ledger.anchor(),
             )
             .err()
@@ -1112,7 +1431,7 @@ impl Gate {
             &study.walk,
             report,
             &verdict,
-            back_gate::EndoscopePolicy::Required,
+            self.endoscope,
         ) {
             Ok((seal, _)) => {
                 let result = json!({"status":"closed","study_id":study_id,"seal":seal.json()});
@@ -1339,7 +1658,91 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties":false
             }
         }),
+        json!({
+            "name":"jev_register_artifact",
+            "description":"Зарегистрировать СВОЙ артефакт (файл/картинку/дизайн) в реестре авторства. Автором записывается вызывающий агент по его токену — записать работу на другого нельзя. artifact {kind:url,url} или {kind:file,path}; либо sha256 (+bytes, locator) от хука производителя.",
+            "inputSchema":{
+                "type":"object",
+                "properties":{
+                    "artifact":{
+                        "type":"object",
+                        "properties":{
+                            "kind":{"type":"string","enum":["file","url"]},
+                            "path":{"type":"string"},
+                            "url":{"type":"string"}
+                        },
+                        "required":["kind"],
+                        "additionalProperties":false
+                    },
+                    "sha256":{"type":"string"},
+                    "bytes":{"type":"integer"},
+                    "locator":{"type":"string"}
+                },
+                "additionalProperties":false
+            }
+        }),
+        json!({
+            "name":"jev_attest",
+            "description":"ОБЯЗАТЕЛЬНО перед словами «это сделал X»: шлюз сам скачивает/читает артефакт, считает SHA-256 и перцептивный хэш картинки и сверяет заявленного автора с реестром. Ответ: confirmed / near_confirmed, mismatch / near_mismatch / not_produced (выдумка, засчитывается тебе) или unproven.",
+            "inputSchema":{
+                "type":"object",
+                "properties":{
+                    "artifact":{
+                        "type":"object",
+                        "properties":{
+                            "kind":{"type":"string","enum":["file","url"]},
+                            "path":{"type":"string"},
+                            "url":{"type":"string"}
+                        },
+                        "required":["kind"],
+                        "additionalProperties":false
+                    },
+                    "claimed_author":{"type":"string"}
+                },
+                "required":["artifact","claimed_author"],
+                "additionalProperties":false
+            }
+        }),
+        json!({
+            "name":"jev_check_report",
+            "description":"Проверить сообщение агента целиком: шлюз сам находит в тексте утверждения «это сделал X» и сверяет их с файлами (artifacts {kind:file|url} или attachments {name, base64}). Отчитавшийся — вызывающий; admin может указать agent.",
+            "inputSchema":{
+                "type":"object",
+                "properties":{
+                    "text":{"type":"string"},
+                    "agent":{"type":"string"},
+                    "artifacts":{"type":"array","items":{"type":"object"}},
+                    "attachments":{"type":"array","items":{
+                        "type":"object",
+                        "properties":{"name":{"type":"string"},"base64":{"type":"string"}},
+                        "required":["base64"]
+                    }}
+                },
+                "required":["text"],
+                "additionalProperties":false
+            }
+        }),
+        json!({
+            "name":"jev_agents",
+            "description":"Сводка по агентам: вызовы, отказы шлюза, зарегистрированные артефакты, подтверждённое авторство и пойманные выдумки; последние события.",
+            "inputSchema":{"type":"object","properties":{},"additionalProperties":false}
+        }),
     ]
+}
+
+/// Байты артефакта для перцептивного хэша (картинки ≤ 32 МБ).
+fn artifact_bytes(probe: &witness::Probe) -> Option<Vec<u8>> {
+    const CAP: u64 = 32 * 1024 * 1024;
+    match probe {
+        witness::Probe::File { path } => {
+            let meta = std::fs::metadata(path).ok()?;
+            (meta.len() <= CAP)
+                .then(|| std::fs::read(path).ok())
+                .flatten()
+        }
+        witness::Probe::Url { url } => crate::jev_http::fetch_capped(url, CAP as usize).ok(),
+        _ => None,
+    }
 }
 
 fn tool_result(value: Value, is_error: bool) -> Value {
@@ -1564,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_and_tools_list_expose_nine_tools() {
+    fn initialize_and_tools_list_expose_twelve_tools() {
         let mut gate = Gate::default();
         let initialized = gate.handle(request(1, "initialize", json!({}))).unwrap();
         assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
@@ -1573,7 +1976,7 @@ mod tests {
             .handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .is_none());
         let listed = gate.handle(request(2, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 13);
     }
 
     struct StudyExtractor;
@@ -1794,6 +2197,7 @@ mod tests {
         ];
         let (_collector, executable) = fake_collector(&sources);
         let mut gate = Gate::default();
+        gate.endoscope = back_gate::EndoscopePolicy::Required;
         gate.collector = Some(executable);
         let (route_id, _) = route(&mut gate, "исследуй последние 2 reels instagram");
         let collected = call_collect(&mut gate, &route_id);
@@ -2009,6 +2413,8 @@ mod tests {
     #[test]
     fn all_steps_done_without_endoscope_stays_open() {
         let mut gate = Gate::default();
+        // Эндоскоп явно подключён как обязательный, но не отвечает.
+        gate.endoscope = back_gate::EndoscopePolicy::Required;
         let (route_id, steps) = route(&mut gate, "отрендери ролик с заменой лица");
         walk_all_steps(&mut gate, &route_id, &steps);
         let route = gate.routes.get(&route_id).unwrap();
@@ -2030,6 +2436,91 @@ mod tests {
             .contains("эндоскоп не настроен"));
         assert!(gate.routes.contains_key(&route_id));
         assert!(!gate.closed.contains_key(&route_id));
+    }
+
+    /// Пять облачных агентов на одном шлюзе: чужой маршрут не трогается.
+    #[test]
+    fn another_agent_cannot_walk_or_close_a_foreign_route() {
+        let mut gate = Gate::default();
+        gate.endoscope = back_gate::EndoscopePolicy::Optional;
+        gate.caller = "grok-1".into();
+        let (route_id, _steps) = route(&mut gate, "отрендери ролик с заменой лица");
+        let foreign = response_text(
+            &gate
+                .handle_as(
+                    "grok-2",
+                    request(
+                        2,
+                        "tools/call",
+                        json!({"name":"jev_close","arguments":{"route_id":route_id,"report":"готово"}}),
+                    ),
+                )
+                .unwrap(),
+        );
+        assert_eq!(foreign["status"], "refused");
+        assert!(foreign["reason"].as_str().unwrap().contains("grok-1"));
+        let own = response_text(
+            &gate
+                .handle_as(
+                    "grok-1",
+                    request(
+                        3,
+                        "tools/call",
+                        json!({"name":"jev_status","arguments":{"id":route_id}}),
+                    ),
+                )
+                .unwrap(),
+        );
+        assert_ne!(own["status"], "refused");
+        let agents = response_text(
+            &gate
+                .handle(request(
+                    4,
+                    "tools/call",
+                    json!({"name":"jev_agents","arguments":{}}),
+                ))
+                .unwrap(),
+        );
+        let grok2 = agents["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["agent"] == "grok-2")
+            .unwrap()
+            .clone();
+        assert_eq!(grok2["refusals"], 1);
+    }
+
+    /// Агент самостоятелен: без подключённого эндоскопа полный проход
+    /// закрывают свидетели шлюза + Z3, а печать честно говорит, что
+    /// независимой проверки не было.
+    #[test]
+    fn standalone_agent_closes_without_endoscope() {
+        let mut gate = Gate::default();
+        gate.endoscope = back_gate::EndoscopePolicy::Optional;
+        let (route_id, steps) = route(&mut gate, "отрендери ролик с заменой лица");
+        walk_all_steps(&mut gate, &route_id, &steps);
+        let report = response_text(
+            &gate
+                .handle(request(
+                    7,
+                    "tools/call",
+                    json!({"name":"jev_report","arguments":{"id":route_id}}),
+                ))
+                .unwrap(),
+        );
+        assert!(report["text"]
+            .as_str()
+            .unwrap()
+            .contains("осталось вызвать jev_close"));
+        let response = call_close(&mut gate, &route_id, "готово");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let result = response_text(&response);
+        assert_eq!(result["status"], "closed");
+        assert_eq!(result["seal"]["jev_close"], true);
+        let proof = result["seal"]["proof"].to_string();
+        assert!(proof.contains("endoscope_not_configured"), "{proof}");
+        assert!(proof.contains("witness_anchor"), "{proof}");
     }
 
     /// Положительный сценарий: полный проход пути → печать jev_close.
