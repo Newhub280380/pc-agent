@@ -142,7 +142,7 @@ jobs:
             {
               echo "linux-core: cargo test упал"
               echo '```'
-              grep -E "^(test |failures:|thread|---- )" /tmp/t.log | tail -60
+              tail -60 /tmp/t.log
               echo '```'
             } > /tmp/body.md
             gh pr comment 49 --body-file /tmp/body.md || true
