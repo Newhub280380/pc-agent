@@ -104,6 +104,11 @@ jobs:
       # не находит libstdc++.
       CC: gcc
       CXX: g++
+      # GCC 15 на ubuntu-latest проверяет тела шаблонов и падает на
+      # m_low_bound/m_lower_bound внутри вшитого Z3 4.12 (z3-sys 0.8.1):
+      # код ill-formed, но раньше не инстанцировался. Флаг возвращает
+      # прежнее поведение; исходники солвера не меняются.
+      CXXFLAGS: -Wno-template-body
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
