@@ -99,6 +99,9 @@ jobs:
 
   linux-core:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     env:
       # bindgen нужен clang, но C++ солвера собираем g++: clang с --target
       # не находит libstdc++.
@@ -127,7 +130,24 @@ jobs:
           go test ./...
           go build -ldflags "-s -w -X main.Version=${{ github.sha }}" -o pcagent-router .
       - working-directory: core
-        run: cargo fmt --check && cargo test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # ВРЕМЕННО (диагностика): вывод падения уезжает в комментарий PR,
+          # потому что логи джобы недоступны из песочницы агента.
+          cargo fmt --check
+          cargo test 2>&1 | tee /tmp/t.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "linux-core: cargo test упал"
+              echo '```'
+              grep -E "^(test |failures:|thread|---- )" /tmp/t.log | tail -60
+              echo '```'
+            } > /tmp/body.md
+            gh pr comment 49 --body-file /tmp/body.md || true
+            exit 1
+          fi
       - name: Сборка агента под Linux
         working-directory: core
         run: cargo build --release
