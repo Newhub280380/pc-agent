@@ -233,6 +233,8 @@ pub struct Agent {
     jev: crate::jev::Jev,
     /// Быстрый выбор ветки через OpenRouter. Ключ наружу не пишется.
     decisions: crate::decisions::Client,
+    /// Когда спрашивать модель: обратимые шаги решает локальная статистика.
+    policy: crate::decision_policy::Policy,
     optimizer: crate::optimize::Kind,
     checkpoints: crate::checkpoint::Store,
     hang: Duration,
@@ -284,6 +286,7 @@ impl Agent {
             stop,
             jev: crate::jev::Jev::new(),
             decisions: crate::decisions::Client::from_env(),
+            policy: crate::decision_policy::Policy::from_env(),
             optimizer: crate::optimize::Kind::from_env(),
             checkpoints: crate::checkpoint::Store::open(crate::checkpoint::default_dir())
                 .or_else(|_| {
@@ -983,46 +986,46 @@ impl Agent {
                 failures.push(why);
                 continue;
             }
-            if self.decisions.enabled() {
-                let state = serde_json::json!({
-                    "action": act_str,
-                    "goal": work.goal(),
-                    "failures": failures,
-                });
-                // Отказ JEV останавливает только необратимое. На живом
-                // прогоне он отказывал почти на каждом шаге, и агент
-                // выбрасывал готовое решение модели — половина запросов
-                // уходила в пустоту, задача стояла. Сомнение в обратимом
-                // шаге — это подсказка, а не запрет.
-                match self.decisions.yes(&state, "Делать ли это действие сейчас?")
-                {
-                    Ok(false) if decision.next.is_destructive() && jev_vetoes < MAX_JEV_VETOES => {
-                        jev_vetoes += 1;
-                        self.log("JEV: необратимое действие сейчас не подходит, пропускаю");
-                        failures.push("jev: noul отказал в необратимом действии".into());
-                        continue;
-                    }
-                    Ok(false) => {
-                        self.log("JEV сомневается, но шаг обратимый — делаю");
-                        jev_vetoes = 0;
-                    }
-                    Ok(true) => jev_vetoes = 0,
-                    Err(e) => self.warn_jev(&e.to_string()),
+            // --- JEV: сеть только там, где ошибка дороже задержки ---
+            // Обратимый шаг решает локальная статистика (микросекунды, ноль
+            // сети): отказ модели на таком шаге всё равно не останавливал
+            // действие, а задержка была настоящей. Необратимый шаг всегда идёт
+            // в модель, и «неясно» тоже не пропускает его молча. Источник
+            // решения подписан — в журнале видно, кто именно разрешил шаг.
+            let destructive = decision.next.is_destructive();
+            let jev_state = serde_json::json!({
+                "action": act_str,
+                "goal": work.goal(),
+                "failures": failures,
+                "irreversible": destructive,
+            });
+            let verdict = self.policy.decide(
+                &mut self.decisions,
+                &self.jev,
+                &act_str,
+                &jev_state,
+                destructive,
+            );
+            match verdict.source {
+                crate::decision_policy::Source::Remote => {
+                    self.log(format!("JEV {}: {}", verdict.source.as_str(), verdict.note));
                 }
+                crate::decision_policy::Source::Fallback => self.warn_jev(&verdict.note),
+                _ => {}
             }
-            match self.jev.ask(&act_str) {
-                crate::jev::JevVerdict::No
-                    if decision.next.is_destructive() && jev_vetoes < MAX_JEV_VETOES =>
-                {
+            if !verdict.allow {
+                if jev_vetoes < MAX_JEV_VETOES {
                     jev_vetoes += 1;
-                    self.log(format!(
-                        "JEV: класс действия «{}» стабильно проваливается — пропускаю",
-                        act_str
-                    ));
-                    failures.push("jev: плохая статистика класса действия".into());
+                    self.log(format!("JEV: шаг отложен — {}", verdict.note));
+                    failures.push(format!("jev: {}", verdict.note));
                     continue;
                 }
-                _ => {}
+                // Второе вето подряд задачу не блокирует: необратимый шаг ниже
+                // всё равно уходит на подтверждение человеком.
+                jev_vetoes = 0;
+                self.log("JEV: второе вето подряд — шаг идёт на подтверждение человеком");
+            } else {
+                jev_vetoes = 0;
             }
 
             // --- GROUNDING: отсекаем выдумки ДО действия ---

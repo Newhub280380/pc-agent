@@ -20,6 +20,7 @@ mod claims;
 mod config;
 mod coordinator;
 mod corpus;
+mod decision_policy;
 mod decisions;
 mod endoscope;
 mod failure;
